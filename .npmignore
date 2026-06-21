@@ -1,0 +1,6 @@
+node_modules/
+.git/
+.github/
+coverage/
+npm-debug.log*
+.DS_Store

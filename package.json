@@ -1,0 +1,47 @@
+{
+  "name": "vibe-coding-analytics",
+  "version": "0.1.0",
+  "description": "Initialize, audit, and evolve project harnesses for modern AI coding agents.",
+  "type": "module",
+  "bin": {
+    "vibe-coding-analytics": "./bin/vibe-coding-analytics.js",
+    "vca": "./bin/vibe-coding-analytics.js"
+  },
+  "files": [
+    "bin",
+    "src",
+    "skills",
+    "templates",
+    ".codex-plugin",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "start": "node ./bin/vibe-coding-analytics.js",
+    "analytics": "node ./bin/vibe-coding-analytics.js analytics",
+    "init": "node ./bin/vibe-coding-analytics.js init",
+    "evolve": "node ./bin/vibe-coding-analytics.js evolve",
+    "test": "node --test",
+    "validate": "npm test && node ./scripts/validate-architecture.js",
+    "ci": "npm run validate"
+  },
+  "keywords": [
+    "vibe-coding",
+    "ai-coding",
+    "codex",
+    "claude-code",
+    "cursor",
+    "github-copilot",
+    "agentic-engineering",
+    "skills"
+  ],
+  "author": "kx-code",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kx-code/vibe-coding-analytics.git"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

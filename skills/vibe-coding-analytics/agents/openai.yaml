@@ -1,0 +1,4 @@
+interface:
+  display_name: "Vibe Coding Analytics"
+  short_description: "Initialize, audit, and evolve AI coding harnesses."
+  default_prompt: "Audit this repository for vibe coding readiness and recommend the smallest harness improvements."

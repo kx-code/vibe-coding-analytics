@@ -1,0 +1,44 @@
+{
+  "name": "vibe-coding-analytics",
+  "version": "0.1.0",
+  "description": "Initialize, audit, and evolve project harnesses for modern AI coding agents.",
+  "author": {
+    "name": "kx-code",
+    "url": "https://github.com/kx-code"
+  },
+  "homepage": "https://github.com/kx-code/vibe-coding-analytics",
+  "repository": "https://github.com/kx-code/vibe-coding-analytics",
+  "license": "MIT",
+  "keywords": [
+    "vibe-coding",
+    "ai-coding",
+    "codex",
+    "claude-code",
+    "cursor",
+    "github-copilot",
+    "skills"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Vibe Coding Analytics",
+    "shortDescription": "Initialize, audit, and evolve AI coding harnesses",
+    "longDescription": "Use Vibe Coding Analytics to inspect repositories for AI coding readiness, create baseline agent instructions and project memory, and evolve repeated workflow patterns into durable tests, validators, commands, skills, and reviewer agents.",
+    "developerName": "kx-code",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/kx-code/vibe-coding-analytics",
+    "privacyPolicyURL": "https://github.com/kx-code/vibe-coding-analytics/blob/main/README.md",
+    "termsOfServiceURL": "https://github.com/kx-code/vibe-coding-analytics/blob/main/LICENSE",
+    "defaultPrompt": [
+      "Audit this project for vibe coding readiness.",
+      "Initialize an AI coding harness for this repository.",
+      "Evolve this project's repeated agent workflows into tests, rules, skills, and commands."
+    ],
+    "brandColor": "#111827",
+    "screenshots": []
+  }
+}
