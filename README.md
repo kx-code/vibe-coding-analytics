@@ -14,16 +14,30 @@ npx vibe-coding-analytics init --write
 npx vibe-coding-analytics evolve --write
 ```
 
-Or after installing globally:
+`vca` is also exposed as a CLI alias. With `npx`, use `--package` so npm installs
+the `vibe-coding-analytics` package and then runs its `vca` binary:
+
+```bash
+npx --package vibe-coding-analytics vca analytics
+```
+
+Or install the CLI globally:
 
 ```bash
 npm install -g vibe-coding-analytics
+vibe-coding-analytics analytics
+vibe-coding-analytics init --write
+vibe-coding-analytics evolve --write
+
 vca analytics
 vca init --write
 vca evolve --write
 ```
 
 Commands are read-only by default. Add `--write` to create missing harness files.
+
+The npm package and CLI are the same package. There is no separate CLI package to
+publish or install.
 
 ## Commands
 
