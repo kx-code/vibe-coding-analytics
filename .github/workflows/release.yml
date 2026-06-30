@@ -1,0 +1,41 @@
+name: Release
+
+# Publishes to the npm registry when a GitHub Release is published.
+# Uses npm Trusted Publishing (OIDC) — no NPM_TOKEN required.
+# The GitHub Release acts as the publish gate, so a stray tag alone
+# never triggers a publish.
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # required for npm Trusted Publishing (OIDC) + provenance
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Setup Node
+        uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238 # v6.2.0
+        with:
+          node-version: "22"
+          cache: "npm"
+          registry-url: "https://registry.npmjs.org"
+      - name: Upgrade npm for Trusted Publishing
+        # Node 22 ships npm 10.x; Trusted Publishing requires npm >= 11.5.1
+        run: npm install -g npm@latest
+      - name: Install
+        run: npm ci
+      - name: Validate
+        run: npm run ci
+      - name: Publish
+        run: npm publish --provenance --access public
