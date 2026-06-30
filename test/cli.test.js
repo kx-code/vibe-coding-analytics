@@ -20,3 +20,34 @@ test("init --write creates baseline harness files", async () => {
   assert.equal(fs.existsSync(path.join(dir, ".claude/commands/evolve.md")), true);
   assert.equal(fs.existsSync(path.join(dir, "docs/knowledge-base/constraints.md")), true);
 });
+
+test("detects harness across git submodules and fractal CLAUDE.md", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-mono-"));
+  fs.mkdirSync(path.join(dir, "backend", "tests", "unit"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "backend", "tests", "unit", "auth_test.go"), "package unit");
+  fs.writeFileSync(path.join(dir, "backend", "Makefile"), "test:\n\tgo test ./...\n");
+  fs.writeFileSync(path.join(dir, "backend", "go.mod"), "module backend\n");
+  fs.writeFileSync(path.join(dir, "backend", "CLAUDE.md"), "# backend");
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# root");
+  fs.writeFileSync(
+    path.join(dir, ".gitmodules"),
+    '[submodule "backend"]\n\tpath = backend\n\turl = https://example.com/b.git\n',
+  );
+  fs.mkdirSync(path.join(dir, ".claude", "skills", "review"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".claude", "skills", "review", "SKILL.md"), "reviewer skill");
+  fs.mkdirSync(path.join(dir, "flutter", "scripts"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "flutter", "scripts", "verify_16kb.ps1"), "# verify");
+
+  const report = analyzeForTest(dir);
+  assert.equal(report.shape, "git submodule monorepo");
+  const pass = new Set(report.checks.filter((c) => c.ok).map((c) => c.area));
+  assert.ok(pass.has("Project facts"), "facts via CLAUDE.md");
+  assert.ok(pass.has("Agent instructions"), "agent instructions via CLAUDE.md");
+  assert.ok(pass.has("Tests"), "tests via backend tests/");
+  assert.ok(pass.has("Typecheck"), "typecheck via go.mod");
+  assert.ok(pass.has("Project memory"), "memory via fractal CLAUDE.md");
+  assert.ok(pass.has("Reusable skills"), "skills via .claude/skills/");
+  assert.ok(pass.has("Specialist reviewers"), "reviewers via review skill");
+  assert.ok(pass.has("Architecture sensors"), "sensors via flutter/scripts/verify_16kb.ps1");
+  assert.ok(report.score >= 50, `score ${report.score} should be >= 50`);
+});

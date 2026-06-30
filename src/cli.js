@@ -49,33 +49,219 @@ function parseOptions(args) {
   return options;
 }
 
+/**
+ * Detect harness maturity across the whole repository, including git submodules
+ * and nested subpackages. Root-anchored prefix matches miss polyglot monorepos,
+ * so checks run against every project root plus a full-tree file walk.
+ */
 function analyzeProject(cwd) {
-  const files = listFiles(cwd, 5);
-  const has = (file) => files.has(file);
-  const hasPrefix = (prefix) => [...files].some((file) => file.startsWith(prefix));
+  const roots = detectProjectRoots(cwd);
+  const filesByRoot = new Map();
+  for (const root of roots) filesByRoot.set(root, listFiles(root, 5));
+  const allFiles = listFiles(cwd, 7);
+
+  const hasAt = (file) => roots.some((root) => filesByRoot.get(root).has(file));
+  const hasPrefixAt = (prefix) =>
+    roots.some((root) => [...filesByRoot.get(root)].some((file) => file.startsWith(prefix)));
+
   const packageJson = readJson(path.join(cwd, "package.json"));
-  const scripts = packageJson?.scripts || {};
+  const scripts = collectAllScripts(cwd, allFiles);
+  const shape = detectShape(cwd, packageJson);
+
+  const fractalDocs =
+    countBasename(allFiles, "CLAUDE.md") >= 2 || countBasename(allFiles, "AGENTS.md") >= 2;
 
   const checks = [
-    check("Project facts", has("README.md") || has("readme.md"), "Add a README with architecture, setup, and validation commands."),
-    check("Agent instructions", has("AGENTS.md") || has("CLAUDE.md") || hasPrefix(".cursor/rules/") || has(".github/copilot-instructions.md"), "Add AGENTS.md plus tool-specific instruction files where relevant."),
-    check("Single validation command", Boolean(scripts.ci || scripts.validate), "Add npm run ci or npm run validate that agents can run before completion."),
-    check("Typecheck", Boolean(scripts["type-check"] || scripts.typecheck || scripts.lint), "Add typecheck/lint scripts appropriate to the stack."),
-    check("Tests", Boolean(scripts.test) || hasPrefix("tests/") || hasPrefix("test/") || has("vitest.config.ts") || has("playwright.config.ts"), "Add unit tests and at least one smoke test for critical flows."),
-    check("CI", hasPrefix(".github/workflows/"), "Add CI that runs the same local validation command."),
-    check("Project memory", hasPrefix("docs/knowledge-base/") || hasPrefix("docs/PRD/") || hasPrefix("docs/architecture/"), "Add docs/knowledge-base patterns, constraints, and known issues."),
-    check("Reusable skills", hasPrefix(".claude/skills/") || hasPrefix("skills/"), "Create skills for repeated workflows such as validate, deploy, migrate, or debug."),
-    check("Specialist reviewers", hasPrefix(".claude/agents/"), "Add reviewer agents for the highest-risk areas."),
-    check("Architecture sensors", hasPrefix("scripts/validate-architecture"), "Add project-specific validators for rules that should not rely on memory.")
+    check(
+      "Project facts",
+      hasAt("README.md") || hasAt("CLAUDE.md") || hasAt("AGENTS.md"),
+      "Add a README or CLAUDE.md with architecture, setup, and validation commands.",
+    ),
+    check(
+      "Agent instructions",
+      hasAt("AGENTS.md") ||
+        hasAt("CLAUDE.md") ||
+        hasPrefixAt(".cursor/rules/") ||
+        hasAt(".github/copilot-instructions.md"),
+      "Add AGENTS.md or CLAUDE.md plus tool-specific instruction files where relevant.",
+    ),
+    check(
+      "Single validation command",
+      Boolean(scripts.ci || scripts.validate) ||
+        anyMakefileTarget(roots, ["ci", "validate", "test"]),
+      "Add npm run ci/validate or a Makefile target that agents can run before completion.",
+    ),
+    check(
+      "Typecheck",
+      Boolean(scripts["type-check"] || scripts.typecheck || scripts.lint) ||
+        hasAt("go.mod") ||
+        hasAt("pubspec.yaml") ||
+        hasAt("tsconfig.json"),
+      "Add typecheck/lint scripts appropriate to the stack.",
+    ),
+    check(
+      "Tests",
+      hasTestFiles(allFiles) ||
+        hasPrefixAt("tests/") ||
+        hasPrefixAt("test/") ||
+        hasAt("vitest.config.ts") ||
+        hasAt("playwright.config.ts") ||
+        hasAt("pytest.ini"),
+      "Add unit tests and at least one smoke test for critical flows.",
+    ),
+    check(
+      "CI",
+      hasPrefixAt(".github/workflows/") ||
+        hasAt(".gitlab-ci.yml") ||
+        hasAt(".circleci/config.yml"),
+      "Add CI that runs the same local validation command.",
+    ),
+    check(
+      "Project memory",
+      hasPrefixAt("docs/knowledge-base/") ||
+        hasPrefixAt("docs/PRD/") ||
+        hasPrefixAt("docs/architecture/") ||
+        fractalDocs ||
+        hasDocsMd(filesByRoot),
+      "Add docs/knowledge-base patterns/constraints/known-issues, fractal CLAUDE.md, or docs/*.md.",
+    ),
+    check(
+      "Reusable skills",
+      hasPrefixAt(".claude/skills/") || hasPrefixAt("skills/"),
+      "Create skills for repeated workflows such as validate, deploy, migrate, or debug.",
+    ),
+    check(
+      "Specialist reviewers",
+      hasPrefixAt(".claude/agents/") ||
+        hasPluginAgents(allFiles) ||
+        hasReviewerSkill(allFiles),
+      "Add reviewer agents (.claude/agents/) or a reviewer skill/plugin for high-risk areas.",
+    ),
+    check(
+      "Architecture sensors",
+      hasValidateScript(allFiles) || anyMakefileTarget(roots, ["validate", "lint"]),
+      "Add project-specific validators (scripts/*validate*/*verify*) for rules that should not rely on memory.",
+    ),
   ];
 
   const passed = checks.filter((item) => item.ok).length;
   const score = Math.round((passed / checks.length) * 100);
-  return { cwd, files, packageJson, scripts, checks, score };
+  return { cwd, shape, roots, files: allFiles, packageJson, scripts, checks, score };
 }
 
 function check(area, ok, action) {
   return { area, ok, action };
+}
+
+/** Project roots = cwd plus every git submodule path declared in .gitmodules. */
+function detectProjectRoots(cwd) {
+  const roots = [cwd];
+  try {
+    const gitmodules = path.join(cwd, ".gitmodules");
+    if (fs.existsSync(gitmodules)) {
+      const text = fs.readFileSync(gitmodules, "utf8");
+      const re = /path\s*=\s*(.+)/g;
+      let match;
+      while ((match = re.exec(text)) !== null) {
+        const abs = path.resolve(cwd, match[1].trim());
+        if (fs.existsSync(abs) && !roots.includes(abs)) roots.push(abs);
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+  return roots;
+}
+
+function detectShape(cwd, packageJson) {
+  if (fs.existsSync(path.join(cwd, ".gitmodules"))) return "git submodule monorepo";
+  if (packageJson && packageJson.workspaces) return "npm workspaces monorepo";
+  return "single project";
+}
+
+/** Merge scripts from every package.json in the tree (root + nested subpackages). */
+function collectAllScripts(cwd, allFiles) {
+  const scripts = {};
+  for (const file of allFiles) {
+    if (file.includes("node_modules/")) continue;
+    if (file === "package.json" || file.endsWith("/package.json")) {
+      const pkg = readJson(path.join(cwd, file));
+      if (pkg && pkg.scripts) Object.assign(scripts, pkg.scripts);
+    }
+  }
+  return scripts;
+}
+
+function anyMakefileTarget(roots, targets) {
+  for (const root of roots) {
+    try {
+      const text = fs.readFileSync(path.join(root, "Makefile"), "utf8");
+      for (const target of targets) {
+        if (new RegExp(`^${target}:`, "m").test(text)) return true;
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+  return false;
+}
+
+/** Detect test files by language conventions across the whole tree. */
+function hasTestFiles(allFiles) {
+  for (const file of allFiles) {
+    const base = file.split("/").pop();
+    if (
+      base.endsWith("_test.go") ||
+      base.endsWith("_test.dart") ||
+      /\.(test|spec)\.(js|ts|mjs|jsx|tsx)$/.test(base) ||
+      (base.startsWith("test_") && base.endsWith(".py")) ||
+      base.endsWith("_test.py")
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function countBasename(allFiles, basename) {
+  let count = 0;
+  for (const file of allFiles) {
+    if (file.split("/").pop() === basename) count += 1;
+  }
+  return count;
+}
+
+function hasDocsMd(filesByRoot) {
+  for (const [, files] of filesByRoot) {
+    for (const file of files) {
+      if (file.startsWith("docs/") && file.endsWith(".md") && file !== "docs/README.md") {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function hasPluginAgents(allFiles) {
+  for (const file of allFiles) {
+    if (file.includes("/.claude/plugins/") && file.includes("/agents/")) return true;
+  }
+  return false;
+}
+
+function hasReviewerSkill(allFiles) {
+  for (const file of allFiles) {
+    if (/\.claude\/skills\/[^/]*(review|reviewer)/i.test(file)) return true;
+  }
+  return false;
+}
+
+function hasValidateScript(allFiles) {
+  for (const file of allFiles) {
+    const inScripts = file.startsWith("scripts/") || file.includes("/scripts/");
+    if (inScripts && /(validate|verify|check|lint)/i.test(file)) return true;
+  }
+  return false;
 }
 
 function listFiles(root, maxDepth) {
@@ -127,20 +313,27 @@ Commands:
   init       Propose or write baseline AI coding harness files.
   evolve     Propose or write self-evolution loop files.
 
-By default commands are read-only. Add --write to create missing files.`);
+By default commands are read-only. Add --write to create missing harness files.`);
 }
 
 function printReport(report) {
   console.log(`Vibe Coding Analytics: ${report.cwd}`);
+  console.log(`Project shape: ${report.shape}`);
   console.log(`Harness score: ${report.score}/100\n`);
   for (const item of report.checks) {
     console.log(`${item.ok ? "PASS" : "MISS"}  ${item.area}`);
     if (!item.ok) console.log(`      ${item.action}`);
   }
+  if (report.shape !== "single project") {
+    console.log(
+      `\nScanned ${report.roots.length} project root(s): ${report.shape} aware (root + git submodules).`,
+    );
+  }
 }
 
 function printEvolution(report) {
   console.log(`Vibe Coding Evolution: ${report.cwd}`);
+  console.log(`Project shape: ${report.shape}`);
   console.log("Adds a recurring improvement loop for extracting repeated work into rules, tests, commands, and skills.\n");
 }
 
