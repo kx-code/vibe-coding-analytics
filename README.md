@@ -88,11 +88,31 @@ It points Codex at the included skills directory and can be used as the base for
 ## What It Checks
 
 - `AGENTS.md`, `CLAUDE.md`, Cursor rules, and Copilot instructions
-- project memory such as PRDs, constraints, patterns, and known issues
-- reusable skills, slash commands, and specialist reviewers
+- project memory such as PRDs, constraints, patterns, known issues, or fractal per-directory `CLAUDE.md`
+- reusable skills, slash commands, specialist reviewers (`.claude/agents/`, reviewer skills, or plugin agents)
 - tests, typecheck, lint, architecture validators, and CI
 - deploy and post-deploy verification hooks
 - self-evolution loops that promote repeated work into durable harness assets
+
+## Monorepo & Non-Standard Conventions
+
+The analyzer is aware of common repository shapes and does not assume a flat
+single-package Node project:
+
+- **Git submodules** — when `.gitmodules` is present, every check runs against the
+  root plus each submodule root, so tests, scripts, and harness files living one
+  level down are still detected.
+- **npm workspaces** — detected from the root `package.json` `workspaces` field.
+- **Polyglot stacks** — `package.json` scripts are merged from every subpackage;
+  Go (`go.mod`), Flutter (`pubspec.yaml`), and TypeScript (`tsconfig.json`) are
+  recognized as typecheck signals; test files are detected by convention
+  (`*_test.go`, `*_test.dart`, `*.test.{js,ts}`, `test_*.py`, …).
+- **Fractal docs** — two or more `CLAUDE.md`/`AGENTS.md` files count as project
+  memory, matching the per-directory documentation pattern.
+- **Architecture sensors** — any `scripts/*validate*`, `*verify*`, `*check*`, or
+  `*lint*` file counts, not just `scripts/validate-architecture`.
+
+The report prints the detected `Project shape` and how many roots were scanned.
 
 ## License
 
