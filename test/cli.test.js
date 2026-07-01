@@ -51,3 +51,43 @@ test("detects harness across git submodules and fractal CLAUDE.md", () => {
   assert.ok(pass.has("Architecture sensors"), "sensors via flutter/scripts/verify_16kb.ps1");
   assert.ok(report.score >= 50, `score ${report.score} should be >= 50`);
 });
+
+test("detects typecheck config in npm workspace subpackages", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-ws-"));
+  fs.writeFileSync(
+    path.join(dir, "package.json"),
+    JSON.stringify({ name: "ws-root", workspaces: ["packages/*"] }),
+  );
+  fs.mkdirSync(path.join(dir, "packages", "app"), { recursive: true });
+  // Workspace package has a tsconfig but no typecheck/lint script — previously
+  // missed because workspace dirs are never added to `roots`, so the per-root
+  // exact-basename lookup never sees packages/app/tsconfig.json.
+  fs.writeFileSync(
+    path.join(dir, "packages", "app", "package.json"),
+    JSON.stringify({ name: "app", scripts: {} }),
+  );
+  fs.writeFileSync(path.join(dir, "packages", "app", "tsconfig.json"), "{}\n");
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# ws");
+
+  const report = analyzeForTest(dir);
+  assert.equal(report.shape, "npm workspaces monorepo");
+  const typecheck = report.checks.find((c) => c.area === "Typecheck");
+  assert.ok(typecheck && typecheck.ok, "typecheck via packages/app/tsconfig.json");
+});
+
+test("detects root-level plugin agents as specialist reviewers", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-plugin-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "p" }));
+  fs.mkdirSync(path.join(dir, ".claude", "plugins", "security", "agents"), { recursive: true });
+  // Root-level plugin layout: listFiles yields a relative path with no leading
+  // slash, so the old `file.includes("/.claude/plugins/")` never matched it.
+  fs.writeFileSync(
+    path.join(dir, ".claude", "plugins", "security", "agents", "reviewer.md"),
+    "# security reviewer",
+  );
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# p");
+
+  const report = analyzeForTest(dir);
+  const reviewers = report.checks.find((c) => c.area === "Specialist reviewers");
+  assert.ok(reviewers && reviewers.ok, "reviewers via root-level .claude/plugins/.../agents/");
+});
