@@ -94,6 +94,9 @@ function analyzeProject(cwd) {
     check(
       "Typecheck",
       Boolean(scripts["type-check"] || scripts.typecheck || scripts.lint) ||
+        hasAt("go.mod") ||
+        hasAt("pubspec.yaml") ||
+        hasAt("tsconfig.json") ||
         countBasename(allFiles, "go.mod") > 0 ||
         countBasename(allFiles, "pubspec.yaml") > 0 ||
         countBasename(allFiles, "tsconfig.json") > 0,

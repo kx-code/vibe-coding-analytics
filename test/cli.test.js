@@ -91,3 +91,24 @@ test("detects root-level plugin agents as specialist reviewers", () => {
   const reviewers = report.checks.find((c) => c.area === "Specialist reviewers");
   assert.ok(reviewers && reviewers.ok, "reviewers via root-level .claude/plugins/.../agents/");
 });
+
+test("detects typecheck config in a deeply-nested git submodule", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-deep-"));
+  // Submodule nested deeper than the listFiles(cwd, 7) full-tree walk can reach,
+  // so a pure countBasename(allFiles) scan misses it. The per-root hasAt walk
+  // (listFiles(submoduleRoot, 5)) is the only thing that reaches the submodule's
+  // own go.mod — so both scans must be kept.
+  const deep = path.join(dir, "a", "b", "c", "d", "e", "f", "g", "h", "dep");
+  fs.mkdirSync(deep, { recursive: true });
+  fs.writeFileSync(path.join(deep, "go.mod"), "module dep\n");
+  fs.writeFileSync(
+    path.join(dir, ".gitmodules"),
+    '[submodule "dep"]\n\tpath = a/b/c/d/e/f/g/h/dep\n\turl = https://example.com/dep.git\n',
+  );
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# deep");
+
+  const report = analyzeForTest(dir);
+  assert.equal(report.shape, "git submodule monorepo");
+  const typecheck = report.checks.find((c) => c.area === "Typecheck");
+  assert.ok(typecheck && typecheck.ok, "typecheck via deeply-nested submodule go.mod");
+});
