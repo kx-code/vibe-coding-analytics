@@ -51,3 +51,64 @@ test("detects harness across git submodules and fractal CLAUDE.md", () => {
   assert.ok(pass.has("Architecture sensors"), "sensors via flutter/scripts/verify_16kb.ps1");
   assert.ok(report.score >= 50, `score ${report.score} should be >= 50`);
 });
+
+test("detects typecheck config in npm workspace subpackages", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-ws-"));
+  fs.writeFileSync(
+    path.join(dir, "package.json"),
+    JSON.stringify({ name: "ws-root", workspaces: ["packages/*"] }),
+  );
+  fs.mkdirSync(path.join(dir, "packages", "app"), { recursive: true });
+  // Workspace package has a tsconfig but no typecheck/lint script — previously
+  // missed because workspace dirs are never added to `roots`, so the per-root
+  // exact-basename lookup never sees packages/app/tsconfig.json.
+  fs.writeFileSync(
+    path.join(dir, "packages", "app", "package.json"),
+    JSON.stringify({ name: "app", scripts: {} }),
+  );
+  fs.writeFileSync(path.join(dir, "packages", "app", "tsconfig.json"), "{}\n");
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# ws");
+
+  const report = analyzeForTest(dir);
+  assert.equal(report.shape, "npm workspaces monorepo");
+  const typecheck = report.checks.find((c) => c.area === "Typecheck");
+  assert.ok(typecheck && typecheck.ok, "typecheck via packages/app/tsconfig.json");
+});
+
+test("detects root-level plugin agents as specialist reviewers", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-plugin-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "p" }));
+  fs.mkdirSync(path.join(dir, ".claude", "plugins", "security", "agents"), { recursive: true });
+  // Root-level plugin layout: listFiles yields a relative path with no leading
+  // slash, so the old `file.includes("/.claude/plugins/")` never matched it.
+  fs.writeFileSync(
+    path.join(dir, ".claude", "plugins", "security", "agents", "reviewer.md"),
+    "# security reviewer",
+  );
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# p");
+
+  const report = analyzeForTest(dir);
+  const reviewers = report.checks.find((c) => c.area === "Specialist reviewers");
+  assert.ok(reviewers && reviewers.ok, "reviewers via root-level .claude/plugins/.../agents/");
+});
+
+test("detects typecheck config in a deeply-nested git submodule", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-deep-"));
+  // Submodule nested deeper than the listFiles(cwd, 7) full-tree walk can reach,
+  // so a pure countBasename(allFiles) scan misses it. The per-root hasAt walk
+  // (listFiles(submoduleRoot, 5)) is the only thing that reaches the submodule's
+  // own go.mod — so both scans must be kept.
+  const deep = path.join(dir, "a", "b", "c", "d", "e", "f", "g", "h", "dep");
+  fs.mkdirSync(deep, { recursive: true });
+  fs.writeFileSync(path.join(deep, "go.mod"), "module dep\n");
+  fs.writeFileSync(
+    path.join(dir, ".gitmodules"),
+    '[submodule "dep"]\n\tpath = a/b/c/d/e/f/g/h/dep\n\turl = https://example.com/dep.git\n',
+  );
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# deep");
+
+  const report = analyzeForTest(dir);
+  assert.equal(report.shape, "git submodule monorepo");
+  const typecheck = report.checks.find((c) => c.area === "Typecheck");
+  assert.ok(typecheck && typecheck.ok, "typecheck via deeply-nested submodule go.mod");
+});

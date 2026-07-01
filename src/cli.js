@@ -96,7 +96,10 @@ function analyzeProject(cwd) {
       Boolean(scripts["type-check"] || scripts.typecheck || scripts.lint) ||
         hasAt("go.mod") ||
         hasAt("pubspec.yaml") ||
-        hasAt("tsconfig.json"),
+        hasAt("tsconfig.json") ||
+        countBasename(allFiles, "go.mod") > 0 ||
+        countBasename(allFiles, "pubspec.yaml") > 0 ||
+        countBasename(allFiles, "tsconfig.json") > 0,
       "Add typecheck/lint scripts appropriate to the stack.",
     ),
     check(
@@ -244,7 +247,9 @@ function hasDocsMd(filesByRoot) {
 
 function hasPluginAgents(allFiles) {
   for (const file of allFiles) {
-    if (file.includes("/.claude/plugins/") && file.includes("/agents/")) return true;
+    // Relative paths have no leading slash, so match `.claude/plugins/<name>/agents/`
+    // anywhere in the tree (root-level or nested), mirroring hasReviewerSkill.
+    if (/\.claude\/plugins\/[^/]+\/agents\//i.test(file)) return true;
   }
   return false;
 }
