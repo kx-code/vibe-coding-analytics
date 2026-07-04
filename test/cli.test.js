@@ -1,9 +1,10 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import test from "node:test";
+import { execSync } from "node:child_process";
+import test, { mock } from "node:test";
 import assert from "node:assert/strict";
-import { analyzeForTest, runCli } from "../src/cli.js";
+import { analyzeForTest, runCli, buildInitFiles } from "../src/cli.js";
 
 test("analyzes an empty project with missing harness areas", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-empty-"));
@@ -195,3 +196,117 @@ test("detects pnpm-workspace and cargo workspace shapes", () => {
 
 // tiny helper so the pnpm assertion line reads cleanly
 function dir_for(d) { return d; }
+
+
+// ---- git-tracked sensor: harness files must be committed, not gitignored ----
+
+test("flags harness files that exist on disk but are not git-tracked", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-tracked-"));
+  execSync('git init -q && git config user.email t@t.t && git config user.name t', { cwd: dir, stdio: "pipe" });
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# root");
+  // A broad .d.ts rule (exactly the SiteGroup class of bug) silently excludes env.d.ts.
+  fs.writeFileSync(path.join(dir, ".gitignore"), "*.d.ts\n");
+  fs.writeFileSync(path.join(dir, "env.d.ts"), "declare global {}\n");
+  execSync("git add -A && git commit -qm init", { cwd: dir, stdio: "pipe" });
+  // env.d.ts is gitignored -> never staged -> exists on disk but NOT tracked.
+
+  const report = analyzeForTest(dir);
+  const tracked = report.checks.find((c) => c.area === "Harness files committed");
+  assert.ok(tracked, "expected a 'Harness files committed' check");
+  assert.equal(tracked.ok, false, "env.d.ts on disk but gitignored should be flagged");
+  assert.ok(/env\.d\.ts/.test(tracked.action), "action should name the offending file");
+});
+
+test("does not flag harness files when the tree is not a git repo", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-nogit-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# root");
+  fs.writeFileSync(path.join(dir, "env.d.ts"), "declare global {}\n");
+  const report = analyzeForTest(dir);
+  const tracked = report.checks.find((c) => c.area === "Harness files committed");
+  assert.ok(tracked && tracked.ok, "non-git tree should not be flagged");
+});
+
+
+test("git-tracked sensor ignores files inside a nested worktree/repo interior", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-nested-"));
+  execSync('git init -q && git config user.email t@t.t && git config user.name t', { cwd: dir, stdio: "pipe" });
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# root");
+  fs.writeFileSync(path.join(dir, ".gitignore"), "*.d.ts\n");
+  // An anchor file at the REAL repo root that IS gitignored -> must be flagged.
+  fs.writeFileSync(path.join(dir, "env.d.ts"), "declare global {}\n");
+  // A nested "worktree": an ancestor dir carrying its own .git. Files here are
+  // tracked by that nested index, not the cwd repo -- must NOT be flagged.
+  fs.mkdirSync(path.join(dir, "sub", "pkg"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "sub", ".git"), "gitdir: ../../.git/worktrees/sub\n");
+  fs.writeFileSync(path.join(dir, "sub", "pkg", "tsconfig.json"), "{}\n");
+  execSync("git add -A && git commit -qm init", { cwd: dir, stdio: "pipe" });
+
+  const report = analyzeForTest(dir);
+  const tracked = report.checks.find((c) => c.area === "Harness files committed");
+  assert.equal(tracked.ok, false, "root env.d.ts gitignored should still be flagged");
+  assert.ok(/env\.d\.ts/.test(tracked.action), "action should name env.d.ts");
+  assert.ok(!/sub\/pkg\/tsconfig\.json/.test(tracked.action), "nested-worktree tsconfig must NOT be flagged");
+});
+
+
+// ---- CLI: --version, --format json, init script pre-fill ----
+
+test("--version prints the package version and skips analysis", async () => {
+  const pkg = JSON.parse(fs.readFileSync(path.join(process.cwd(), "package.json"), "utf8"));
+  const logs = [];
+  const stub = mock.method(console, "log", (...a) => logs.push(a.join(" ")));
+  // sandbox with no package.json at all -- version must NOT depend on cwd.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-ver-"));
+  try {
+    await runCli(["--version", "--cwd", dir]);
+    assert.ok(logs.some((l) => l.includes(pkg.version)), `expected version ${pkg.version} in output: ${logs.join("|")}`);
+    assert.ok(!logs.some((l) => /Harness score/.test(l)), "must not run analytics");
+  } finally {
+    stub.mock.restore();
+  }
+});
+
+test("analytics --format json emits parseable JSON with score and checks", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-json-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "x", version: "0.0.0" }));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x");
+  const logs = [];
+  const stub = mock.method(console, "log", (...a) => logs.push(a.join(" ")));
+  try {
+    await runCli(["analytics", "--format", "json", "--cwd", dir]);
+    const blob = logs.join("\n");
+    const parsed = JSON.parse(blob);
+    assert.equal(typeof parsed.score, "number");
+    assert.ok(Array.isArray(parsed.checks) && parsed.checks.length > 0);
+    assert.ok(parsed.checks.every((c) => "area" in c && "ok" in c));
+    // files must be a JSON array, not a serialized Set (which stringifies to {})
+    assert.ok(Array.isArray(parsed.files), "files must serialize as an array");
+  } finally {
+    stub.mock.restore();
+  }
+});
+
+test("init pre-fills detected package.json scripts into AGENTS.md", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-init-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({
+    name: "demo",
+    scripts: { dev: "astro dev", build: "astro build", verify: "node --test", test: "node --test" },
+  }));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo");
+  const report = analyzeForTest(dir);
+  const files = buildInitFiles(report);
+  const agents = files.find((f) => f.relativePath === "AGENTS.md").content;
+  assert.ok(/astro dev/.test(agents), "Dev line must show the detected dev command");
+  assert.ok(/node --test/.test(agents), "Validate/Test must show the detected verify/test command");
+});
+
+test("init leaves command lines blank when no scripts are detected", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-init-empty-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "bare" }));
+  const report = analyzeForTest(dir);
+  const files = buildInitFiles(report);
+  const agents = files.find((f) => f.relativePath === "AGENTS.md").content;
+  // Install is always filled (npm install); the others stay as prompts.
+  assert.ok(/Install:/.test(agents));
+  assert.ok(!/astro dev/.test(agents), "must not invent commands that are not in package.json");
+});

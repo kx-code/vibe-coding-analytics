@@ -1,12 +1,27 @@
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
+import { spawnSync } from "node:child_process";
+import { createRequire } from "node:module";
+
+// File-walk depth limits. Per-root scans stay shallow (the root's own files live
+// near the surface); the full-tree walk goes deeper so nested workspace packages
+// and deeply-placed harness files (e.g. apps/admin/src/env.d.ts) are seen.
+const PER_ROOT_SCAN_DEPTH = 5;
+const FULL_TREE_SCAN_DEPTH = 7;
+
+const require = createRequire(import.meta.url);
 
 const COMMANDS = new Set(["init", "analytics", "evolve", "help"]);
 
 export async function runCli(argv) {
-  const command = COMMANDS.has(argv[0]) ? argv[0] : argv[0] ? "help" : "help";
-  const options = parseOptions(argv.slice(command === "help" && argv[0] !== "help" ? 0 : 1));
+  if (argv.includes("--version") || argv.includes("-V")) {
+    console.log(cliVersion());
+    return;
+  }
+
+  const command = COMMANDS.has(argv[0]) ? argv[0] : "help";
+  const options = parseOptions(argv.slice(command === "help" ? 0 : 1));
 
   if (command === "help") {
     printHelp();
@@ -17,7 +32,11 @@ export async function runCli(argv) {
   const report = analyzeProject(cwd);
 
   if (command === "analytics") {
-    printReport(report);
+    if (options.format === "json") {
+      console.log(JSON.stringify({ ...report, files: [...report.files] }, null, 2));
+    } else {
+      printReport(report);
+    }
     return;
   }
 
@@ -35,16 +54,25 @@ export async function runCli(argv) {
   }
 }
 
+function cliVersion() {
+  try {
+    return require("../package.json").version;
+  } catch {
+    return "0.0.0-unknown";
+  }
+}
+
 export function analyzeForTest(cwd) {
   return analyzeProject(path.resolve(cwd));
 }
 
 function parseOptions(args) {
-  const options = { write: false, cwd: null };
+  const options = { write: false, cwd: null, format: "text" };
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i];
     if (arg === "--write") options.write = true;
     if (arg === "--cwd") options.cwd = args[++i];
+    if (arg === "--format") options.format = args[++i] || "text";
   }
   return options;
 }
@@ -57,8 +85,8 @@ function parseOptions(args) {
 function analyzeProject(cwd) {
   const roots = detectProjectRoots(cwd);
   const filesByRoot = new Map();
-  for (const root of roots) filesByRoot.set(root, listFiles(root, 5));
-  const allFiles = listFiles(cwd, 7);
+  for (const root of roots) filesByRoot.set(root, listFiles(root, PER_ROOT_SCAN_DEPTH));
+  const allFiles = listFiles(cwd, FULL_TREE_SCAN_DEPTH);
 
   const hasAt = (file) => roots.some((root) => filesByRoot.get(root).has(file));
   const hasPrefixAt = (prefix) =>
@@ -67,6 +95,11 @@ function analyzeProject(cwd) {
   const packageJson = readJson(path.join(cwd, "package.json"));
   const scripts = collectAllScripts(cwd, allFiles);
   const shape = detectShape(cwd, packageJson);
+  // Harness anchor files that exist on disk but are NOT git-tracked (the
+  // SiteGroup class of bug: a broad `*.d.ts` gitignore silently excluded
+  // env.d.ts, so CI checkouts failed with 36 TS errors that never reproduced
+  // on the author's machine). Computed once; consumed by the check below.
+  const untrackedHarness = untrackedHarnessFiles(cwd, allFiles);
 
   const fractalDocs =
     countBasename(allFiles, "CLAUDE.md") >= 2 || countBasename(allFiles, "AGENTS.md") >= 2;
@@ -154,6 +187,13 @@ function analyzeProject(cwd) {
       "Architecture sensors",
       hasValidateScript(allFiles) || anyMakefileTarget(roots, ["validate", "lint"]),
       "Add project-specific validators (scripts/*validate*/*verify*) for rules that should not rely on memory.",
+    ),
+    check(
+      "Harness files committed",
+      untrackedHarness.length === 0,
+      untrackedHarness.length === 0
+        ? "Keep config/declaration files (env.d.ts, tsconfig.json, AGENTS.md) git-tracked; a broad gitignore rule (*.d.ts, *.env) silently drops them from CI checkouts."
+        : `These harness files exist on disk but are NOT git-tracked -- remove the matching .gitignore rule (or 'git add -f'): ${untrackedHarness.join(", ")}`,
     ),
   ];
 
@@ -352,6 +392,42 @@ function hasValidateScript(allFiles) {
   return false;
 }
 
+function insideNestedRepo(cwd, relPath) {
+  // True if any ancestor directory of relPath (between cwd and the file) carries
+  // its own .git -- a worktree (.git file) or nested repo/submodule (.git dir).
+  // Such files are tracked by THAT repo's index, not the cwd repo's.
+  const parts = relPath.split("/");
+  for (let i = 1; i < parts.length; i += 1) {
+    const ancestor = parts.slice(0, i).join("/");
+    if (fs.existsSync(path.join(cwd, ancestor, ".git"))) return true;
+  }
+  return false;
+}
+
+function untrackedHarnessFiles(cwd, allFiles) {
+  // N/A outside a git repo -- there is no "committed" to check.
+  if (!fs.existsSync(path.join(cwd, ".git"))) return [];
+  const BUILD_OUT_RE = /(^|\/)(dist|build|\.next|\.astro|node_modules|out|coverage)\//i;
+  const offenders = [];
+  for (const f of allFiles) {
+    const isAnchor = /(^|\/)(AGENTS\.md|CLAUDE\.md|env\.d\.ts|tsconfig\.json|jsconfig\.json)$/i.test(f)
+      || (/\.d\.ts$/i.test(f) && !BUILD_OUT_RE.test(f));
+    if (!isAnchor) continue;
+    // Skip files that live inside a NESTED repo/worktree/submodule: an ancestor
+    // dir carries its own .git, so its index (not the cwd repo's) tracks the file.
+    // git ls-files from cwd would otherwise mis-flag every file checked out in a
+    // sibling `git worktree` (e.g. .claude/worktrees/<name>/...) as untracked.
+    if (insideNestedRepo(cwd, f)) continue;
+    // git ls-files --error-unmatch exits 0 only for tracked paths; ignored AND
+    // merely-unstaged paths both fail -- both break a fresh CI checkout, so both
+    // are flagged. ENOENT (git missing) yields status null (!== 0) -> flagged,
+    // which errs toward warning in pathological no-git environments.
+    const r = spawnSync("git", ["ls-files", "--error-unmatch", f], { cwd, encoding: "utf8" });
+    if (r.status !== 0) offenders.push(f);
+  }
+  return offenders;
+}
+
 function listFiles(root, maxDepth) {
   const result = new Set();
   walk(root, "", 0, maxDepth, result);
@@ -392,16 +468,21 @@ function printHelp() {
   console.log(`vibe-coding-analytics
 
 Usage:
-  npx vibe-coding-analytics analytics [--cwd path]
+  npx vibe-coding-analytics analytics [--cwd path] [--format json]
   npx vibe-coding-analytics init [--cwd path] [--write]
   npx vibe-coding-analytics evolve [--cwd path] [--write]
+  npx vibe-coding-analytics --version | -V
 
 Commands:
   analytics  Audit the current project harness and print gaps.
   init       Propose or write baseline AI coding harness files.
   evolve     Propose or write self-evolution loop files.
 
-By default commands are read-only. Add --write to create missing harness files.`);
+Options:
+  --cwd <path>     Run against this directory (default: current directory).
+  --write          Create missing harness files (init/evolve). Default is read-only.
+  --format json    Emit the analytics report as machine-readable JSON (analytics only).
+  --version, -V    Print the vibe-coding-analytics version and exit.`);
 }
 
 function printReport(report) {
@@ -425,10 +506,10 @@ function printEvolution(report) {
   console.log("Adds a recurring improvement loop for extracting repeated work into rules, tests, commands, and skills.\n");
 }
 
-function buildInitFiles(report) {
+export function buildInitFiles(report) {
   const name = report.packageJson?.name || path.basename(report.cwd);
   return [
-    file("AGENTS.md", agentInstructions(name)),
+    file("AGENTS.md", agentInstructions(name, report.scripts)),
     file(".github/copilot-instructions.md", copilotInstructions(name)),
     file("docs/knowledge-base/patterns.md", "# Patterns\n\nDocument project-specific code patterns that agents should reuse.\n"),
     file("docs/knowledge-base/constraints.md", "# Constraints\n\nDocument rules that must not be violated. Promote repeated rules into tests or validators.\n"),
@@ -472,7 +553,18 @@ function writeOrPreview(cwd, files, write) {
   if (!write) console.log("\nRun again with --write to create these files.");
 }
 
-function agentInstructions(name) {
+function agentInstructions(name, scripts) {
+  // Pre-fill Commands from detected package.json scripts so the generated file is
+  // immediately accurate, not a fill-in worksheet. Missing commands stay blank.
+  const cmd = (...keys) => {
+    for (const k of keys) if (scripts && scripts[k]) return scripts[k];
+    return "";
+  };
+  const dev = cmd("dev", "start");
+  const validate = cmd("verify", "validate");
+  const build = cmd("build");
+  const testCmd = cmd("test");
+  const line = (label, value) => `- ${label}: ${value || ""}`;
   return `# ${name} Agent Instructions
 
 ## Project Facts
@@ -482,11 +574,11 @@ function agentInstructions(name) {
 
 ## Commands
 
-- Install:
-- Dev:
-- Validate:
-- Build:
-- Test:
+${line("Install", "npm install")}
+${line("Dev", dev)}
+${line("Validate", validate)}
+${line("Build", build)}
+${line("Test", testCmd)}
 
 ## Agent Rules
 
