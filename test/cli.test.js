@@ -336,3 +336,28 @@ test("evolve does not flag feature-commit churn as fix hotspots", () => {
   assert.equal(plan.fixPatterns.fixCommits, 0, "no fix commits in history");
   assert.equal(plan.fixPatterns.hotFiles.length, 0, "feature/refactor churn must not be flagged as a fix hotspot");
 });
+test("evolve scopes fix hotspots to the analyzed cwd, not the ancestor repo", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "vca-scope-root-"));
+  execSync('git init -q && git config user.email t@t.t && git config user.name t', { cwd: root, stdio: "pipe" });
+  // Ancestor-repo fixes OUTSIDE the analyzed subdir, touching root-bug.ts twice.
+  // Each reaches the count>=2 hotspot threshold, so without `-- .` path scoping
+  // they would leak into the subdir's hotspot list as a false regression candidate.
+  fs.writeFileSync(path.join(root, "root-bug.ts"), "a\n");
+  execSync('git add -A && git commit -qm "fix: root ancestor bug 1"', { cwd: root, stdio: "pipe" });
+  fs.writeFileSync(path.join(root, "root-bug.ts"), "b\n");
+  execSync('git add -A && git commit -qm "fix: root ancestor bug 2"', { cwd: root, stdio: "pipe" });
+  // The analyzed subdir + two fixes touching auth.ts (reaches count>=2 threshold).
+  const sub = path.join(root, "pkg");
+  fs.mkdirSync(sub);
+  fs.writeFileSync(path.join(sub, "auth.ts"), "a\n");
+  execSync('git add -A && git commit -qm "fix(auth): token race"', { cwd: root, stdio: "pipe" });
+  fs.writeFileSync(path.join(sub, "auth.ts"), "b\n");
+  execSync('git add -A && git commit -qm "fix(auth): refresh loop"', { cwd: root, stdio: "pipe" });
+
+  const report = analyzeForTest(sub);
+  const plan = buildEvolutionPlan(report);
+  const leaked = plan.fixPatterns.hotFiles.find((h) => h.file.endsWith("root-bug.ts"));
+  assert.equal(leaked, undefined, "fix outside the analyzed cwd must not leak into hotspots");
+  const auth = plan.fixPatterns.hotFiles.find((h) => h.file.endsWith("auth.ts"));
+  assert.ok(auth && auth.count >= 2, "fix inside the analyzed cwd should be reported as a hotspot");
+});

@@ -474,7 +474,7 @@ function evolutionRecommendations(report) {
 function recentFixPatterns(cwd, limit = 40) {
   let log = "";
   try {
-    log = execSync(`git log --no-merges --pretty=format:%s --name-only -n ${limit}`, {
+    log = execSync(`git log --no-merges --pretty=format:%s --name-only -n ${limit} -- .`, {
       cwd,
       stdio: ["ignore", "pipe", "ignore"],
       encoding: "utf8",
