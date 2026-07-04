@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import test, { mock } from "node:test";
+import test from "node:test";
 import assert from "node:assert/strict";
 import { analyzeForTest, runCli, printReport } from "../src/cli.js";
 
@@ -165,13 +165,14 @@ test("printReport surfaces warnings in its output", () => {
   fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# rules\n");
   const report = analyzeForTest(dir);
   const logs = [];
-  const stub = mock.method(console, "log", (...a) => logs.push(a.join(" ")));
+  const orig = console.log;
+  console.log = (...a) => logs.push(a.join(" "));
   try {
     printReport(report);
-    const blob = logs.join("\n");
-    assert.ok(/Warnings:/.test(blob), "prints a Warnings header");
-    assert.ok(/rules exist but no tests or CI/.test(blob), "prints the rules-without-enforcement message");
   } finally {
-    stub.mock.restore();
+    console.log = orig;
   }
+  const blob = logs.join("\n");
+  assert.ok(/Warnings:/.test(blob), "prints a Warnings header");
+  assert.ok(/rules exist but no tests or CI/.test(blob), "prints the rules-without-enforcement message");
 });
