@@ -208,3 +208,62 @@ test("cross-session memory detected via decisions, ADR, or agent memory", () => 
     "memory via .claude/memory",
   );
 });
+
+// ---- PR #6 codex P2: namespaced deploy, validate/ci as rule sensor, submodule deploy + decisions ----
+
+test("deploy hooks pass for namespaced deploy:prod / release:canary scripts", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-depns-"));
+  fs.writeFileSync(
+    path.join(dir, "package.json"),
+    JSON.stringify({ name: "x", scripts: { "deploy:prod": "wrangler pages deploy", "release:canary": "tb" } }),
+  );
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x");
+  const report = analyzeForTest(dir);
+  const deploy = report.checks.find((c) => c.area === "Deploy hooks");
+  assert.ok(deploy && deploy.ok, "namespaced deploy:prod / release:canary must satisfy Deploy hooks");
+});
+
+test("rule sensors pass for a validate/ci script backing prose rules", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-ruleval-"));
+  fs.writeFileSync(
+    path.join(dir, "package.json"),
+    JSON.stringify({ name: "x", scripts: { validate: "node --test", ci: "node --test" } }),
+  );
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x rules");
+  // No test files, no lint/typecheck script -- the only sensor is `validate`/`ci`.
+  const report = analyzeForTest(dir);
+  const sensors = report.checks.find((c) => c.area === "Rule sensors");
+  assert.ok(sensors && sensors.ok, "scripts.validate / scripts.ci must count as a rule sensor");
+});
+
+test("deploy hooks pass when a deploy workflow lives in a deep git submodule", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-deepdep-"));
+  // Submodule nested deeper than listFiles(cwd, 7) reaches, so allFiles misses it;
+  // only the per-root filesByRoot scan sees the submodule's deploy workflow.
+  const sub = path.join(dir, "a", "b", "c", "d", "e", "f", "g", "h", "svc");
+  fs.mkdirSync(path.join(sub, ".github", "workflows"), { recursive: true });
+  fs.writeFileSync(path.join(sub, ".github", "workflows", "deploy.yml"), "on: push\n");
+  fs.writeFileSync(
+    path.join(dir, ".gitmodules"),
+    '[submodule "svc"]\n\tpath = a/b/c/d/e/f/g/h/svc\n\turl = https://example.com/s.git\n',
+  );
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# deep");
+  const report = analyzeForTest(dir);
+  const deploy = report.checks.find((c) => c.area === "Deploy hooks");
+  assert.ok(deploy && deploy.ok, "deploy workflow in a deep submodule must be detected");
+});
+
+test("cross-session memory detected for decisions under a submodule root", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-submem-"));
+  fs.mkdirSync(path.join(dir, "backend", "docs", "decisions"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "backend", "docs", "decisions", "0001-use-x.md"), "# adr\n");
+  fs.writeFileSync(path.join(dir, "backend", "go.mod"), "module backend\n");
+  fs.writeFileSync(
+    path.join(dir, ".gitmodules"),
+    '[submodule "backend"]\n\tpath = backend\n\turl = https://example.com/b.git\n',
+  );
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# root");
+  const report = analyzeForTest(dir);
+  const mem = report.checks.find((c) => c.area === "Cross-session memory");
+  assert.ok(mem && mem.ok, "backend/docs/decisions/ under a submodule must count as memory");
+});
