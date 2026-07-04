@@ -486,13 +486,15 @@ function recentFixPatterns(cwd, limit = 40) {
   let fixCommits = 0;
   const counts = new Map();
   let expectSubject = true;
+  let inFixCommit = false;
   for (const raw of log.split("\n")) {
     const line = raw.trim();
     if (!line) { expectSubject = true; continue; }
     if (expectSubject) {
-      if (/(fix|bug|patch|hotfix)/i.test(line)) fixCommits += 1;
+      inFixCommit = /(fix|bug|patch|hotfix)/i.test(line);
+      if (inFixCommit) fixCommits += 1;
       expectSubject = false;
-    } else {
+    } else if (inFixCommit) {
       counts.set(line, (counts.get(line) || 0) + 1);
     }
   }

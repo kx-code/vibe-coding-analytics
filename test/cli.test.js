@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import test, { mock } from "node:test";
+import test from "node:test";
 import { execSync } from "node:child_process";
 import assert from "node:assert/strict";
 import { analyzeForTest, runCli, buildEvolutionPlan, printEvolution } from "../src/cli.js";
@@ -311,14 +311,28 @@ test("printEvolution prints concrete gap -> promotion lines", () => {
   const report = analyzeForTest(dir);
   const plan = buildEvolutionPlan(report);
   const logs = [];
-  const stub = mock.method(console, "log", (...a) => logs.push(a.join(" ")));
+  const orig = console.log;
+  console.log = (...a) => logs.push(a.join(" "));
   try {
     printEvolution(report, plan);
-    const blob = logs.join("\n");
-    assert.ok(/Promote these current gaps/.test(blob), "prints promotion header");
-    assert.ok(/Tests/.test(blob), "names the Tests gap");
-    assert.ok(/regression test/.test(blob), "shows the Tests promotion target");
   } finally {
-    stub.mock.restore();
+    console.log = orig;
   }
+  const blob = logs.join("\n");
+  assert.ok(/Promote these current gaps/.test(blob), "prints promotion header");
+  assert.ok(/Tests/.test(blob), "names the Tests gap");
+  assert.ok(/regression test/.test(blob), "shows the Tests promotion target");
+});
+
+test("evolve does not flag feature-commit churn as fix hotspots", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-evolve-feat-"));
+  execSync('git init -q && git config user.email t@t.t && git config user.name t', { cwd: dir, stdio: "pipe" });
+  fs.writeFileSync(path.join(dir, "feature.ts"), "a\n");
+  execSync('git add -A && git commit -qm "feat: add feature"', { cwd: dir, stdio: "pipe" });
+  fs.writeFileSync(path.join(dir, "feature.ts"), "b\n");
+  execSync('git add -A && git commit -qm "refactor: expand feature"', { cwd: dir, stdio: "pipe" });
+  const report = analyzeForTest(dir);
+  const plan = buildEvolutionPlan(report);
+  assert.equal(plan.fixPatterns.fixCommits, 0, "no fix commits in history");
+  assert.equal(plan.fixPatterns.hotFiles.length, 0, "feature/refactor churn must not be flagged as a fix hotspot");
 });
