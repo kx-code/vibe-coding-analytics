@@ -139,7 +139,12 @@ for marketplace submission.
 - Reusable skills, slash commands, specialist reviewers (`.claude/agents/`,
   reviewer skills, or plugin agents)
 - Tests, typecheck, lint, architecture validators, and CI
+- Rule-to-sensor coverage: prose rules in `CLAUDE.md`/`AGENTS.md` backed by
+  computational sensors (tests, lint, validators), not prose-only
+- Failure observability: monitoring, alerting, or error counters so critical-path
+  failures surface instead of failing silently
 - Deploy and post-deploy verification hooks
+- Cross-session memory: ADR decisions, agent memory, or a decisions log
 - Self-evolution loops that promote repeated work into durable harness assets
 
 ## Monorepo & Non-Standard Conventions

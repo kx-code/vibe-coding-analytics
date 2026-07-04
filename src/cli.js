@@ -145,6 +145,31 @@ function analyzeProject(cwd) {
       hasValidateScript(allFiles) || anyMakefileTarget(roots, ["validate", "lint"]),
       "Add project-specific validators (scripts/*validate*/*verify*) for rules that should not rely on memory.",
     ),
+    check(
+      "Deploy hooks",
+      Boolean(scripts.deploy || scripts.release) ||
+        anyMakefileTarget(roots, ["deploy", "release"]) ||
+        hasDeployArtifact(allFiles),
+      "Add a deploy/release script, workflow, or skill so code is never deployed unverified.",
+    ),
+    check(
+      "Rule sensors",
+      !(hasAt("CLAUDE.md") || hasAt("AGENTS.md")) ||
+        hasTestFiles(allFiles) ||
+        hasValidateScript(allFiles) ||
+        Boolean(scripts.lint || scripts["type-check"] || scripts.typecheck),
+      "Rules in CLAUDE.md/AGENTS.md need computational sensors (tests, lint, validators); prose-only rules drift.",
+    ),
+    check(
+      "Failure observability",
+      Boolean(scripts.monitor) || hasObservabilitySensor(allFiles),
+      "Add monitoring/alerting (monitor scripts, health workflows, error counters) so critical-path failures surface instead of failing silently.",
+    ),
+    check(
+      "Cross-session memory",
+      hasMemoryStore(allFiles),
+      "Add cross-session memory (docs/decisions ADRs, .claude/memory, or a decisions log) so context persists across sessions.",
+    ),
   ];
 
   const passed = checks.filter((item) => item.ok).length;
@@ -265,6 +290,38 @@ function hasValidateScript(allFiles) {
   for (const file of allFiles) {
     const inScripts = file.startsWith("scripts/") || file.includes("/scripts/");
     if (inScripts && /(validate|verify|check|lint)/i.test(file)) return true;
+  }
+  return false;
+}
+
+/** Deploy/release artifacts: scripts, CI workflows, or deploy/release skills. */
+function hasDeployArtifact(allFiles) {
+  for (const file of allFiles) {
+    if (/scripts\/[^/]*(deploy|release)/i.test(file)) return true;
+    if (/\.github\/workflows\/[^/]*(deploy|release)/i.test(file)) return true;
+    if (/\.claude\/skills\/[^/]*(deploy|release)/i.test(file)) return true;
+  }
+  return false;
+}
+
+/** Observability sensors: monitor/alert/health files in script/workflow/worker paths.
+ *  README or docs that merely mention monitoring do not count. */
+function hasObservabilitySensor(allFiles) {
+  for (const file of allFiles) {
+    if (!/(monitor|alert|observability|health[-_]?check)/i.test(file)) continue;
+    if (file.includes(".github/workflows/")) return true;
+    if (file.startsWith("scripts/") || file.includes("/scripts/")) return true;
+    if (file.startsWith("workers/") || file.includes("/workers/")) return true;
+  }
+  return false;
+}
+
+/** Cross-session memory: ADR/decisions logs or agent memory stores. */
+function hasMemoryStore(allFiles) {
+  for (const file of allFiles) {
+    if (file.startsWith("docs/decisions/") || file.startsWith("docs/adr/")) return true;
+    if (/\.claude\/memory\//i.test(file)) return true;
+    if (/(^|\/)(DECISIONS|ARCHITECTURE[-_]DECISIONS)\.md$/i.test(file)) return true;
   }
   return false;
 }
