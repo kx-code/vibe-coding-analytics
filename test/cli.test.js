@@ -1,9 +1,10 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import test from "node:test";
+import test, { mock } from "node:test";
+import { execSync } from "node:child_process";
 import assert from "node:assert/strict";
-import { analyzeForTest, runCli } from "../src/cli.js";
+import { analyzeForTest, runCli, buildEvolutionPlan, printEvolution } from "../src/cli.js";
 
 test("analyzes an empty project with missing harness areas", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-empty-"));
@@ -266,4 +267,58 @@ test("cross-session memory detected for decisions under a submodule root", () =>
   const report = analyzeForTest(dir);
   const mem = report.checks.find((c) => c.area === "Cross-session memory");
   assert.ok(mem && mem.ok, "backend/docs/decisions/ under a submodule must count as memory");
+
+// ---- evolve: analytics gaps -> concrete promotion plan + git fix hotspots ----
+
+test("evolve maps each missing harness area to a concrete promotion target", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-evolve-gap-"));
+  // No CLAUDE.md, no tests, no CI => many gaps; and not a git repo.
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo" }));
+  const report = analyzeForTest(dir);
+  const plan = buildEvolutionPlan(report);
+  assert.ok(plan.recommendations.length > 0, "should recommend promotions for gaps");
+  const areas = plan.recommendations.map((r) => r.area);
+  assert.ok(areas.includes("Tests"), "Tests gap -> regression test");
+  assert.ok(areas.includes("CI"), "CI gap -> workflow");
+  for (const r of plan.recommendations) {
+    assert.ok(r.promoteTo && r.action, `recommendation has promoteTo + action for ${r.area}`);
+  }
+  // Non-git fixture must not throw and must report no fix patterns.
+  assert.equal(plan.fixPatterns.hotFiles.length, 0);
+  assert.equal(plan.fixPatterns.fixCommits, 0);
+});
+
+test("evolve surfaces recent fix hotspots from git history", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-evolve-fix-"));
+  execSync('git init -q && git config user.email t@t.t && git config user.name t', { cwd: dir, stdio: "pipe" });
+  fs.writeFileSync(path.join(dir, "auth.ts"), "a\n");
+  execSync('git add -A && git commit -qm "fix: refresh token race"', { cwd: dir, stdio: "pipe" });
+  fs.writeFileSync(path.join(dir, "auth.ts"), "b\n");
+  execSync('git add -A && git commit -qm "fix(auth): redirect loop"', { cwd: dir, stdio: "pipe" });
+  fs.writeFileSync(path.join(dir, "other.ts"), "c\n");
+  execSync('git add -A && git commit -qm "feat: add thing"', { cwd: dir, stdio: "pipe" });
+
+  const report = analyzeForTest(dir);
+  const plan = buildEvolutionPlan(report);
+  assert.ok(plan.fixPatterns.fixCommits >= 2, `counted >=2 fix commits, got ${plan.fixPatterns.fixCommits}`);
+  const auth = plan.fixPatterns.hotFiles.find((h) => h.file === "auth.ts");
+  assert.ok(auth && auth.count >= 2, `auth.ts should be a hotspot (changed 2x), got ${JSON.stringify(plan.fixPatterns.hotFiles)}`);
+});
+
+test("printEvolution prints concrete gap -> promotion lines", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-evolve-print-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo" }));
+  const report = analyzeForTest(dir);
+  const plan = buildEvolutionPlan(report);
+  const logs = [];
+  const stub = mock.method(console, "log", (...a) => logs.push(a.join(" ")));
+  try {
+    printEvolution(report, plan);
+    const blob = logs.join("\n");
+    assert.ok(/Promote these current gaps/.test(blob), "prints promotion header");
+    assert.ok(/Tests/.test(blob), "names the Tests gap");
+    assert.ok(/regression test/.test(blob), "shows the Tests promotion target");
+  } finally {
+    stub.mock.restore();
+  }
 });
