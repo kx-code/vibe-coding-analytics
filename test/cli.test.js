@@ -1,9 +1,9 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import test from "node:test";
+import test, { mock } from "node:test";
 import assert from "node:assert/strict";
-import { analyzeForTest, runCli } from "../src/cli.js";
+import { analyzeForTest, runCli, printReport } from "../src/cli.js";
 
 test("analyzes an empty project with missing harness areas", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-empty-"));
@@ -111,4 +111,67 @@ test("detects typecheck config in a deeply-nested git submodule", () => {
   assert.equal(report.shape, "git submodule monorepo");
   const typecheck = report.checks.find((c) => c.area === "Typecheck");
   assert.ok(typecheck && typecheck.ok, "typecheck via deeply-nested submodule go.mod");
+});
+
+
+// ---- false-safety warnings (Tests without CI, rules without enforcement, no single command) ----
+
+test("warns when tests exist but no CI runs them", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-w-tci-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "x", scripts: { test: "node --test", ci: "node --test" } }));
+  fs.writeFileSync(path.join(dir, "app.test.js"), "test('x', () => {});\n");
+  // no .github/workflows => CI missing
+  const report = analyzeForTest(dir);
+  const codes = report.warnings.map((w) => w.code);
+  assert.ok(codes.includes("tests-without-ci"), `expected tests-without-ci, got ${codes.join(",")}`);
+  // validation command is satisfied (scripts.ci) so no-single-command must NOT also fire
+  assert.ok(!codes.includes("no-single-command"), "ci script present => no-single-command should not fire");
+});
+
+test("warns when agent rules exist but nothing enforces them", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-w-rwe-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# rules\n");
+  // no tests, no CI, no validation command
+  const report = analyzeForTest(dir);
+  const codes = report.warnings.map((w) => w.code);
+  assert.ok(codes.includes("rules-without-enforcement"), `expected rules-without-enforcement, got ${codes.join(",")}`);
+});
+
+test("warns when tests/CI exist but no single validation command", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-w-nsc-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "x", scripts: { dev: "node ." } }));
+  fs.writeFileSync(path.join(dir, "app.test.js"), "test('x', () => {});\n");
+  fs.mkdirSync(path.join(dir, ".github", "workflows"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".github", "workflows", "ci.yml"), "on: push\n");
+  // no ci/validate script and no Makefile => Single validation command MISS while Tests+CI pass
+  const report = analyzeForTest(dir);
+  const codes = report.warnings.map((w) => w.code);
+  assert.ok(codes.includes("no-single-command"), `expected no-single-command, got ${codes.join(",")}`);
+});
+
+test("a project with tests + CI + validation command has no false-safety warnings", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-w-clean-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "x", scripts: { ci: "node --test" } }));
+  fs.writeFileSync(path.join(dir, "app.test.js"), "test('x', () => {});\n");
+  fs.mkdirSync(path.join(dir, ".github", "workflows"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".github", "workflows", "ci.yml"), "on: push\n");
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# rules\n");
+  const report = analyzeForTest(dir);
+  assert.equal(report.warnings.length, 0, `expected no warnings, got ${JSON.stringify(report.warnings)}`);
+});
+
+test("printReport surfaces warnings in its output", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-w-print-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# rules\n");
+  const report = analyzeForTest(dir);
+  const logs = [];
+  const stub = mock.method(console, "log", (...a) => logs.push(a.join(" ")));
+  try {
+    printReport(report);
+    const blob = logs.join("\n");
+    assert.ok(/Warnings:/.test(blob), "prints a Warnings header");
+    assert.ok(/rules exist but no tests or CI/.test(blob), "prints the rules-without-enforcement message");
+  } finally {
+    stub.mock.restore();
+  }
 });

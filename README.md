@@ -141,6 +141,7 @@ for marketplace submission.
 - Tests, typecheck, lint, architecture validators, and CI
 - Deploy and post-deploy verification hooks
 - Self-evolution loops that promote repeated work into durable harness assets
+- False-safety warnings when checks are partially present (tests without CI, agent rules without enforcement, no single validation command)
 
 ## Monorepo & Non-Standard Conventions
 
