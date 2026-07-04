@@ -120,9 +120,13 @@ function analyzeProject(cwd) {
     ),
     check(
       "Single validation command",
-      Boolean(scripts.ci || scripts.validate) ||
-        anyMakefileTarget(roots, ["ci", "validate", "test"]),
-      "Add npm run ci/validate or a Makefile target that agents can run before completion.",
+      // The validation-command vocabulary is {ci, validate, verify, test} across
+      // both npm scripts and Makefile targets -- kept symmetric so the two backends
+      // never disagree. `verify` and `test` are the most common names in practice
+      // (e.g. a root `verify` that fans out across workspaces + vitest).
+      Boolean(scripts.ci || scripts.validate || scripts.verify || scripts.test) ||
+        anyMakefileTarget(roots, ["ci", "validate", "verify", "test"]),
+      "Add npm run ci/validate/verify/test or a Makefile target that agents can run before completion.",
     ),
     check(
       "Typecheck",

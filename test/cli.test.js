@@ -310,3 +310,19 @@ test("init leaves command lines blank when no scripts are detected", () => {
   assert.ok(/Install:/.test(agents));
   assert.ok(!/astro dev/.test(agents), "must not invent commands that are not in package.json");
 });
+
+
+test("Single validation command passes for npm scripts named verify or test", () => {
+  for (const scriptName of ["verify", "test", "ci", "validate"]) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-valcmd-"));
+    fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({
+      name: "x",
+      scripts: { [scriptName]: "node --test" },
+    }));
+    fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x");
+    const report = analyzeForTest(dir);
+    const check = report.checks.find((c) => c.area === "Single validation command");
+    assert.equal(check.ok, true, `script named '${scriptName}' should satisfy the validation command check`);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
