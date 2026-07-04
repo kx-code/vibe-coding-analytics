@@ -165,6 +165,9 @@ function isTestFile(base) {
     base.endsWith(".spec.ts") ||
     base.endsWith(".spec.tsx") ||
     base.endsWith(".test.mjs") ||
+    base.endsWith(".test.jsx") ||
+    base.endsWith(".spec.jsx") ||
+    base.endsWith(".spec.mjs") ||
     (base.startsWith("test_") && base.endsWith(".py")) ||
     base.endsWith("_test.py")
   );

@@ -161,3 +161,14 @@ test("MISS-ing checks carry no depth hint", () => {
   assert.ok(tests && !tests.ok, "Tests should MISS on empty project");
   assert.equal(tests.depth, undefined, "MISS-ing check must not carry a depth hint");
 });
+
+test("Tests depth counts jsx/spec test files accepted by the Tests check", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-d-jsx-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "x" }));
+  fs.writeFileSync(path.join(dir, "App.test.jsx"), "export {};\n");
+  fs.writeFileSync(path.join(dir, "utils.spec.jsx"), "export {};\n");
+  const report = analyzeForTest(dir);
+  const tests = report.checks.find((c) => c.area === "Tests");
+  assert.ok(tests && tests.ok, "Tests should pass via .test.jsx");
+  assert.match(tests.depth, /2 test file/, `depth should count jsx test files, got ${tests.depth}`);
+});
