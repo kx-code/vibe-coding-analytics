@@ -93,7 +93,12 @@ function analyzeProject(cwd) {
     ),
     check(
       "Typecheck",
-      Boolean(scripts["type-check"] || scripts.typecheck || scripts.lint) ||
+      // Plain-JS projects (no TypeScript/Go/Python/Dart sources and no typed-stack
+      // config anywhere in the tree) have nothing to typecheck -- treat as N/A so
+      // zero-dependency JS CLIs are not flagged. Typed stacks must still provide a
+      // typecheck/lint script OR the config file itself.
+      !hasTypedStack(allFiles) ||
+        Boolean(scripts["type-check"] || scripts.typecheck || scripts.lint) ||
         hasAt("go.mod") ||
         hasAt("pubspec.yaml") ||
         hasAt("tsconfig.json") ||
@@ -118,6 +123,11 @@ function analyzeProject(cwd) {
         hasAt(".gitlab-ci.yml") ||
         hasAt(".circleci/config.yml"),
       "Add CI that runs the same local validation command.",
+    ),
+    check(
+      "Deploy hooks",
+      hasDeployHook(allFiles, scripts),
+      "Add a deploy script, workflow, or skill so deployment is repeatable and observable.",
     ),
     check(
       "Project memory",
@@ -156,7 +166,12 @@ function check(area, ok, action) {
   return { area, ok, action };
 }
 
-/** Project roots = cwd plus every git submodule path declared in .gitmodules. */
+/**
+ * Project roots = cwd plus every git submodule path AND every npm/pnpm workspace
+ * package. Workspace packages are first-class project roots: per-root exact-basename
+ * lookups (hasAt) must see packages/<name>/tsconfig.json etc., not just the monorepo
+ * root. Without this, harness files that live inside a workspace package are missed.
+ */
 function detectProjectRoots(cwd) {
   const roots = [cwd];
   try {
@@ -173,12 +188,61 @@ function detectProjectRoots(cwd) {
   } catch {
     /* ignore */
   }
+  for (const glob of readWorkspacePatterns(cwd)) {
+    for (const abs of expandWorkspaceGlob(cwd, glob)) {
+      if (!roots.includes(abs)) roots.push(abs);
+    }
+  }
   return roots;
+}
+
+/** Collect workspace patterns from package.json (npm) -- pnpm-workspace.yaml is not
+ *  parsed here because pnpm workspace members still appear under cwd and are picked
+ *  up by the per-root walk; npm needs explicit glob expansion to be counted as roots. */
+function readWorkspacePatterns(cwd) {
+  const pkg = readJson(path.join(cwd, "package.json"));
+  if (!pkg || !pkg.workspaces) return [];
+  return Array.isArray(pkg.workspaces) ? pkg.workspaces : pkg.workspaces.packages || [];
+}
+
+/** Minimal npm-style workspace glob expander: supports a trailing /* (the common
+ *  case) and literal directory entries. Only directories containing package.json
+ *  are workspace packages. */
+function expandWorkspaceGlob(root, glob) {
+  const out = [];
+  const starIdx = glob.indexOf("*");
+  if (starIdx >= 0) {
+    const base = path.join(root, glob.slice(0, starIdx).replace(/\/$/, ""));
+    let entries = [];
+    try {
+      entries = fs.readdirSync(base, { withFileTypes: true });
+    } catch {
+      return out;
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const abs = path.join(base, entry.name);
+      if (fs.existsSync(path.join(abs, "package.json"))) out.push(abs);
+    }
+  } else {
+    const abs = path.join(root, glob);
+    if (fs.existsSync(path.join(abs, "package.json"))) out.push(abs);
+  }
+  return out;
 }
 
 function detectShape(cwd, packageJson) {
   if (fs.existsSync(path.join(cwd, ".gitmodules"))) return "git submodule monorepo";
+  if (fs.existsSync(path.join(cwd, "pnpm-workspace.yaml"))) return "pnpm workspace monorepo";
   if (packageJson && packageJson.workspaces) return "npm workspaces monorepo";
+  if (fs.existsSync(path.join(cwd, "Cargo.toml"))) {
+    try {
+      const toml = fs.readFileSync(path.join(cwd, "Cargo.toml"), "utf8");
+      if (/^\s*\[workspace\]/m.test(toml)) return "cargo workspace monorepo";
+    } catch {
+      /* ignore */
+    }
+  }
   return "single project";
 }
 
@@ -226,6 +290,16 @@ function hasTestFiles(allFiles) {
   return false;
 }
 
+function hasTypedStack(allFiles) {
+  if (countBasename(allFiles, "tsconfig.json") > 0) return true;
+  if (countBasename(allFiles, "go.mod") > 0) return true;
+  if (countBasename(allFiles, "pubspec.yaml") > 0) return true;
+  for (const file of allFiles) {
+    if (/\.(ts|tsx|go|py|dart)$/i.test(file)) return true;
+  }
+  return false;
+}
+
 function countBasename(allFiles, basename) {
   let count = 0;
   for (const file of allFiles) {
@@ -257,6 +331,15 @@ function hasPluginAgents(allFiles) {
 function hasReviewerSkill(allFiles) {
   for (const file of allFiles) {
     if (/\.claude\/skills\/[^/]*(review|reviewer)/i.test(file)) return true;
+  }
+  return false;
+}
+
+function hasDeployHook(allFiles, scripts) {
+  if (scripts.deploy) return true;
+  for (const file of allFiles) {
+    if (/\.github\/workflows\/[^/]*deploy/i.test(file)) return true;
+    if (/skills\/[^/]*deploy/i.test(file)) return true;
   }
   return false;
 }

@@ -112,3 +112,86 @@ test("detects typecheck config in a deeply-nested git submodule", () => {
   const typecheck = report.checks.find((c) => c.area === "Typecheck");
   assert.ok(typecheck && typecheck.ok, "typecheck via deeply-nested submodule go.mod");
 });
+
+test("deploy hooks detected via scripts, workflows, and skills", () => {
+  const scriptDir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-deploy-script-"));
+  fs.writeFileSync(
+    path.join(scriptDir, "package.json"),
+    JSON.stringify({ name: "a", scripts: { deploy: "wrangler pages deploy" } }),
+  );
+  fs.writeFileSync(path.join(scriptDir, "CLAUDE.md"), "# a");
+  let r = analyzeForTest(scriptDir);
+  assert.ok(r.checks.find((c) => c.area === "Deploy hooks")?.ok, "deploy via package script");
+
+  const wfDir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-deploy-wf-"));
+  fs.mkdirSync(path.join(wfDir, ".github", "workflows"), { recursive: true });
+  fs.writeFileSync(path.join(wfDir, ".github", "workflows", "deploy.yml"), "on: push\n");
+  fs.writeFileSync(path.join(wfDir, "CLAUDE.md"), "# b");
+  r = analyzeForTest(wfDir);
+  assert.ok(r.checks.find((c) => c.area === "Deploy hooks")?.ok, "deploy via workflow file");
+
+  const skillDir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-deploy-skill-"));
+  fs.mkdirSync(path.join(skillDir, ".claude", "skills", "deploy-production"), { recursive: true });
+  fs.writeFileSync(path.join(skillDir, ".claude", "skills", "deploy-production", "SKILL.md"), "deploy");
+  fs.writeFileSync(path.join(skillDir, "CLAUDE.md"), "# c");
+  r = analyzeForTest(skillDir);
+  assert.ok(r.checks.find((c) => c.area === "Deploy hooks")?.ok, "deploy via skill");
+});
+
+
+// ---- PR A: detection accuracy ----
+
+test("detects each npm workspace package as a project root", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-wsroots-"));
+  fs.writeFileSync(
+    path.join(dir, "package.json"),
+    JSON.stringify({ name: "root", workspaces: ["packages/*"] }),
+  );
+  for (const name of ["a", "b"]) {
+    fs.mkdirSync(path.join(dir, "packages", name), { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, "packages", name, "package.json"),
+      JSON.stringify({ name, scripts: { test: "node --test" } }),
+    );
+  }
+  fs.writeFileSync(path.join(dir, "packages", "b", "CLAUDE.md"), "# b");
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# root");
+  const report = analyzeForTest(dir);
+  // root + 2 workspace packages
+  assert.ok(
+    report.roots.length >= 3,
+    `expected >=3 roots (root + 2 workspaces), got ${report.roots.length}`,
+  );
+});
+
+test("does not flag typecheck for a plain-JS project", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-plainjs-"));
+  fs.writeFileSync(
+    path.join(dir, "package.json"),
+    JSON.stringify({ name: "plain", scripts: { test: "node --test" } }),
+  );
+  fs.writeFileSync(path.join(dir, "index.js"), "console.log(1);\n");
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# plain");
+  const report = analyzeForTest(dir);
+  const tc = report.checks.find((c) => c.area === "Typecheck");
+  assert.ok(tc && tc.ok, "plain-JS project should not be flagged for typecheck");
+});
+
+test("detects pnpm-workspace and cargo workspace shapes", () => {
+  const pnpm = fs.mkdtempSync(path.join(os.tmpdir(), "vca-pnpm-"));
+  fs.writeFileSync(path.join(dir_for(pnpm), "pnpm-workspace.yaml"), "packages:\n  - packages/*\n");
+  fs.writeFileSync(path.join(pnpm, "package.json"), JSON.stringify({ name: "p" }));
+  fs.writeFileSync(path.join(pnpm, "CLAUDE.md"), "# pnpm");
+  let report = analyzeForTest(pnpm);
+  assert.equal(report.shape, "pnpm workspace monorepo");
+
+  const cargo = fs.mkdtempSync(path.join(os.tmpdir(), "vca-cargo-"));
+  fs.mkdirSync(path.join(cargo, "crates", "lib"), { recursive: true });
+  fs.writeFileSync(path.join(cargo, "Cargo.toml"), "[workspace]\nmembers = [\"crates/lib\"]\n");
+  fs.writeFileSync(path.join(cargo, "CLAUDE.md"), "# cargo");
+  report = analyzeForTest(cargo);
+  assert.equal(report.shape, "cargo workspace monorepo");
+});
+
+// tiny helper so the pnpm assertion line reads cleanly
+function dir_for(d) { return d; }
