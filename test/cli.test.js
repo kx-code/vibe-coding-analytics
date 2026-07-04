@@ -172,3 +172,29 @@ test("Tests depth counts jsx/spec test files accepted by the Tests check", () =>
   assert.ok(tests && tests.ok, "Tests should pass via .test.jsx");
   assert.match(tests.depth, /2 test file/, `depth should count jsx test files, got ${tests.depth}`);
 });
+
+test("Architecture sensors depth counts validators grouped under a validate/ dir", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-valdir-"));
+  // scripts/validate/architecture.js -- hasValidateScript matches the full path
+  // (PASS), but the old basename counter only saw "architecture.js" and reported 0.
+  fs.mkdirSync(path.join(dir, "scripts", "validate"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "scripts", "validate", "architecture.js"), "module.exports = {};\n");
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x");
+  const report = analyzeForTest(dir);
+  const sensors = report.checks.find((c) => c.area === "Architecture sensors");
+  assert.ok(sensors && sensors.ok, "hasValidateScript matches the full path -> PASS");
+  assert.match(sensors.depth, /1 validator script/, `depth should count the validate-dir script, got ${sensors.depth}`);
+});
+
+test("Tests depth counts plain filenames inside a recognized test/ directory", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-testdir-"));
+  // Mocha-style layout: test/api.js has no .test/.spec suffix, so the Tests check
+  // passes via hasPrefixAt("test/") but the old suffix-only counter reported 0.
+  fs.mkdirSync(path.join(dir, "test"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "test", "api.js"), "const assert = require('assert');\n");
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x");
+  const report = analyzeForTest(dir);
+  const tests = report.checks.find((c) => c.area === "Tests");
+  assert.ok(tests && tests.ok, "hasPrefixAt('test/') -> PASS");
+  assert.match(tests.depth, /1 test file/, `depth should count test/api.js, got ${tests.depth}`);
+});

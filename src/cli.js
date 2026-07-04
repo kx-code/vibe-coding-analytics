@@ -175,7 +175,15 @@ function isTestFile(base) {
 function countTestFiles(allFiles) {
   let n = 0;
   for (const file of allFiles) {
-    if (isTestFile(file.split("/").pop())) n += 1;
+    if (file.endsWith("/")) continue; // directory entry, not a file
+    const base = file.split("/").pop();
+    if (isTestFile(base)) { n += 1; continue; }
+    // Recognized test directory (Mocha test/, tests/, Jest __tests__/): a source
+    // file here counts even without a .test/.spec suffix, mirroring the Tests
+    // check hasPrefixAt("test/"|"tests/") predicate.
+    if (/(^|\/)(test|tests|__tests__)\//.test(file) && !/\.(md|markdown|txt|json|ya?ml|lock)$/i.test(base)) {
+      n += 1;
+    }
   }
   return n;
 }
@@ -205,9 +213,11 @@ function countSkills(allFiles) {
 function countValidators(allFiles) {
   let n = 0;
   for (const f of allFiles) {
+    if (f.endsWith("/")) continue; // directory entry, not a file
     const inScripts = f.startsWith("scripts/") || f.includes("/scripts/");
-    const base = f.split("/").pop();
-    if (inScripts && /validate|verify|check|lint/i.test(base)) n += 1;
+    // Match the full path, like hasValidateScript, so scripts/validate/architecture.js
+    // counts via its directory rather than only its basename.
+    if (inScripts && /validate|verify|check|lint/i.test(f)) n += 1;
   }
   return n;
 }
