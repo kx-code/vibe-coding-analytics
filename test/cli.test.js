@@ -112,3 +112,52 @@ test("detects typecheck config in a deeply-nested git submodule", () => {
   const typecheck = report.checks.find((c) => c.area === "Typecheck");
   assert.ok(typecheck && typecheck.ok, "typecheck via deeply-nested submodule go.mod");
 });
+
+
+// ---- depth signals: distinguish stub (1 test) from mature (many) ----
+
+test("Tests depth reports test file count", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-d-tests-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "x" }));
+  for (const name of ["a.test.js", "b.test.js", "c.test.ts"]) {
+    fs.writeFileSync(path.join(dir, name), "export {};\n");
+  }
+  const report = analyzeForTest(dir);
+  const tests = report.checks.find((c) => c.area === "Tests");
+  assert.ok(tests && tests.ok, "Tests should pass");
+  assert.match(tests.depth, /3 test file/, `depth should report 3 test files, got ${tests.depth}`);
+});
+
+test("Agent instructions depth reports instruction line count", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-d-lines-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "x" }));
+  // 5 lines, no trailing newline => split("\n").length === 5
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# line1\n# line2\n# line3\n# line4\n# line5");
+  const report = analyzeForTest(dir);
+  const ai = report.checks.find((c) => c.area === "Agent instructions");
+  assert.ok(ai && ai.ok);
+  assert.match(ai.depth, /5 instruction line/, `depth should report 5 lines, got ${ai.depth}`);
+});
+
+test("Reusable skills depth reports skill count", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-d-skills-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "x" }));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.mkdirSync(path.join(dir, ".claude", "skills", "deploy"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".claude", "skills", "deploy", "SKILL.md"), "deploy\n");
+  fs.mkdirSync(path.join(dir, ".claude", "skills", "release"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".claude", "skills", "release", "SKILL.md"), "release\n");
+  const report = analyzeForTest(dir);
+  const skills = report.checks.find((c) => c.area === "Reusable skills");
+  assert.ok(skills && skills.ok);
+  assert.match(skills.depth, /2 skill/, `depth should report 2 skills, got ${skills.depth}`);
+});
+
+test("MISS-ing checks carry no depth hint", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-d-miss-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "x" }));
+  const report = analyzeForTest(dir);
+  const tests = report.checks.find((c) => c.area === "Tests");
+  assert.ok(tests && !tests.ok, "Tests should MISS on empty project");
+  assert.equal(tests.depth, undefined, "MISS-ing check must not carry a depth hint");
+});

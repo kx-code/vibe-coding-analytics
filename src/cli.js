@@ -147,9 +147,77 @@ function analyzeProject(cwd) {
     ),
   ];
 
+  enrichDepth(checks, { allFiles, roots, filesByRoot });
   const passed = checks.filter((item) => item.ok).length;
   const score = Math.round((passed / checks.length) * 100);
   return { cwd, shape, roots, files: allFiles, packageJson, scripts, checks, score };
+}
+
+/** Count test files across the tree (no regex, mirrors hasTestFile conventions). */
+function isTestFile(base) {
+  return (
+    base.endsWith("_test.go") ||
+    base.endsWith("_test.dart") ||
+    base.endsWith(".test.js") ||
+    base.endsWith(".test.ts") ||
+    base.endsWith(".test.tsx") ||
+    base.endsWith(".spec.js") ||
+    base.endsWith(".spec.ts") ||
+    base.endsWith(".spec.tsx") ||
+    base.endsWith(".test.mjs") ||
+    (base.startsWith("test_") && base.endsWith(".py")) ||
+    base.endsWith("_test.py")
+  );
+}
+function countTestFiles(allFiles) {
+  let n = 0;
+  for (const file of allFiles) {
+    if (isTestFile(file.split("/").pop())) n += 1;
+  }
+  return n;
+}
+function countInstructionLines(roots, filesByRoot) {
+  let lines = 0;
+  for (const root of roots) {
+    for (const f of filesByRoot.get(root)) {
+      if (f === "CLAUDE.md" || f === "AGENTS.md") {
+        try {
+          lines += fs.readFileSync(path.join(root, f), "utf8").split("\n").length;
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+  }
+  return lines;
+}
+function countSkills(allFiles) {
+  let n = 0;
+  for (const f of allFiles) {
+    const inSkills = f.startsWith(".claude/skills/") || f.startsWith("skills/") || f.includes("/.claude/skills/") || f.includes("/skills/");
+    if (inSkills && f.split("/").pop().toUpperCase() === "SKILL.MD") n += 1;
+  }
+  return n;
+}
+function countValidators(allFiles) {
+  let n = 0;
+  for (const f of allFiles) {
+    const inScripts = f.startsWith("scripts/") || f.includes("/scripts/");
+    const base = f.split("/").pop();
+    if (inScripts && /validate|verify|check|lint/i.test(base)) n += 1;
+  }
+  return n;
+}
+/** Attach a depth hint to key PASS-ing checks so a stub (1 test) is distinguishable from a mature project (hundreds). */
+function enrichDepth(checks, ctx) {
+  const set = (area, depth) => {
+    const c = checks.find((x) => x.area === area);
+    if (c && c.ok && depth) c.depth = depth;
+  };
+  set("Tests", `${countTestFiles(ctx.allFiles)} test file(s)`);
+  set("Agent instructions", `${countInstructionLines(ctx.roots, ctx.filesByRoot)} instruction line(s)`);
+  set("Reusable skills", `${countSkills(ctx.allFiles)} skill(s)`);
+  set("Architecture sensors", `${countValidators(ctx.allFiles)} validator script(s)`);
 }
 
 function check(area, ok, action) {
@@ -326,7 +394,7 @@ function printReport(report) {
   console.log(`Project shape: ${report.shape}`);
   console.log(`Harness score: ${report.score}/100\n`);
   for (const item of report.checks) {
-    console.log(`${item.ok ? "PASS" : "MISS"}  ${item.area}`);
+    console.log(`${item.ok ? "PASS" : "MISS"}  ${item.area}${item.depth ? `  (${item.depth})` : ""}`);
     if (!item.ok) console.log(`      ${item.action}`);
   }
   if (report.shape !== "single project") {

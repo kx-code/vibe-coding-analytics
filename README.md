@@ -141,6 +141,7 @@ for marketplace submission.
 - Tests, typecheck, lint, architecture validators, and CI
 - Deploy and post-deploy verification hooks
 - Self-evolution loops that promote repeated work into durable harness assets
+- Depth hints on passing checks (test-file / instruction-line / skill counts) so a stub is distinguishable from a mature project at the same score
 
 ## Monorepo & Non-Standard Conventions
 
