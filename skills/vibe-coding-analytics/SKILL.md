@@ -66,7 +66,7 @@ Do not overbuild. Add more harness only when the project has repeated operations
 
 ## Automatic Evolution
 
-Use `evolve` when the user mentions auto-improvement, loop, repeated capabilities, skill extraction, session mining, memory updates, or keeping the project configuration fresh.
+Use `evolve` when the user mentions auto-improvement, loop, repeated capabilities, skill extraction, session mining, memory updates, or keeping the project configuration fresh. The command turns detected analytics gaps into concrete promotion targets and reads recent git fix history to flag regression-test candidates.
 
 Promotion rules:
 

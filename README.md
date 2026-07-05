@@ -20,8 +20,9 @@ zero-config CLI and first-class templates for Claude Code and Codex.
   tests, CI, and deploy hooks.
 - **Scaffold** baseline harness files (`AGENTS.md`, `CLAUDE.md`, skills, slash
   commands, reviewer agents).
-- **Evolve** a self-improvement loop that promotes repeated corrections and
-  failed checks into durable harness assets.
+- **Evolve** a concrete improvement plan: maps detected analytics gaps to
+  promotion targets (tests, validators, CI, skills, rules) and surfaces recent
+  git fix hotspots as regression-test candidates.
 - **Monorepo-aware** — git submodules, npm workspaces, polyglot stacks, and
   fractal per-directory docs are detected automatically.
 - **Read-only by default** — every command is safe to dry-run; pass `--write`

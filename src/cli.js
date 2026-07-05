@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
+import { execSync } from "node:child_process";
 
 const COMMANDS = new Set(["init", "analytics", "evolve", "help"]);
 
@@ -29,8 +30,9 @@ export async function runCli(argv) {
   }
 
   if (command === "evolve") {
-    const files = buildEvolutionFiles(report);
-    printEvolution(report);
+    const plan = buildEvolutionPlan(report);
+    const files = buildEvolutionFiles(report, plan);
+    printEvolution(report, plan);
     writeOrPreview(cwd, files, options.write);
   }
 }
@@ -410,10 +412,23 @@ function printReport(report) {
   }
 }
 
-function printEvolution(report) {
+export function printEvolution(report, plan) {
+  const safePlan = plan || buildEvolutionPlan(report);
   console.log(`Vibe Coding Evolution: ${report.cwd}`);
   console.log(`Project shape: ${report.shape}`);
   console.log("Adds a recurring improvement loop for extracting repeated work into rules, tests, commands, and skills.\n");
+  if (safePlan.recommendations.length) {
+    console.log("Promote these current gaps into durable sensors:");
+    for (const r of safePlan.recommendations) console.log(`- ${r.area} -> ${r.promoteTo}`);
+    console.log();
+  } else {
+    console.log("No missing harness areas detected. Focus on promoting repeated work from recent activity.\n");
+  }
+  if (safePlan.fixPatterns.hotFiles.length) {
+    console.log(`Recent fix hotspots (${safePlan.fixPatterns.fixCommits} fix commits):`);
+    for (const h of safePlan.fixPatterns.hotFiles) console.log(`- ${h.file} (${h.count}x)`);
+    console.log();
+  }
 }
 
 function buildInitFiles(report) {
@@ -430,10 +445,80 @@ function buildInitFiles(report) {
   ];
 }
 
-function buildEvolutionFiles(report) {
+const EVOLVE_PROMOTIONS = {
+  "Project facts": { promoteTo: "README / CLAUDE.md", action: "Add a README or CLAUDE.md with architecture, setup, and validation commands." },
+  "Agent instructions": { promoteTo: "AGENTS.md / CLAUDE.md rule", action: "Add AGENTS.md or CLAUDE.md so agents inherit stable project rules." },
+  "Single validation command": { promoteTo: "package script (ci/validate)", action: "Add an npm run ci/validate script that agents run before completion." },
+  "Typecheck": { promoteTo: "typecheck script", action: "Add a typecheck/lint script appropriate to the stack." },
+  "Tests": { promoteTo: "regression test", action: "Add a failing test for the most recent bug, then make it pass." },
+  "CI": { promoteTo: "CI workflow", action: "Add CI that runs the same local validation command on every push." },
+  "Project memory": { promoteTo: "docs/knowledge-base entry", action: "Add docs/knowledge-base patterns/constraints/known-issues." },
+  "Reusable skills": { promoteTo: "project skill", action: "Create a skill for a repeated workflow (validate, deploy, migrate, debug)." },
+  "Specialist reviewers": { promoteTo: "reviewer agent", action: "Add a reviewer agent for the highest-risk domain." },
+  "Architecture sensors": { promoteTo: "architecture validator", action: "Add a scripts/validate validator for rules that should not rely on memory." },
+};
+
+/** Map each missing analytics check to a concrete promotion target (the "evolve" half of analytics). */
+function evolutionRecommendations(report) {
+  const recs = [];
+  for (const item of report.checks) {
+    if (item.ok) continue;
+    const promotion = EVOLVE_PROMOTIONS[item.area];
+    if (!promotion) continue;
+    recs.push({ area: item.area, promoteTo: promotion.promoteTo, action: promotion.action });
+  }
+  return recs;
+}
+
+/** Read recent git history for fix commits + repeatedly-changed files. Degrades to empty when cwd is not a git repo. */
+function recentFixPatterns(cwd, limit = 40) {
+  let log = "";
+  try {
+    log = execSync(`git log --no-merges --pretty=format:%s --name-only -n ${limit} -- .`, {
+      cwd,
+      stdio: ["ignore", "pipe", "ignore"],
+      encoding: "utf8",
+      timeout: 4000,
+    });
+  } catch {
+    return { fixCommits: 0, hotFiles: [] };
+  }
+  let fixCommits = 0;
+  const counts = new Map();
+  let expectSubject = true;
+  let inFixCommit = false;
+  for (const raw of log.split("\n")) {
+    const line = raw.trim();
+    if (!line) { expectSubject = true; continue; }
+    if (expectSubject) {
+      inFixCommit = /\b(fix|bug|patch|hotfix)\b/i.test(line);
+      if (inFixCommit) fixCommits += 1;
+      expectSubject = false;
+    } else if (inFixCommit) {
+      counts.set(line, (counts.get(line) || 0) + 1);
+    }
+  }
+  const hotFiles = [...counts.entries()]
+    .filter(([, n]) => n >= 2)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5)
+    .map(([file, count]) => ({ file, count }));
+  return { fixCommits, hotFiles };
+}
+
+/** Build a concrete evolution plan from analytics gaps + recent fix history. */
+export function buildEvolutionPlan(report) {
+  return {
+    recommendations: evolutionRecommendations(report),
+    fixPatterns: recentFixPatterns(report.cwd),
+  };
+}
+
+function buildEvolutionFiles(report, plan) {
   const name = report.packageJson?.name || path.basename(report.cwd);
+  const safePlan = plan || buildEvolutionPlan(report);
   return [
-    file("docs/knowledge-base/agent-evolution.md", evolutionDoc(name)),
+    file("docs/knowledge-base/agent-evolution.md", evolutionDoc(name, safePlan)),
     file(".claude/commands/evolve.md", slashEvolveCommand()),
     file(".claude/skills/project-evolution/SKILL.md", projectEvolutionSkill(name))
   ];
@@ -543,7 +628,21 @@ This command is designed for loop usage, for example:
 `;
 }
 
-function evolutionDoc(name) {
+function evolutionDoc(name, plan) {
+  const safePlan = plan || { recommendations: [], fixPatterns: { fixCommits: 0, hotFiles: [] } };
+  const recLines = safePlan.recommendations.length
+    ? safePlan.recommendations.map((r) => `- ${r.area} -> ${r.promoteTo}: ${r.action}`).join("\n")
+    : "- No missing harness areas detected. Keep promoting repeated work into durable sensors.";
+  const hotspotSection = safePlan.fixPatterns.hotFiles.length
+    ? [
+        "## Recent Fix Hotspots",
+        "",
+        `${safePlan.fixPatterns.fixCommits} fix commit(s) found in recent history. Files changed more than once are regression-test candidates:`,
+        "",
+        ...safePlan.fixPatterns.hotFiles.map((h) => `- ${h.file} (${h.count}x)`),
+        "",
+      ].join("\n")
+    : "";
   return `# ${name} Agent Evolution Loop
 
 Use this document to record how the project harness improves over time.
@@ -557,7 +656,11 @@ Use this document to record how the project harness improves over time.
 - Production incidents
 - Manual checklist items that keep recurring
 
-## Promotion Rules
+## Current Gaps -> Promote To
+
+${recLines}
+
+${hotspotSection}## Promotion Rules
 
 - Repeated bug -> regression test or validator
 - Repeated command sequence -> slash command or package script
