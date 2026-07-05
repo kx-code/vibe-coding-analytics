@@ -94,6 +94,7 @@ function analyzeProject(cwd) {
   const fractalDocs =
     countBasename(allFiles, "CLAUDE.md") >= 2 || countBasename(allFiles, "AGENTS.md") >= 2;
 
+  const numberedRules = countNumberedRules(roots);
   const checks = [
     check(
       "Project facts",
@@ -182,6 +183,13 @@ function analyzeProject(cwd) {
         hasValidateScript(allFiles) ||
         Boolean(scripts.lint || scripts["type-check"] || scripts.typecheck || scripts.validate || scripts.ci),
       "Rules in CLAUDE.md/AGENTS.md need computational sensors (tests, lint, validators); prose-only rules drift.",
+    ),
+    check(
+      "Steering loop",
+      numberedRules >= 5,
+      numberedRules >= 5
+        ? "Keep growing numbered rules after each bug fix; each rule should map to a sensor (see Rule sensors)."
+        : `Add numbered rules ("规则 N" / "Rule N") to CLAUDE.md/AGENTS.md that grow after each bug fix -- the rising count is the steering loop heartbeat. Found ${numberedRules}.`,
     ),
     check(
       "Failure observability",
@@ -326,6 +334,7 @@ function enrichDepth(checks, ctx) {
   set("Agent instructions", `${countInstructionLines(ctx.roots, ctx.filesByRoot)} instruction line(s)`);
   set("Reusable skills", `${countSkills(merged)} skill(s)`);
   set("Architecture sensors", `${countValidators(merged)} validator script(s)`);
+  set("Steering loop", `${countNumberedRules(ctx.roots)} numbered rule(s)`);
 }
 
 function check(area, ok, action) {
@@ -383,6 +392,23 @@ function anyMakefileTarget(roots, targets) {
     }
   }
   return false;
+}
+
+/** Count numbered rules ("规则 N" / "Rule N") across project roots. */
+function countNumberedRules(roots) {
+  let count = 0;
+  for (const root of roots) {
+    for (const name of ["CLAUDE.md", "AGENTS.md"]) {
+      try {
+        const text = fs.readFileSync(path.join(root, name), "utf8");
+        const matches = text.match(/(?:规则|Rule)\s*\d+/gi);
+        if (matches) count += matches.length;
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+  return count;
 }
 
 /** Detect test files by language conventions across the whole tree. */

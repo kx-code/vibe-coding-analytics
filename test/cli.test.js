@@ -780,3 +780,42 @@ test("init honors local package-lock.json over ancestor pnpm workspace", async (
   const agents = fs.readFileSync(path.join(sub, "AGENTS.md"), "utf8");
   assert.ok(/- Install: npm install/.test(agents), "local package-lock.json (npm) wins over ancestor pnpm");
 });
+
+test("analytics PASS Steering loop with 5+ numbered rules", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-sl1-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "规则 1 a\n规则 2 b\n规则 3 c\n规则 4 d\n规则 5 e\n");
+  const r = analyzeForTest(dir);
+  const loop = r.checks.find((c) => c.area === "Steering loop");
+  assert.ok(loop && loop.ok, "5 numbered rules pass steering loop");
+});
+
+test("analytics MISS Steering loop with fewer than 5 numbered rules", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-sl2-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "规则 1 a\n规则 2 b\n");
+  const r = analyzeForTest(dir);
+  const loop = r.checks.find((c) => c.area === "Steering loop");
+  assert.ok(loop && !loop.ok, "2 numbered rules miss steering loop");
+});
+
+test("analytics counts English Rule N numbering", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-sl3-"));
+  fs.writeFileSync(path.join(dir, "AGENTS.md"), "Rule 1 a\nRule 2 b\nRule 3 c\nRule 4 d\nRule 5 e\nRule 6 f\n");
+  const r = analyzeForTest(dir);
+  const loop = r.checks.find((c) => c.area === "Steering loop");
+  assert.ok(loop && loop.ok, "English Rule N counts toward steering loop");
+});
+
+test("analytics MISS Steering loop with no rules file", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-sl4-"));
+  const r = analyzeForTest(dir);
+  const loop = r.checks.find((c) => c.area === "Steering loop");
+  assert.ok(loop && !loop.ok, "no rules file misses steering loop");
+});
+
+test("every analytics check has a non-empty action/hint", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-actions-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "project");
+  const r = analyzeForTest(dir);
+  const missing = r.checks.filter((c) => !c.action || typeof c.action !== "string" || c.action.trim() === "");
+  assert.equal(missing.length, 0, `checks missing action: ${missing.map((c) => c.area).join(", ")}`);
+});
