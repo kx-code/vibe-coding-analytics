@@ -1,11 +1,16 @@
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
-import { execSync } from "node:child_process";
+import { execSync, spawnSync } from "node:child_process";
 
 const COMMANDS = new Set(["init", "analytics", "evolve", "help"]);
 
 export async function runCli(argv) {
+  if (argv.includes("--version") || argv.includes("-V")) {
+    console.log(cliVersion());
+    return;
+  }
+
   const command = COMMANDS.has(argv[0]) ? argv[0] : argv[0] ? "help" : "help";
   const options = parseOptions(argv.slice(command === "help" && argv[0] !== "help" ? 0 : 1));
 
@@ -18,7 +23,11 @@ export async function runCli(argv) {
   const report = analyzeProject(cwd);
 
   if (command === "analytics") {
-    printReport(report);
+    if (options.format === "json") {
+      console.log(JSON.stringify({ ...report, files: [...report.files] }, null, 2));
+    } else {
+      printReport(report);
+    }
     return;
   }
 
@@ -37,16 +46,27 @@ export async function runCli(argv) {
   }
 }
 
+/** Read the package version from the cli.js-adjacent package.json (ESM-safe). */
+function cliVersion() {
+  try {
+    const pkg = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+    return pkg.version || "0.0.0-unknown";
+  } catch {
+    return "0.0.0-unknown";
+  }
+}
+
 export function analyzeForTest(cwd) {
   return analyzeProject(path.resolve(cwd));
 }
 
 function parseOptions(args) {
-  const options = { write: false, cwd: null };
+  const options = { write: false, cwd: null, format: "text" };
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i];
     if (arg === "--write") options.write = true;
     if (arg === "--cwd") options.cwd = args[++i];
+    if (arg === "--format") options.format = args[++i] || "text";
   }
   return options;
 }
@@ -69,6 +89,7 @@ function analyzeProject(cwd) {
   const packageJson = readJson(path.join(cwd, "package.json"));
   const scripts = collectAllScripts(cwd, allFiles);
   const shape = detectShape(cwd, packageJson);
+  const untrackedHarness = untrackedHarnessFiles(cwd, allFiles);
 
   const fractalDocs =
     countBasename(allFiles, "CLAUDE.md") >= 2 || countBasename(allFiles, "AGENTS.md") >= 2;
@@ -172,13 +193,20 @@ function analyzeProject(cwd) {
       hasMemoryStore(filesByRoot),
       "Add cross-session memory (docs/decisions ADRs, .claude/memory, or a decisions log) so context persists across sessions.",
     ),
+    check(
+      "Harness files committed",
+      untrackedHarness.length === 0,
+      untrackedHarness.length === 0
+        ? "Keep config/declaration files (env.d.ts, tsconfig.json, AGENTS.md) git-tracked; a broad gitignore rule (*.d.ts, *.env) silently drops them from CI checkouts."
+        : `These harness files exist on disk but are NOT git-tracked -- remove the matching .gitignore rule (or 'git add -f'): ${untrackedHarness.join(", ")}`,
+    ),
   ];
 
   enrichDepth(checks, { allFiles, roots, filesByRoot });
   const passed = checks.filter((item) => item.ok).length;
   const score = Math.round((passed / checks.length) * 100);
   const warnings = detectWarnings(checks);
-  return { cwd, shape, roots, files: allFiles, packageJson, scripts, checks, score, warnings };
+  return { cwd, shape, roots, files: allFiles, packageJson, scripts, checks, score, warnings, untrackedHarness };
 }
 
 /** Surface false-safety combinations (grounded in SKILL.md Red Flags). */
@@ -466,6 +494,42 @@ function hasMemoryStore(filesByRoot) {
   return false;
 }
 
+/** True when f sits inside a nested repo/worktree/submodule: an ancestor dir carries its own .git. */
+function insideNestedRepo(cwd, f) {
+  const parts = f.split("/");
+  for (let i = 1; i < parts.length; i += 1) {
+    const ancestor = parts.slice(0, i).join("/");
+    if (fs.existsSync(path.join(cwd, ancestor, ".git"))) return true;
+  }
+  return false;
+}
+
+/** Harness anchor files that exist on disk but are NOT git-tracked. A broad gitignore
+ *  (*.d.ts, *.env) can silently drop env.d.ts/tsconfig.json/AGENTS.md from CI checkouts,
+ *  so they reproduce locally but fail in CI. N/A outside a git repo. */
+function untrackedHarnessFiles(cwd, allFiles) {
+  // Detect a git repo even when cwd is a subdirectory (--cwd packages/app):
+  // .git lives in an ancestor, so fs.existsSync(cwd/.git) misses it and the
+  // check would silently pass for gitignored harness files. Probe via git.
+  let inGitRepo = fs.existsSync(path.join(cwd, ".git"));
+  if (!inGitRepo) {
+    const probe = spawnSync("git", ["rev-parse", "--is-inside-work-tree"], { cwd, encoding: "utf8" });
+    inGitRepo = probe.status === 0 && probe.stdout.trim() === "true";
+  }
+  if (!inGitRepo) return [];
+  const BUILD_OUT_RE = /(^|\/)(dist|build|\.next|\.astro|node_modules|out|coverage)\//i;
+  const offenders = [];
+  for (const f of allFiles) {
+    const isAnchor = /(^|\/)(AGENTS\.md|CLAUDE\.md|env\.d\.ts|tsconfig\.json|jsconfig\.json)$/i.test(f)
+      || (/\.d\.ts$/i.test(f) && !BUILD_OUT_RE.test(f));
+    if (!isAnchor) continue;
+    if (insideNestedRepo(cwd, f)) continue;
+    const r = spawnSync("git", ["ls-files", "--error-unmatch", f], { cwd, encoding: "utf8" });
+    if (r.status !== 0) offenders.push(f);
+  }
+  return offenders;
+}
+
 function listFiles(root, maxDepth) {
   const result = new Set();
   walk(root, "", 0, maxDepth, result);
@@ -559,7 +623,7 @@ export function printEvolution(report, plan) {
 function buildInitFiles(report) {
   const name = report.packageJson?.name || path.basename(report.cwd);
   return [
-    file("AGENTS.md", agentInstructions(name)),
+    file("AGENTS.md", agentInstructions(name, report.packageJson?.scripts, Boolean(report.packageJson))),
     file(".github/copilot-instructions.md", copilotInstructions(name)),
     file("docs/knowledge-base/patterns.md", "# Patterns\n\nDocument project-specific code patterns that agents should reuse.\n"),
     file("docs/knowledge-base/constraints.md", "# Constraints\n\nDocument rules that must not be violated. Promote repeated rules into tests or validators.\n"),
@@ -673,7 +737,18 @@ function writeOrPreview(cwd, files, write) {
   if (!write) console.log("\nRun again with --write to create these files.");
 }
 
-function agentInstructions(name) {
+function agentInstructions(name, scripts, hasPackageJson = false) {
+  // Emit `npm run <script>` rather than the raw body: locally installed binaries
+  //  (vite, tsc, eslint) are only on PATH when run through npm scripts.
+  const cmd = (...keys) => {
+    for (const k of keys) if (scripts && scripts[k]) return `npm run ${k}`;
+    return "";
+  };
+  const dev = cmd("dev", "start");
+  const validate = cmd("verify", "validate", "ci");
+  const build = cmd("build");
+  const testCmd = cmd("test");
+  const line = (label, value) => `- ${label}: ${value || ""}`;
   return `# ${name} Agent Instructions
 
 ## Project Facts
@@ -683,11 +758,11 @@ function agentInstructions(name) {
 
 ## Commands
 
-- Install:
-- Dev:
-- Validate:
-- Build:
-- Test:
+${line("Install", hasPackageJson ? "npm install" : "")}
+${line("Dev", dev)}
+${line("Validate", validate)}
+${line("Build", build)}
+${line("Test", testCmd)}
 
 ## Agent Rules
 
