@@ -623,7 +623,7 @@ export function printEvolution(report, plan) {
 function buildInitFiles(report) {
   const name = report.packageJson?.name || path.basename(report.cwd);
   return [
-    file("AGENTS.md", agentInstructions(name, report.scripts, Boolean(report.packageJson))),
+    file("AGENTS.md", agentInstructions(name, report.packageJson?.scripts, Boolean(report.packageJson))),
     file(".github/copilot-instructions.md", copilotInstructions(name)),
     file("docs/knowledge-base/patterns.md", "# Patterns\n\nDocument project-specific code patterns that agents should reuse.\n"),
     file("docs/knowledge-base/constraints.md", "# Constraints\n\nDocument rules that must not be violated. Promote repeated rules into tests or validators.\n"),
@@ -745,7 +745,7 @@ function agentInstructions(name, scripts, hasPackageJson = false) {
     return "";
   };
   const dev = cmd("dev", "start");
-  const validate = cmd("verify", "validate");
+  const validate = cmd("verify", "validate", "ci");
   const build = cmd("build");
   const testCmd = cmd("test");
   const line = (label, value) => `- ${label}: ${value || ""}`;

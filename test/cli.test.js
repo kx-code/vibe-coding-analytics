@@ -667,3 +667,38 @@ test("flags untracked harness files when cwd is a repo subdirectory", () => {
   assert.ok(tracked, "check exists");
   assert.equal(tracked.ok, false, "flags gitignored env.d.ts even when cwd is a repo subdir");
 });
+
+test("init pre-fills Validate from ci script when no verify/validate", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-ci-"));
+  fs.writeFileSync(
+    path.join(dir, "package.json"),
+    JSON.stringify({ name: "demo", scripts: { ci: "node --test" } }),
+  );
+  await runCli(["init", "--cwd", dir, "--write"]);
+  const agents = fs.readFileSync(path.join(dir, "AGENTS.md"), "utf8");
+  assert.ok(/- Validate: npm run ci$/m.test(agents), "Validate falls back to npm run ci");
+});
+
+test("init pre-fills only root scripts in monorepo (no child pkg leak)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-mono-"));
+  // root: has build but NO dev
+  fs.writeFileSync(
+    path.join(dir, "package.json"),
+    JSON.stringify({
+      name: "monorepo-root",
+      scripts: { build: "npm run build --workspaces" },
+      workspaces: ["packages/*"],
+    }),
+  );
+  // child pkg: has dev (must NOT leak into root AGENTS.md)
+  fs.mkdirSync(path.join(dir, "packages", "foo"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, "packages", "foo", "package.json"),
+    JSON.stringify({ name: "foo", scripts: { dev: "vite" } }),
+  );
+  await runCli(["init", "--cwd", dir, "--write"]);
+  const agents = fs.readFileSync(path.join(dir, "AGENTS.md"), "utf8");
+  assert.ok(/- Build: npm run build/m.test(agents), "root Build pre-filled from root script");
+  // child-only "dev" must not leak: Dev line should be blank or absent
+  assert.ok(!/- Dev: npm run dev/.test(agents), "child dev script does not leak to root Dev");
+});
