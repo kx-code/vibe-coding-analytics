@@ -634,9 +634,9 @@ test("init pre-fills detected package.json scripts into AGENTS.md", async () => 
   );
   await runCli(["init", "--cwd", dir, "--write"]);
   const agents = fs.readFileSync(path.join(dir, "AGENTS.md"), "utf8");
-  assert.ok(/- Dev: vite$/m.test(agents), "Dev pre-filled with script value");
-  assert.ok(/- Build: vite build$/m.test(agents), "Build pre-filled with script value");
-  assert.ok(/- Test: node --test$/m.test(agents), "Test pre-filled with script value");
+  assert.ok(/- Dev: npm run dev$/m.test(agents), "Dev pre-filled as `npm run` invocation");
+  assert.ok(/- Build: npm run build$/m.test(agents), "Build pre-filled as `npm run` invocation");
+  assert.ok(/- Test: npm run test$/m.test(agents), "Test pre-filled as `npm run` invocation");
 });
 
 test("init leaves command lines blank when no scripts are detected", async () => {
@@ -646,4 +646,24 @@ test("init leaves command lines blank when no scripts are detected", async () =>
   const agents = fs.readFileSync(path.join(dir, "AGENTS.md"), "utf8");
   assert.ok(/- Build:\s*$/m.test(agents), "Build line stays blank when no scripts detected");
   assert.ok(/- Dev:\s*$/m.test(agents), "Dev line stays blank when no scripts detected");
+});
+
+test("init leaves Install blank for non-Node projects", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-nonde-"));
+  fs.writeFileSync(path.join(dir, "go.mod"), "module demo\n");
+  await runCli(["init", "--cwd", dir, "--write"]);
+  const agents = fs.readFileSync(path.join(dir, "AGENTS.md"), "utf8");
+  assert.ok(/- Install:\s*$/m.test(agents), "Install blank for non-Node project (no bogus npm install)");
+});
+
+test("flags untracked harness files when cwd is a repo subdirectory", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "vca-subdir-"));
+  fs.mkdirSync(path.join(root, "pkg"), { recursive: true });
+  fs.writeFileSync(path.join(root, "pkg", "env.d.ts"), "declare namespace {}\n");
+  fs.writeFileSync(path.join(root, ".gitignore"), "*.d.ts\n");
+  execSync('git init -q && git config user.email t@t.t && git config user.name t', { cwd: root, stdio: "pipe" });
+  const report = analyzeForTest(path.join(root, "pkg"));
+  const tracked = report.checks.find((c) => c.area === "Harness files committed");
+  assert.ok(tracked, "check exists");
+  assert.equal(tracked.ok, false, "flags gitignored env.d.ts even when cwd is a repo subdir");
 });

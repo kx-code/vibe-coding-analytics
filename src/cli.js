@@ -508,7 +508,15 @@ function insideNestedRepo(cwd, f) {
  *  (*.d.ts, *.env) can silently drop env.d.ts/tsconfig.json/AGENTS.md from CI checkouts,
  *  so they reproduce locally but fail in CI. N/A outside a git repo. */
 function untrackedHarnessFiles(cwd, allFiles) {
-  if (!fs.existsSync(path.join(cwd, ".git"))) return [];
+  // Detect a git repo even when cwd is a subdirectory (--cwd packages/app):
+  // .git lives in an ancestor, so fs.existsSync(cwd/.git) misses it and the
+  // check would silently pass for gitignored harness files. Probe via git.
+  let inGitRepo = fs.existsSync(path.join(cwd, ".git"));
+  if (!inGitRepo) {
+    const probe = spawnSync("git", ["rev-parse", "--is-inside-work-tree"], { cwd, encoding: "utf8" });
+    inGitRepo = probe.status === 0 && probe.stdout.trim() === "true";
+  }
+  if (!inGitRepo) return [];
   const BUILD_OUT_RE = /(^|\/)(dist|build|\.next|\.astro|node_modules|out|coverage)\//i;
   const offenders = [];
   for (const f of allFiles) {
@@ -615,7 +623,7 @@ export function printEvolution(report, plan) {
 function buildInitFiles(report) {
   const name = report.packageJson?.name || path.basename(report.cwd);
   return [
-    file("AGENTS.md", agentInstructions(name, report.scripts)),
+    file("AGENTS.md", agentInstructions(name, report.scripts, Boolean(report.packageJson))),
     file(".github/copilot-instructions.md", copilotInstructions(name)),
     file("docs/knowledge-base/patterns.md", "# Patterns\n\nDocument project-specific code patterns that agents should reuse.\n"),
     file("docs/knowledge-base/constraints.md", "# Constraints\n\nDocument rules that must not be violated. Promote repeated rules into tests or validators.\n"),
@@ -729,9 +737,11 @@ function writeOrPreview(cwd, files, write) {
   if (!write) console.log("\nRun again with --write to create these files.");
 }
 
-function agentInstructions(name, scripts) {
+function agentInstructions(name, scripts, hasPackageJson = false) {
+  // Emit `npm run <script>` rather than the raw body: locally installed binaries
+  //  (vite, tsc, eslint) are only on PATH when run through npm scripts.
   const cmd = (...keys) => {
-    for (const k of keys) if (scripts && scripts[k]) return scripts[k];
+    for (const k of keys) if (scripts && scripts[k]) return `npm run ${k}`;
     return "";
   };
   const dev = cmd("dev", "start");
@@ -748,7 +758,7 @@ function agentInstructions(name, scripts) {
 
 ## Commands
 
-${line("Install", "npm install")}
+${line("Install", hasPackageJson ? "npm install" : "")}
 ${line("Dev", dev)}
 ${line("Validate", validate)}
 ${line("Build", build)}
