@@ -491,7 +491,7 @@ function recentFixPatterns(cwd, limit = 40) {
     const line = raw.trim();
     if (!line) { expectSubject = true; continue; }
     if (expectSubject) {
-      inFixCommit = /(fix|bug|patch|hotfix)/i.test(line);
+      inFixCommit = /\b(fix|bug|patch|hotfix)\b/i.test(line);
       if (inFixCommit) fixCommits += 1;
       expectSubject = false;
     } else if (inFixCommit) {

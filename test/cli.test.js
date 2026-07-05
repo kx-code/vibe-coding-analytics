@@ -361,3 +361,20 @@ test("evolve scopes fix hotspots to the analyzed cwd, not the ancestor repo", ()
   const auth = plan.fixPatterns.hotFiles.find((h) => h.file.endsWith("auth.ts"));
   assert.ok(auth && auth.count >= 2, "fix inside the analyzed cwd should be reported as a hotspot");
 });
+
+test("evolve does not count prefix/fixture/dispatch substrings as fix commits", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-fixterms-"));
+  execSync('git init -q && git config user.email t@t.t && git config user.name t', { cwd: dir, stdio: "pipe" });
+  // Each subject contains a "fix"/"patch" substring inside another word.
+  // The old unanchored regex matched them and counted these as fix commits.
+  fs.writeFileSync(path.join(dir, "a.ts"), "1\n");
+  execSync('git add -A && git commit -qm "feat: add prefix helper"', { cwd: dir, stdio: "pipe" });
+  fs.writeFileSync(path.join(dir, "a.ts"), "2\n");
+  execSync('git add -A && git commit -qm "chore: update test fixture"', { cwd: dir, stdio: "pipe" });
+  fs.writeFileSync(path.join(dir, "a.ts"), "3\n");
+  execSync('git add -A && git commit -qm "refactor: dispatch handler"', { cwd: dir, stdio: "pipe" });
+  const report = analyzeForTest(dir);
+  const plan = buildEvolutionPlan(report);
+  assert.equal(plan.fixPatterns.fixCommits, 0, "prefix/fixture/dispatch substrings must not count as fix commits");
+  assert.equal(plan.fixPatterns.hotFiles.length, 0, "non-fix commits must not produce hotspots");
+});
