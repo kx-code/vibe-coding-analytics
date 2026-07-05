@@ -811,3 +811,11 @@ test("analytics MISS Steering loop with no rules file", () => {
   const loop = r.checks.find((c) => c.area === "Steering loop");
   assert.ok(loop && !loop.ok, "no rules file misses steering loop");
 });
+
+test("every analytics check has a non-empty action/hint", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-actions-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "project");
+  const r = analyzeForTest(dir);
+  const missing = r.checks.filter((c) => !c.action || typeof c.action !== "string" || c.action.trim() === "");
+  assert.equal(missing.length, 0, `checks missing action: ${missing.map((c) => c.area).join(", ")}`);
+});

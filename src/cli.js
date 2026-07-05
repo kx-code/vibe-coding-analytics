@@ -182,6 +182,7 @@ function analyzeProject(cwd) {
         hasTestFiles(allFiles) ||
         hasValidateScript(allFiles) ||
         Boolean(scripts.lint || scripts["type-check"] || scripts.typecheck || scripts.validate || scripts.ci),
+      "Rules in CLAUDE.md/AGENTS.md need computational sensors (tests, lint, validators); prose-only rules drift.",
     ),
     check(
       "Steering loop",
