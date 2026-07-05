@@ -620,10 +620,35 @@ export function printEvolution(report, plan) {
   }
 }
 
+function detectPackageManager(cwd, packageJson) {
+  // Explicit packageManager field wins; otherwise infer from lockfile.
+  if (packageJson && packageJson.packageManager) {
+    const pm = String(packageJson.packageManager).split("@")[0].trim();
+    if (pm === "npm" || pm === "pnpm" || pm === "yarn" || pm === "bun") return pm;
+  }
+  // Walk up the directory tree so a workspace subdirectory inherits the
+  // package manager declared by the workspace root lockfile.
+  let dir = cwd;
+  while (true) {
+    try {
+      if (fs.existsSync(path.join(dir, "package-lock.json"))) return "npm";
+      if (fs.existsSync(path.join(dir, "pnpm-lock.yaml"))) return "pnpm";
+      if (fs.existsSync(path.join(dir, "yarn.lock"))) return "yarn";
+      if (fs.existsSync(path.join(dir, "bun.lockb")) || fs.existsSync(path.join(dir, "bun.lock"))) return "bun";
+    } catch {
+      /* ignore fs errors (e.g. permission) */
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) break; // filesystem root reached
+    dir = parent;
+  }
+  return "npm";
+}
+
 function buildInitFiles(report) {
   const name = report.packageJson?.name || path.basename(report.cwd);
   return [
-    file("AGENTS.md", agentInstructions(name, report.packageJson?.scripts, Boolean(report.packageJson))),
+    file("AGENTS.md", agentInstructions(name, report.packageJson?.scripts, Boolean(report.packageJson), detectPackageManager(report.cwd, report.packageJson))),
     file(".github/copilot-instructions.md", copilotInstructions(name)),
     file("docs/knowledge-base/patterns.md", "# Patterns\n\nDocument project-specific code patterns that agents should reuse.\n"),
     file("docs/knowledge-base/constraints.md", "# Constraints\n\nDocument rules that must not be violated. Promote repeated rules into tests or validators.\n"),
@@ -737,11 +762,11 @@ function writeOrPreview(cwd, files, write) {
   if (!write) console.log("\nRun again with --write to create these files.");
 }
 
-function agentInstructions(name, scripts, hasPackageJson = false) {
+function agentInstructions(name, scripts, hasPackageJson = false, pm = "npm") {
   // Emit `npm run <script>` rather than the raw body: locally installed binaries
   //  (vite, tsc, eslint) are only on PATH when run through npm scripts.
   const cmd = (...keys) => {
-    for (const k of keys) if (scripts && scripts[k]) return `npm run ${k}`;
+    for (const k of keys) if (scripts && scripts[k]) return `${pm} run ${k}`;
     return "";
   };
   const dev = cmd("dev", "start");
@@ -758,7 +783,7 @@ function agentInstructions(name, scripts, hasPackageJson = false) {
 
 ## Commands
 
-${line("Install", hasPackageJson ? "npm install" : "")}
+${line("Install", hasPackageJson ? `${pm} install` : "")}
 ${line("Dev", dev)}
 ${line("Validate", validate)}
 ${line("Build", build)}
