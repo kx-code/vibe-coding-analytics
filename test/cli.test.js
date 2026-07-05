@@ -753,3 +753,17 @@ test("init respects packageManager field over lockfile", async () => {
   const agents = fs.readFileSync(path.join(dir, "AGENTS.md"), "utf8");
   assert.ok(/- Install: pnpm install/.test(agents), "packageManager field wins over yarn.lock");
 });
+
+test("init detects workspace package manager above cwd", async () => {
+  // workspace root has the lockfile; init runs from a child package dir
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "vca-ws-"));
+  fs.writeFileSync(path.join(root, "package.json"), JSON.stringify({ name: "ws-root", private: true }));
+  fs.writeFileSync(path.join(root, "pnpm-lock.yaml"), "");
+  const sub = path.join(root, "packages", "foo");
+  fs.mkdirSync(sub, { recursive: true });
+  fs.writeFileSync(path.join(sub, "package.json"), JSON.stringify({ name: "foo", scripts: { dev: "vite" } }));
+  await runCli(["init", "--cwd", sub, "--write"]);
+  const agents = fs.readFileSync(path.join(sub, "AGENTS.md"), "utf8");
+  assert.ok(/- Install: pnpm install/.test(agents), "detects pnpm from workspace root lockfile above cwd");
+  assert.ok(/- Dev: pnpm run dev/.test(agents), "uses pnpm run for child pkg scripts");
+});

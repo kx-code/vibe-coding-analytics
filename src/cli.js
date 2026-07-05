@@ -626,12 +626,20 @@ function detectPackageManager(cwd, packageJson) {
     const pm = String(packageJson.packageManager).split("@")[0].trim();
     if (pm === "npm" || pm === "pnpm" || pm === "yarn" || pm === "bun") return pm;
   }
-  try {
-    if (fs.existsSync(path.join(cwd, "pnpm-lock.yaml"))) return "pnpm";
-    if (fs.existsSync(path.join(cwd, "yarn.lock"))) return "yarn";
-    if (fs.existsSync(path.join(cwd, "bun.lockb")) || fs.existsSync(path.join(cwd, "bun.lock"))) return "bun";
-  } catch {
-    /* ignore fs errors (e.g. permission) */
+  // Walk up the directory tree so a workspace subdirectory inherits the
+  // package manager declared by the workspace root lockfile.
+  let dir = cwd;
+  while (true) {
+    try {
+      if (fs.existsSync(path.join(dir, "pnpm-lock.yaml"))) return "pnpm";
+      if (fs.existsSync(path.join(dir, "yarn.lock"))) return "yarn";
+      if (fs.existsSync(path.join(dir, "bun.lockb")) || fs.existsSync(path.join(dir, "bun.lock"))) return "bun";
+    } catch {
+      /* ignore fs errors (e.g. permission) */
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) break; // filesystem root reached
+    dir = parent;
   }
   return "npm";
 }
