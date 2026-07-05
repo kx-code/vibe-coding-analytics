@@ -560,3 +560,90 @@ test("Tests depth excludes placeholder and fixture files in test directories", (
   assert.ok(tests && tests.ok, "hasPrefixAt('test/') still PASS");
   assert.match(tests.depth, /0 test file/, `placeholder/fixture must not count, got ${tests.depth}`);
 });
+
+test("--version prints the package version and skips analysis", async () => {
+  const orig = console.log;
+  let captured = "";
+  console.log = (s) => {
+    captured = String(s);
+  };
+  try {
+    await runCli(["--version"]);
+  } finally {
+    console.log = orig;
+  }
+  const pkg = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+  assert.equal(captured, pkg.version, `expected ${pkg.version}, got ${captured}`);
+});
+
+test("analytics --format json emits parseable JSON with score and checks", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-json-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  const orig = console.log;
+  let captured = "";
+  console.log = (s) => { captured = String(s); };
+  try {
+    await runCli(["analytics", "--cwd", dir, "--format", "json"]);
+  } finally {
+    console.log = orig;
+  }
+  const obj = JSON.parse(captured);
+  assert.equal(typeof obj.score, "number", "score is a number");
+  assert.ok(Array.isArray(obj.checks), "checks is an array");
+  assert.ok(Array.isArray(obj.files), "files is an array (Set serialized)");
+});
+
+test("flags harness files that exist on disk but are not git-tracked", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-untracked-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# root\n");
+  fs.writeFileSync(path.join(dir, "env.d.ts"), "declare namespace {}\n");
+  fs.writeFileSync(path.join(dir, ".gitignore"), "*.d.ts\n");
+  execSync('git init -q && git config user.email t@t.t && git config user.name t', { cwd: dir, stdio: "pipe" });
+  const report = analyzeForTest(dir);
+  const tracked = report.checks.find((c) => c.area === "Harness files committed");
+  assert.ok(tracked, "has a Harness files committed check");
+  assert.equal(tracked.ok, false, "check fails when env.d.ts is gitignored");
+  assert.ok(/env\.d\.ts/.test(tracked.action), "action names the untracked file");
+});
+
+test("does not flag harness files when they are git-tracked", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-tracked-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# root\n");
+  fs.writeFileSync(path.join(dir, "tsconfig.json"), "{}\n");
+  execSync('git init -q && git config user.email t@t.t && git config user.name t', { cwd: dir, stdio: "pipe" });
+  execSync("git add -A", { cwd: dir, stdio: "pipe" });
+  const report = analyzeForTest(dir);
+  const tracked = report.checks.find((c) => c.area === "Harness files committed");
+  assert.ok(tracked && tracked.ok, "check passes when harness files are tracked");
+});
+
+test("does not flag harness files when the tree is not a git repo", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-nogit-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# root\n");
+  fs.writeFileSync(path.join(dir, "tsconfig.json"), "{}\n");
+  const report = analyzeForTest(dir);
+  const tracked = report.checks.find((c) => c.area === "Harness files committed");
+  assert.ok(tracked && tracked.ok, "N/A outside a git repo");
+});
+
+test("init pre-fills detected package.json scripts into AGENTS.md", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-prefill-"));
+  fs.writeFileSync(
+    path.join(dir, "package.json"),
+    JSON.stringify({ name: "demo", scripts: { dev: "vite", build: "vite build", test: "node --test" } }),
+  );
+  await runCli(["init", "--cwd", dir, "--write"]);
+  const agents = fs.readFileSync(path.join(dir, "AGENTS.md"), "utf8");
+  assert.ok(/- Dev: vite$/m.test(agents), "Dev pre-filled with script value");
+  assert.ok(/- Build: vite build$/m.test(agents), "Build pre-filled with script value");
+  assert.ok(/- Test: node --test$/m.test(agents), "Test pre-filled with script value");
+});
+
+test("init leaves command lines blank when no scripts are detected", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-noscripts-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "bare", scripts: {} }));
+  await runCli(["init", "--cwd", dir, "--write"]);
+  const agents = fs.readFileSync(path.join(dir, "AGENTS.md"), "utf8");
+  assert.ok(/- Build:\s*$/m.test(agents), "Build line stays blank when no scripts detected");
+  assert.ok(/- Dev:\s*$/m.test(agents), "Dev line stays blank when no scripts detected");
+});
