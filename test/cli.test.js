@@ -198,3 +198,23 @@ test("Tests depth counts plain filenames inside a recognized test/ directory", (
   assert.ok(tests && tests.ok, "hasPrefixAt('test/') -> PASS");
   assert.match(tests.depth, /1 test file/, `depth should count test/api.js, got ${tests.depth}`);
 });
+
+test("depth counters scan submodule roots beyond the top-level walk", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-depthsub-"));
+  // Submodule nested deeper than listFiles(cwd, 7), so its test file is only in
+  // filesByRoot[submoduleRoot], not allFiles. The Tests check still passes via
+  // hasPrefixAt("tests/") (per-root), but the old counter only saw allFiles.
+  const sub = path.join(dir, "a", "b", "c", "d", "e", "f", "g", "h", "svc");
+  fs.mkdirSync(path.join(sub, "tests"), { recursive: true });
+  fs.writeFileSync(path.join(sub, "tests", "api_test.go"), "package tests\n");
+  fs.writeFileSync(path.join(sub, "go.mod"), "module svc\n");
+  fs.writeFileSync(
+    path.join(dir, ".gitmodules"),
+    '[submodule "svc"]\n\tpath = a/b/c/d/e/f/g/h/svc\n\turl = https://example.com/s.git\n',
+  );
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# root");
+  const report = analyzeForTest(dir);
+  const tests = report.checks.find((c) => c.area === "Tests");
+  assert.ok(tests && tests.ok, "submodule test file -> Tests PASS via per-root scan");
+  assert.match(tests.depth, /1 test file/, `deep-submodule test should be counted, got ${tests.depth}`);
+});

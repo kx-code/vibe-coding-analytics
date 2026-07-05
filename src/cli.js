@@ -223,14 +223,27 @@ function countValidators(allFiles) {
 }
 /** Attach a depth hint to key PASS-ing checks so a stub (1 test) is distinguishable from a mature project (hundreds). */
 function enrichDepth(checks, ctx) {
+  // Depth counters must see every project root, not just the top-level walk:
+  // (tests/skills/validators in a deep submodule live in filesByRoot and can be
+  // truncated out of allFiles by the listFiles(cwd, 7) depth cap). Normalize each
+  // non-cwd root to cwd-relative paths so deep files are counted without
+  // double-counting shallow ones already in allFiles.
+  const cwd = ctx.roots[0];
+  const allRootFiles = new Set(ctx.allFiles);
+  for (const [root, files] of ctx.filesByRoot) {
+    if (root === cwd) continue;
+    const prefix = path.relative(cwd, root);
+    for (const f of files) allRootFiles.add(prefix ? `${prefix}/${f}` : f);
+  }
+  const merged = [...allRootFiles];
   const set = (area, depth) => {
     const c = checks.find((x) => x.area === area);
     if (c && c.ok && depth) c.depth = depth;
   };
-  set("Tests", `${countTestFiles(ctx.allFiles)} test file(s)`);
+  set("Tests", `${countTestFiles(merged)} test file(s)`);
   set("Agent instructions", `${countInstructionLines(ctx.roots, ctx.filesByRoot)} instruction line(s)`);
-  set("Reusable skills", `${countSkills(ctx.allFiles)} skill(s)`);
-  set("Architecture sensors", `${countValidators(ctx.allFiles)} validator script(s)`);
+  set("Reusable skills", `${countSkills(merged)} skill(s)`);
+  set("Architecture sensors", `${countValidators(merged)} validator script(s)`);
 }
 
 function check(area, ok, action) {
