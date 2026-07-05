@@ -142,6 +142,8 @@ for marketplace submission.
 - Tests, typecheck, lint, architecture validators, and CI
 - Rule-to-sensor coverage: prose rules in `CLAUDE.md`/`AGENTS.md` backed by
   computational sensors (tests, lint, validators), not prose-only
+- Steering loop: numbered rules (`规则 N` / `Rule N`) in `CLAUDE.md`/`AGENTS.md`
+  that grow after each bug fix — the rising count is the feedback-loop heartbeat
 - Failure observability: monitoring, alerting, or error counters so critical-path
   failures surface instead of failing silently
 - Deploy and post-deploy verification hooks
