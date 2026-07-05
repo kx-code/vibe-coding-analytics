@@ -267,6 +267,7 @@ test("cross-session memory detected for decisions under a submodule root", () =>
   const report = analyzeForTest(dir);
   const mem = report.checks.find((c) => c.area === "Cross-session memory");
   assert.ok(mem && mem.ok, "backend/docs/decisions/ under a submodule must count as memory");
+});
 
 // ---- evolve: analytics gaps -> concrete promotion plan + git fix hotspots ----
 
