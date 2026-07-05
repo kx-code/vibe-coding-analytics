@@ -702,3 +702,54 @@ test("init pre-fills only root scripts in monorepo (no child pkg leak)", async (
   // child-only "dev" must not leak: Dev line should be blank or absent
   assert.ok(!/- Dev: npm run dev/.test(agents), "child dev script does not leak to root Dev");
 });
+
+test("init uses pnpm commands when pnpm-lock.yaml present", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-pnpm-"));
+  fs.writeFileSync(
+    path.join(dir, "package.json"),
+    JSON.stringify({ name: "demo", scripts: { dev: "vite" } }),
+  );
+  fs.writeFileSync(path.join(dir, "pnpm-lock.yaml"), "");
+  await runCli(["init", "--cwd", dir, "--write"]);
+  const agents = fs.readFileSync(path.join(dir, "AGENTS.md"), "utf8");
+  assert.ok(/- Install: pnpm install/.test(agents), "pnpm install");
+  assert.ok(/- Dev: pnpm run dev/.test(agents), "pnpm run dev");
+});
+
+test("init uses yarn commands when yarn.lock present", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-yarn-"));
+  fs.writeFileSync(
+    path.join(dir, "package.json"),
+    JSON.stringify({ name: "demo", scripts: { dev: "vite" } }),
+  );
+  fs.writeFileSync(path.join(dir, "yarn.lock"), "");
+  await runCli(["init", "--cwd", dir, "--write"]);
+  const agents = fs.readFileSync(path.join(dir, "AGENTS.md"), "utf8");
+  assert.ok(/- Install: yarn install/.test(agents), "yarn install");
+  assert.ok(/- Dev: yarn run dev/.test(agents), "yarn run dev");
+});
+
+test("init uses bun commands when bun.lockb present", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-bun-"));
+  fs.writeFileSync(
+    path.join(dir, "package.json"),
+    JSON.stringify({ name: "demo", scripts: { dev: "vite" } }),
+  );
+  fs.writeFileSync(path.join(dir, "bun.lockb"), "");
+  await runCli(["init", "--cwd", dir, "--write"]);
+  const agents = fs.readFileSync(path.join(dir, "AGENTS.md"), "utf8");
+  assert.ok(/- Install: bun install/.test(agents), "bun install");
+  assert.ok(/- Dev: bun run dev/.test(agents), "bun run dev");
+});
+
+test("init respects packageManager field over lockfile", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-pm-"));
+  fs.writeFileSync(
+    path.join(dir, "package.json"),
+    JSON.stringify({ name: "demo", scripts: { dev: "vite" }, packageManager: "pnpm@9.12.0" }),
+  );
+  fs.writeFileSync(path.join(dir, "yarn.lock"), "");
+  await runCli(["init", "--cwd", dir, "--write"]);
+  const agents = fs.readFileSync(path.join(dir, "AGENTS.md"), "utf8");
+  assert.ok(/- Install: pnpm install/.test(agents), "packageManager field wins over yarn.lock");
+});
