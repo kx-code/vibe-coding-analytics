@@ -131,8 +131,9 @@ test("Tests depth reports test file count", () => {
 test("Agent instructions depth reports instruction line count", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-d-lines-"));
   fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "x" }));
-  // 5 lines, no trailing newline => split("\n").length === 5
-  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# line1\n# line2\n# line3\n# line4\n# line5");
+  // 5 lines WITH a trailing newline (normal Markdown convention) — must still
+  // report 5, not 6: the trailing \n must not add an empty counted segment.
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# line1\n# line2\n# line3\n# line4\n# line5\n");
   const report = analyzeForTest(dir);
   const ai = report.checks.find((c) => c.area === "Agent instructions");
   assert.ok(ai && ai.ok);

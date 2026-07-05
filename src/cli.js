@@ -198,7 +198,11 @@ function countInstructionLines(roots, filesByRoot) {
     for (const f of filesByRoot.get(root)) {
       if (f === "CLAUDE.md" || f === "AGENTS.md") {
         try {
-          lines += fs.readFileSync(path.join(root, f), "utf8").split("\n").length;
+          // Trim trailing newline(s): Markdown convention ends files with \n,
+          // which would otherwise add an empty segment and overstate the
+          // instruction-line depth hint by one per AGENTS/CLAUDE.md (off-by-one).
+          const instructionText = fs.readFileSync(path.join(root, f), "utf8").replace(/\n+$/, "");
+          lines += instructionText === "" ? 0 : instructionText.split("\n").length;
         } catch {
           /* ignore */
         }
