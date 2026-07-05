@@ -145,6 +145,31 @@ function analyzeProject(cwd) {
       hasValidateScript(allFiles) || anyMakefileTarget(roots, ["validate", "lint"]),
       "Add project-specific validators (scripts/*validate*/*verify*) for rules that should not rely on memory.",
     ),
+    check(
+      "Deploy hooks",
+      hasScriptPrefix(scripts, ["deploy", "release"]) ||
+        anyMakefileTarget(roots, ["deploy", "release"]) ||
+        hasDeployArtifact(filesByRoot),
+      "Add a deploy/release script, workflow, or skill so code is never deployed unverified.",
+    ),
+    check(
+      "Rule sensors",
+      !(hasAt("CLAUDE.md") || hasAt("AGENTS.md")) ||
+        hasTestFiles(allFiles) ||
+        hasValidateScript(allFiles) ||
+        Boolean(scripts.lint || scripts["type-check"] || scripts.typecheck || scripts.validate || scripts.ci),
+      "Rules in CLAUDE.md/AGENTS.md need computational sensors (tests, lint, validators); prose-only rules drift.",
+    ),
+    check(
+      "Failure observability",
+      Boolean(scripts.monitor) || hasObservabilitySensor(allFiles),
+      "Add monitoring/alerting (monitor scripts, health workflows, error counters) so critical-path failures surface instead of failing silently.",
+    ),
+    check(
+      "Cross-session memory",
+      hasMemoryStore(filesByRoot),
+      "Add cross-session memory (docs/decisions ADRs, .claude/memory, or a decisions log) so context persists across sessions.",
+    ),
   ];
 
   const passed = checks.filter((item) => item.ok).length;
@@ -265,6 +290,55 @@ function hasValidateScript(allFiles) {
   for (const file of allFiles) {
     const inScripts = file.startsWith("scripts/") || file.includes("/scripts/");
     if (inScripts && /(validate|verify|check|lint)/i.test(file)) return true;
+  }
+  return false;
+}
+
+/** Deploy/release artifacts: scripts, CI workflows, or deploy/release skills. */
+/** True if any package script key starts with one of the given heads (e.g. deploy:prod). */
+function hasScriptPrefix(scripts, prefixes) {
+  for (const name of Object.keys(scripts)) {
+    if (prefixes.includes(name.split(":")[0])) return true;
+  }
+  return false;
+}
+
+/** Deploy artifacts in scripts/workflows/skills. Scanned per root so a deploy
+ *  hook inside a deep git submodule is not lost to the root listFiles depth cap. */
+function hasDeployArtifact(filesByRoot) {
+  for (const [, files] of filesByRoot) {
+    for (const file of files) {
+      if (/scripts\/[^/]*(deploy|release)/i.test(file)) return true;
+      if (/\.github\/workflows\/[^/]*(deploy|release)/i.test(file)) return true;
+      if (/\.claude\/skills\/[^/]*(deploy|release)/i.test(file)) return true;
+    }
+  }
+  return false;
+}
+
+/** Observability sensors: monitor/alert/health files in script/workflow/worker paths.
+ *  README or docs that merely mention monitoring do not count. */
+function hasObservabilitySensor(allFiles) {
+  for (const file of allFiles) {
+    if (!/(monitor|alert|observability|health[-_]?check)/i.test(file)) continue;
+    if (file.includes(".github/workflows/")) return true;
+    if (file.startsWith("scripts/") || file.includes("/scripts/")) return true;
+    if (file.startsWith("workers/") || file.includes("/workers/")) return true;
+  }
+  return false;
+}
+
+/** Cross-session memory: ADR/decisions logs or agent memory stores. */
+/** Cross-session memory: ADR/decisions logs or agent memory stores.
+ *  Scanned per root so submodule decision docs (e.g. backend/docs/decisions/) count. */
+function hasMemoryStore(filesByRoot) {
+  for (const [, files] of filesByRoot) {
+    for (const file of files) {
+      // Root-anchored (docs/decisions/) AND submodule paths (backend/docs/decisions/).
+      if (/(^|\/)docs\/(decisions|adr)\//i.test(file)) return true;
+      if (/\.claude\/memory\//i.test(file)) return true;
+      if (/(^|\/)(DECISIONS|ARCHITECTURE[-_]DECISIONS)\.md$/i.test(file)) return true;
+    }
   }
   return false;
 }

@@ -43,6 +43,10 @@ Use this loop for both new projects and existing repositories:
 | Sensors | typecheck, lint, tests, Playwright, architecture validation, pre-commit hooks |
 | CI and release | GitHub Actions, PR template, deploy workflow, post-deploy checks |
 | Feedback loops | bug-to-test practice, issue/PR review loops, recurring health checks |
+| Rule sensors | prose rules backed by tests, lint, validators (not prose-only) |
+| Observability | monitor scripts, health workflows, error counters, alerts |
+| Deploy safety | deploy scripts/workflows/skills, post-deploy verification |
+| Cross-session memory | ADR decisions (docs/decisions), .claude/memory, decisions log |
 
 Prefer `rg --files` and package manifests over guessing. Read mature sibling projects only as pattern sources; do not copy domain-specific rules.
 
