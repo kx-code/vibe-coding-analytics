@@ -631,6 +631,7 @@ function detectPackageManager(cwd, packageJson) {
   let dir = cwd;
   while (true) {
     try {
+      if (fs.existsSync(path.join(dir, "package-lock.json"))) return "npm";
       if (fs.existsSync(path.join(dir, "pnpm-lock.yaml"))) return "pnpm";
       if (fs.existsSync(path.join(dir, "yarn.lock"))) return "yarn";
       if (fs.existsSync(path.join(dir, "bun.lockb")) || fs.existsSync(path.join(dir, "bun.lock"))) return "bun";

@@ -767,3 +767,16 @@ test("init detects workspace package manager above cwd", async () => {
   assert.ok(/- Install: pnpm install/.test(agents), "detects pnpm from workspace root lockfile above cwd");
   assert.ok(/- Dev: pnpm run dev/.test(agents), "uses pnpm run for child pkg scripts");
 });
+
+test("init honors local package-lock.json over ancestor pnpm workspace", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "vca-nested-"));
+  fs.writeFileSync(path.join(root, "package.json"), JSON.stringify({ name: "ws", private: true }));
+  fs.writeFileSync(path.join(root, "pnpm-lock.yaml"), "");
+  const sub = path.join(root, "packages", "bar");
+  fs.mkdirSync(sub, { recursive: true });
+  fs.writeFileSync(path.join(sub, "package.json"), JSON.stringify({ name: "bar", scripts: { dev: "vite" } }));
+  fs.writeFileSync(path.join(sub, "package-lock.json"), "{}");
+  await runCli(["init", "--cwd", sub, "--write"]);
+  const agents = fs.readFileSync(path.join(sub, "AGENTS.md"), "utf8");
+  assert.ok(/- Install: npm install/.test(agents), "local package-lock.json (npm) wins over ancestor pnpm");
+});
