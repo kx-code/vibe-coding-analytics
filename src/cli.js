@@ -172,6 +172,11 @@ function isTestFile(base) {
     base.endsWith("_test.py")
   );
 }
+/** Source-code extensions counted inside a recognized test directory.
+ *  Allowlist (not blocklist) so placeholders (.gitkeep), binaries, fixtures,
+ *  docs and configs are excluded in one shot. */
+const TEST_DIR_SOURCE_EXT = /\.(?:[cm]?js|tsx?|jsx|py|go|rs|rb|java|kt|kts|c(?:pp|\+\+)?|h(?:pp|h)?|cc|sh|bash|zsh|dart|swift|php|cs|scala|clj|ex|exs|lua|pl|r|tcl)$/i;
+
 function countTestFiles(allFiles) {
   let n = 0;
   for (const file of allFiles) {
@@ -181,7 +186,7 @@ function countTestFiles(allFiles) {
     // Recognized test directory (Mocha test/, tests/, Jest __tests__/): a source
     // file here counts even without a .test/.spec suffix, mirroring the Tests
     // check hasPrefixAt("test/"|"tests/") predicate.
-    if (/(^|\/)(test|tests|__tests__)\//.test(file) && !/\.(md|markdown|txt|json|ya?ml|lock)$/i.test(base)) {
+    if (/(^|\/)(test|tests|__tests__)\//.test(file) && TEST_DIR_SOURCE_EXT.test(base)) {
       n += 1;
     }
   }

@@ -218,3 +218,16 @@ test("depth counters scan submodule roots beyond the top-level walk", () => {
   assert.ok(tests && tests.ok, "submodule test file -> Tests PASS via per-root scan");
   assert.match(tests.depth, /1 test file/, `deep-submodule test should be counted, got ${tests.depth}`);
 });
+
+test("Tests depth excludes placeholder and fixture files in test directories", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-testph-"));
+  fs.mkdirSync(path.join(dir, "test"), { recursive: true });
+  // Placeholders / binary fixtures under test/ must NOT inflate the depth count.
+  fs.writeFileSync(path.join(dir, "test", ".gitkeep"), "");
+  fs.writeFileSync(path.join(dir, "test", "fixture.bin"), "\0");
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x");
+  const report = analyzeForTest(dir);
+  const tests = report.checks.find((c) => c.area === "Tests");
+  assert.ok(tests && tests.ok, "hasPrefixAt('test/') still PASS");
+  assert.match(tests.depth, /0 test file/, `placeholder/fixture must not count, got ${tests.depth}`);
+});
