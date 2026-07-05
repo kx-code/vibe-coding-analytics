@@ -2,8 +2,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { execSync } from "node:child_process";
 import assert from "node:assert/strict";
-import { analyzeForTest, runCli, printReport } from "../src/cli.js";
+import { analyzeForTest, runCli, buildEvolutionPlan, printEvolution, printReport } from "../src/cli.js";
 
 test("analyzes an empty project with missing harness areas", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-empty-"));
@@ -113,9 +114,273 @@ test("detects typecheck config in a deeply-nested git submodule", () => {
   assert.ok(typecheck && typecheck.ok, "typecheck via deeply-nested submodule go.mod");
 });
 
+test("deploy hooks detected via scripts, workflows, and skills", () => {
+  const scriptDir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-deploy-script-"));
+  fs.writeFileSync(
+    path.join(scriptDir, "package.json"),
+    JSON.stringify({ name: "a", scripts: { deploy: "wrangler pages deploy" } }),
+  );
+  fs.writeFileSync(path.join(scriptDir, "CLAUDE.md"), "# a");
+  let r = analyzeForTest(scriptDir);
+  assert.ok(r.checks.find((c) => c.area === "Deploy hooks")?.ok, "deploy via package script");
 
-// ---- false-safety warnings (Tests without CI, rules without enforcement, no single command) ----
+  const wfDir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-deploy-wf-"));
+  fs.mkdirSync(path.join(wfDir, ".github", "workflows"), { recursive: true });
+  fs.writeFileSync(path.join(wfDir, ".github", "workflows", "deploy.yml"), "on: push\n");
+  fs.writeFileSync(path.join(wfDir, "CLAUDE.md"), "# b");
+  r = analyzeForTest(wfDir);
+  assert.ok(r.checks.find((c) => c.area === "Deploy hooks")?.ok, "deploy via workflow file");
 
+  const skillDir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-deploy-skill-"));
+  fs.mkdirSync(path.join(skillDir, ".claude", "skills", "deploy-production"), { recursive: true });
+  fs.writeFileSync(path.join(skillDir, ".claude", "skills", "deploy-production", "SKILL.md"), "deploy");
+  fs.writeFileSync(path.join(skillDir, "CLAUDE.md"), "# c");
+  r = analyzeForTest(skillDir);
+  assert.ok(r.checks.find((c) => c.area === "Deploy hooks")?.ok, "deploy via skill");
+});
+
+test("rule sensors require computational enforcement when prose rules exist", () => {
+  const proseOnly = fs.mkdtempSync(path.join(os.tmpdir(), "vca-prose-only-"));
+  fs.writeFileSync(path.join(proseOnly, "package.json"), JSON.stringify({ name: "only", scripts: {} }));
+  fs.writeFileSync(path.join(proseOnly, "CLAUDE.md"), "# only\n## Rules\n- do good things\n");
+  let r = analyzeForTest(proseOnly);
+  const miss = r.checks.find((c) => c.area === "Rule sensors");
+  assert.ok(miss && !miss.ok, "prose-only rules with no tests/lint/validators should MISS");
+
+  const withTests = fs.mkdtempSync(path.join(os.tmpdir(), "vca-prose-tests-"));
+  fs.writeFileSync(path.join(withTests, "package.json"), JSON.stringify({ name: "wt", scripts: {} }));
+  fs.writeFileSync(path.join(withTests, "CLAUDE.md"), "# wt");
+  fs.writeFileSync(path.join(withTests, "app.test.js"), "test('x', () => {})");
+  r = analyzeForTest(withTests);
+  assert.ok(r.checks.find((c) => c.area === "Rule sensors")?.ok, "rules + tests should PASS");
+
+  const withLint = fs.mkdtempSync(path.join(os.tmpdir(), "vca-prose-lint-"));
+  fs.writeFileSync(
+    path.join(withLint, "package.json"),
+    JSON.stringify({ name: "wl", scripts: { lint: "eslint ." } }),
+  );
+  fs.writeFileSync(path.join(withLint, "CLAUDE.md"), "# wl");
+  r = analyzeForTest(withLint);
+  assert.ok(r.checks.find((c) => c.area === "Rule sensors")?.ok, "rules + lint script should PASS");
+});
+
+test("failure observability detected via monitor/alert/health files", () => {
+  const scriptDir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-obs-script-"));
+  fs.writeFileSync(path.join(scriptDir, "package.json"), JSON.stringify({ name: "a" }));
+  fs.mkdirSync(path.join(scriptDir, "scripts"), { recursive: true });
+  fs.writeFileSync(path.join(scriptDir, "scripts", "monitor-payments.js"), "monitor");
+  fs.writeFileSync(path.join(scriptDir, "CLAUDE.md"), "# a");
+  let r = analyzeForTest(scriptDir);
+  assert.ok(
+    r.checks.find((c) => c.area === "Failure observability")?.ok,
+    "observability via monitor script",
+  );
+
+  const wfDir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-obs-wf-"));
+  fs.mkdirSync(path.join(wfDir, ".github", "workflows"), { recursive: true });
+  fs.writeFileSync(path.join(wfDir, ".github", "workflows", "health-check.yml"), "on: schedule\n");
+  fs.writeFileSync(path.join(wfDir, "CLAUDE.md"), "# b");
+  r = analyzeForTest(wfDir);
+  assert.ok(
+    r.checks.find((c) => c.area === "Failure observability")?.ok,
+    "observability via health workflow",
+  );
+});
+
+test("cross-session memory detected via decisions, ADR, or agent memory", () => {
+  const adrDir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-mem-adr-"));
+  fs.writeFileSync(path.join(adrDir, "package.json"), JSON.stringify({ name: "a" }));
+  fs.mkdirSync(path.join(adrDir, "docs", "decisions"), { recursive: true });
+  fs.writeFileSync(path.join(adrDir, "docs", "decisions", "0001-use-x.md"), "# ADR 1");
+  fs.writeFileSync(path.join(adrDir, "CLAUDE.md"), "# a");
+  let r = analyzeForTest(adrDir);
+  assert.ok(
+    r.checks.find((c) => c.area === "Cross-session memory")?.ok,
+    "memory via docs/decisions ADR",
+  );
+
+  const agentMemDir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-mem-agent-"));
+  fs.mkdirSync(path.join(agentMemDir, ".claude", "memory"), { recursive: true });
+  fs.writeFileSync(path.join(agentMemDir, ".claude", "memory", "context.md"), "memory");
+  fs.writeFileSync(path.join(agentMemDir, "CLAUDE.md"), "# b");
+  r = analyzeForTest(agentMemDir);
+  assert.ok(
+    r.checks.find((c) => c.area === "Cross-session memory")?.ok,
+    "memory via .claude/memory",
+  );
+});
+
+// ---- PR #6 codex P2: namespaced deploy, validate/ci as rule sensor, submodule deploy + decisions ----
+
+test("deploy hooks pass for namespaced deploy:prod / release:canary scripts", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-depns-"));
+  fs.writeFileSync(
+    path.join(dir, "package.json"),
+    JSON.stringify({ name: "x", scripts: { "deploy:prod": "wrangler pages deploy", "release:canary": "tb" } }),
+  );
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x");
+  const report = analyzeForTest(dir);
+  const deploy = report.checks.find((c) => c.area === "Deploy hooks");
+  assert.ok(deploy && deploy.ok, "namespaced deploy:prod / release:canary must satisfy Deploy hooks");
+});
+
+test("rule sensors pass for a validate/ci script backing prose rules", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-ruleval-"));
+  fs.writeFileSync(
+    path.join(dir, "package.json"),
+    JSON.stringify({ name: "x", scripts: { validate: "node --test", ci: "node --test" } }),
+  );
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x rules");
+  // No test files, no lint/typecheck script -- the only sensor is `validate`/`ci`.
+  const report = analyzeForTest(dir);
+  const sensors = report.checks.find((c) => c.area === "Rule sensors");
+  assert.ok(sensors && sensors.ok, "scripts.validate / scripts.ci must count as a rule sensor");
+});
+
+test("deploy hooks pass when a deploy workflow lives in a deep git submodule", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-deepdep-"));
+  // Submodule nested deeper than listFiles(cwd, 7) reaches, so allFiles misses it;
+  // only the per-root filesByRoot scan sees the submodule's deploy workflow.
+  const sub = path.join(dir, "a", "b", "c", "d", "e", "f", "g", "h", "svc");
+  fs.mkdirSync(path.join(sub, ".github", "workflows"), { recursive: true });
+  fs.writeFileSync(path.join(sub, ".github", "workflows", "deploy.yml"), "on: push\n");
+  fs.writeFileSync(
+    path.join(dir, ".gitmodules"),
+    '[submodule "svc"]\n\tpath = a/b/c/d/e/f/g/h/svc\n\turl = https://example.com/s.git\n',
+  );
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# deep");
+  const report = analyzeForTest(dir);
+  const deploy = report.checks.find((c) => c.area === "Deploy hooks");
+  assert.ok(deploy && deploy.ok, "deploy workflow in a deep submodule must be detected");
+});
+
+test("cross-session memory detected for decisions under a submodule root", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-submem-"));
+  fs.mkdirSync(path.join(dir, "backend", "docs", "decisions"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "backend", "docs", "decisions", "0001-use-x.md"), "# adr\n");
+  fs.writeFileSync(path.join(dir, "backend", "go.mod"), "module backend\n");
+  fs.writeFileSync(
+    path.join(dir, ".gitmodules"),
+    '[submodule "backend"]\n\tpath = backend\n\turl = https://example.com/b.git\n',
+  );
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# root");
+  const report = analyzeForTest(dir);
+  const mem = report.checks.find((c) => c.area === "Cross-session memory");
+  assert.ok(mem && mem.ok, "backend/docs/decisions/ under a submodule must count as memory");
+});
+
+// ---- evolve: analytics gaps -> concrete promotion plan + git fix hotspots ----
+
+test("evolve maps each missing harness area to a concrete promotion target", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-evolve-gap-"));
+  // No CLAUDE.md, no tests, no CI => many gaps; and not a git repo.
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo" }));
+  const report = analyzeForTest(dir);
+  const plan = buildEvolutionPlan(report);
+  assert.ok(plan.recommendations.length > 0, "should recommend promotions for gaps");
+  const areas = plan.recommendations.map((r) => r.area);
+  assert.ok(areas.includes("Tests"), "Tests gap -> regression test");
+  assert.ok(areas.includes("CI"), "CI gap -> workflow");
+  for (const r of plan.recommendations) {
+    assert.ok(r.promoteTo && r.action, `recommendation has promoteTo + action for ${r.area}`);
+  }
+  // Non-git fixture must not throw and must report no fix patterns.
+  assert.equal(plan.fixPatterns.hotFiles.length, 0);
+  assert.equal(plan.fixPatterns.fixCommits, 0);
+});
+
+test("evolve surfaces recent fix hotspots from git history", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-evolve-fix-"));
+  execSync('git init -q && git config user.email t@t.t && git config user.name t', { cwd: dir, stdio: "pipe" });
+  fs.writeFileSync(path.join(dir, "auth.ts"), "a\n");
+  execSync('git add -A && git commit -qm "fix: refresh token race"', { cwd: dir, stdio: "pipe" });
+  fs.writeFileSync(path.join(dir, "auth.ts"), "b\n");
+  execSync('git add -A && git commit -qm "fix(auth): redirect loop"', { cwd: dir, stdio: "pipe" });
+  fs.writeFileSync(path.join(dir, "other.ts"), "c\n");
+  execSync('git add -A && git commit -qm "feat: add thing"', { cwd: dir, stdio: "pipe" });
+
+  const report = analyzeForTest(dir);
+  const plan = buildEvolutionPlan(report);
+  assert.ok(plan.fixPatterns.fixCommits >= 2, `counted >=2 fix commits, got ${plan.fixPatterns.fixCommits}`);
+  const auth = plan.fixPatterns.hotFiles.find((h) => h.file === "auth.ts");
+  assert.ok(auth && auth.count >= 2, `auth.ts should be a hotspot (changed 2x), got ${JSON.stringify(plan.fixPatterns.hotFiles)}`);
+});
+
+test("printEvolution prints concrete gap -> promotion lines", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-evolve-print-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo" }));
+  const report = analyzeForTest(dir);
+  const plan = buildEvolutionPlan(report);
+  const logs = [];
+  const orig = console.log;
+  console.log = (...a) => logs.push(a.join(" "));
+  try {
+    printEvolution(report, plan);
+  } finally {
+    console.log = orig;
+  }
+  const blob = logs.join("\n");
+  assert.ok(/Promote these current gaps/.test(blob), "prints promotion header");
+  assert.ok(/Tests/.test(blob), "names the Tests gap");
+  assert.ok(/regression test/.test(blob), "shows the Tests promotion target");
+});
+
+test("evolve does not flag feature-commit churn as fix hotspots", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-evolve-feat-"));
+  execSync('git init -q && git config user.email t@t.t && git config user.name t', { cwd: dir, stdio: "pipe" });
+  fs.writeFileSync(path.join(dir, "feature.ts"), "a\n");
+  execSync('git add -A && git commit -qm "feat: add feature"', { cwd: dir, stdio: "pipe" });
+  fs.writeFileSync(path.join(dir, "feature.ts"), "b\n");
+  execSync('git add -A && git commit -qm "refactor: expand feature"', { cwd: dir, stdio: "pipe" });
+  const report = analyzeForTest(dir);
+  const plan = buildEvolutionPlan(report);
+  assert.equal(plan.fixPatterns.fixCommits, 0, "no fix commits in history");
+  assert.equal(plan.fixPatterns.hotFiles.length, 0, "feature/refactor churn must not be flagged as a fix hotspot");
+});
+test("evolve scopes fix hotspots to the analyzed cwd, not the ancestor repo", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "vca-scope-root-"));
+  execSync('git init -q && git config user.email t@t.t && git config user.name t', { cwd: root, stdio: "pipe" });
+  // Ancestor-repo fixes OUTSIDE the analyzed subdir, touching root-bug.ts twice.
+  // Each reaches the count>=2 hotspot threshold, so without `-- .` path scoping
+  // they would leak into the subdir's hotspot list as a false regression candidate.
+  fs.writeFileSync(path.join(root, "root-bug.ts"), "a\n");
+  execSync('git add -A && git commit -qm "fix: root ancestor bug 1"', { cwd: root, stdio: "pipe" });
+  fs.writeFileSync(path.join(root, "root-bug.ts"), "b\n");
+  execSync('git add -A && git commit -qm "fix: root ancestor bug 2"', { cwd: root, stdio: "pipe" });
+  // The analyzed subdir + two fixes touching auth.ts (reaches count>=2 threshold).
+  const sub = path.join(root, "pkg");
+  fs.mkdirSync(sub);
+  fs.writeFileSync(path.join(sub, "auth.ts"), "a\n");
+  execSync('git add -A && git commit -qm "fix(auth): token race"', { cwd: root, stdio: "pipe" });
+  fs.writeFileSync(path.join(sub, "auth.ts"), "b\n");
+  execSync('git add -A && git commit -qm "fix(auth): refresh loop"', { cwd: root, stdio: "pipe" });
+
+  const report = analyzeForTest(sub);
+  const plan = buildEvolutionPlan(report);
+  const leaked = plan.fixPatterns.hotFiles.find((h) => h.file.endsWith("root-bug.ts"));
+  assert.equal(leaked, undefined, "fix outside the analyzed cwd must not leak into hotspots");
+  const auth = plan.fixPatterns.hotFiles.find((h) => h.file.endsWith("auth.ts"));
+  assert.ok(auth && auth.count >= 2, "fix inside the analyzed cwd should be reported as a hotspot");
+});
+
+test("evolve does not count prefix/fixture/dispatch substrings as fix commits", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-fixterms-"));
+  execSync('git init -q && git config user.email t@t.t && git config user.name t', { cwd: dir, stdio: "pipe" });
+  // Each subject contains a "fix"/"patch" substring inside another word.
+  // The old unanchored regex matched them and counted these as fix commits.
+  fs.writeFileSync(path.join(dir, "a.ts"), "1\n");
+  execSync('git add -A && git commit -qm "feat: add prefix helper"', { cwd: dir, stdio: "pipe" });
+  fs.writeFileSync(path.join(dir, "a.ts"), "2\n");
+  execSync('git add -A && git commit -qm "chore: update test fixture"', { cwd: dir, stdio: "pipe" });
+  fs.writeFileSync(path.join(dir, "a.ts"), "3\n");
+  execSync('git add -A && git commit -qm "refactor: dispatch handler"', { cwd: dir, stdio: "pipe" });
+  const report = analyzeForTest(dir);
+  const plan = buildEvolutionPlan(report);
+  assert.equal(plan.fixPatterns.fixCommits, 0, "prefix/fixture/dispatch substrings must not count as fix commits");
+  assert.equal(plan.fixPatterns.hotFiles.length, 0, "non-fix commits must not produce hotspots");
+});
+
+// ---- false-safety warnings for partially-present checks (PR #8) ----
 test("warns when tests exist but no CI runs them", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-w-tci-"));
   fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "x", scripts: { test: "node --test", ci: "node --test" } }));
