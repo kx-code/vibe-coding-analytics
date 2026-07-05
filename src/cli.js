@@ -174,6 +174,7 @@ function analyzeProject(cwd) {
     ),
   ];
 
+  enrichDepth(checks, { allFiles, roots, filesByRoot });
   const passed = checks.filter((item) => item.ok).length;
   const score = Math.round((passed / checks.length) * 100);
   const warnings = detectWarnings(checks);
@@ -195,6 +196,108 @@ function detectWarnings(checks) {
     warnings.push({ code: "no-single-command", message: "No single ci/validate command -- agents cannot prove the repo is healthy in one step." });
   }
   return warnings;
+}
+
+/** Count test files across the tree (no regex, mirrors hasTestFile conventions). */
+function isTestFile(base) {
+  return (
+    base.endsWith("_test.go") ||
+    base.endsWith("_test.dart") ||
+    base.endsWith(".test.js") ||
+    base.endsWith(".test.ts") ||
+    base.endsWith(".test.tsx") ||
+    base.endsWith(".spec.js") ||
+    base.endsWith(".spec.ts") ||
+    base.endsWith(".spec.tsx") ||
+    base.endsWith(".test.mjs") ||
+    base.endsWith(".test.jsx") ||
+    base.endsWith(".spec.jsx") ||
+    base.endsWith(".spec.mjs") ||
+    (base.startsWith("test_") && base.endsWith(".py")) ||
+    base.endsWith("_test.py")
+  );
+}
+/** Source-code extensions counted inside a recognized test directory.
+ *  Allowlist (not blocklist) so placeholders (.gitkeep), binaries, fixtures,
+ *  docs and configs are excluded in one shot. */
+const TEST_DIR_SOURCE_EXT = /\.(?:[cm]?js|tsx?|jsx|py|go|rs|rb|java|kt|kts|c(?:pp|\+\+)?|h(?:pp|h)?|cc|sh|bash|zsh|dart|swift|php|cs|scala|clj|ex|exs|lua|pl|r|tcl)$/i;
+
+function countTestFiles(allFiles) {
+  let n = 0;
+  for (const file of allFiles) {
+    if (file.endsWith("/")) continue; // directory entry, not a file
+    const base = file.split("/").pop();
+    if (isTestFile(base)) { n += 1; continue; }
+    // Recognized test directory (Mocha test/, tests/, Jest __tests__/): a source
+    // file here counts even without a .test/.spec suffix, mirroring the Tests
+    // check hasPrefixAt("test/"|"tests/") predicate.
+    if (/(^|\/)(test|tests|__tests__)\//.test(file) && TEST_DIR_SOURCE_EXT.test(base)) {
+      n += 1;
+    }
+  }
+  return n;
+}
+function countInstructionLines(roots, filesByRoot) {
+  let lines = 0;
+  for (const root of roots) {
+    for (const f of filesByRoot.get(root)) {
+      if (f === "CLAUDE.md" || f === "AGENTS.md") {
+        try {
+          // Trim trailing newline(s): Markdown convention ends files with \n,
+          // which would otherwise add an empty segment and overstate the
+          // instruction-line depth hint by one per AGENTS/CLAUDE.md (off-by-one).
+          const instructionText = fs.readFileSync(path.join(root, f), "utf8").replace(/\n+$/, "");
+          lines += instructionText === "" ? 0 : instructionText.split("\n").length;
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+  }
+  return lines;
+}
+function countSkills(allFiles) {
+  let n = 0;
+  for (const f of allFiles) {
+    const inSkills = f.startsWith(".claude/skills/") || f.startsWith("skills/") || f.includes("/.claude/skills/") || f.includes("/skills/");
+    if (inSkills && f.split("/").pop().toUpperCase() === "SKILL.MD") n += 1;
+  }
+  return n;
+}
+function countValidators(allFiles) {
+  let n = 0;
+  for (const f of allFiles) {
+    if (f.endsWith("/")) continue; // directory entry, not a file
+    const inScripts = f.startsWith("scripts/") || f.includes("/scripts/");
+    // Match the full path, like hasValidateScript, so scripts/validate/architecture.js
+    // counts via its directory rather than only its basename.
+    if (inScripts && /validate|verify|check|lint/i.test(f)) n += 1;
+  }
+  return n;
+}
+/** Attach a depth hint to key PASS-ing checks so a stub (1 test) is distinguishable from a mature project (hundreds). */
+function enrichDepth(checks, ctx) {
+  // Depth counters must see every project root, not just the top-level walk:
+  // (tests/skills/validators in a deep submodule live in filesByRoot and can be
+  // truncated out of allFiles by the listFiles(cwd, 7) depth cap). Normalize each
+  // non-cwd root to cwd-relative paths so deep files are counted without
+  // double-counting shallow ones already in allFiles.
+  const cwd = ctx.roots[0];
+  const allRootFiles = new Set(ctx.allFiles);
+  for (const [root, files] of ctx.filesByRoot) {
+    if (root === cwd) continue;
+    const prefix = path.relative(cwd, root);
+    for (const f of files) allRootFiles.add(prefix ? `${prefix}/${f}` : f);
+  }
+  const merged = [...allRootFiles];
+  const set = (area, depth) => {
+    const c = checks.find((x) => x.area === area);
+    if (c && c.ok && depth) c.depth = depth;
+  };
+  set("Tests", `${countTestFiles(merged)} test file(s)`);
+  set("Agent instructions", `${countInstructionLines(ctx.roots, ctx.filesByRoot)} instruction line(s)`);
+  set("Reusable skills", `${countSkills(merged)} skill(s)`);
+  set("Architecture sensors", `${countValidators(merged)} validator script(s)`);
 }
 
 function check(area, ok, action) {
@@ -420,7 +523,7 @@ export function printReport(report) {
   console.log(`Project shape: ${report.shape}`);
   console.log(`Harness score: ${report.score}/100\n`);
   for (const item of report.checks) {
-    console.log(`${item.ok ? "PASS" : "MISS"}  ${item.area}`);
+    console.log(`${item.ok ? "PASS" : "MISS"}  ${item.area}${item.depth ? `  (${item.depth})` : ""}`);
     if (!item.ok) console.log(`      ${item.action}`);
   }
   if (report.warnings && report.warnings.length) {

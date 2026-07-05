@@ -441,3 +441,122 @@ test("printReport surfaces warnings in its output", () => {
   assert.ok(/Warnings:/.test(blob), "prints a Warnings header");
   assert.ok(/rules exist but no tests or CI/.test(blob), "prints the rules-without-enforcement message");
 });
+
+// ---- depth signals: distinguish stub (1 test) from mature (many) ----
+
+test("Tests depth reports test file count", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-d-tests-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "x" }));
+  for (const name of ["a.test.js", "b.test.js", "c.test.ts"]) {
+    fs.writeFileSync(path.join(dir, name), "export {};\n");
+  }
+  const report = analyzeForTest(dir);
+  const tests = report.checks.find((c) => c.area === "Tests");
+  assert.ok(tests && tests.ok, "Tests should pass");
+  assert.match(tests.depth, /3 test file/, `depth should report 3 test files, got ${tests.depth}`);
+});
+
+test("Agent instructions depth reports instruction line count", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-d-lines-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "x" }));
+  // 5 lines WITH a trailing newline (normal Markdown convention) — must still
+  // report 5, not 6: the trailing \n must not add an empty counted segment.
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# line1\n# line2\n# line3\n# line4\n# line5\n");
+  const report = analyzeForTest(dir);
+  const ai = report.checks.find((c) => c.area === "Agent instructions");
+  assert.ok(ai && ai.ok);
+  assert.match(ai.depth, /5 instruction line/, `depth should report 5 lines, got ${ai.depth}`);
+});
+
+test("Reusable skills depth reports skill count", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-d-skills-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "x" }));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.mkdirSync(path.join(dir, ".claude", "skills", "deploy"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".claude", "skills", "deploy", "SKILL.md"), "deploy\n");
+  fs.mkdirSync(path.join(dir, ".claude", "skills", "release"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".claude", "skills", "release", "SKILL.md"), "release\n");
+  const report = analyzeForTest(dir);
+  const skills = report.checks.find((c) => c.area === "Reusable skills");
+  assert.ok(skills && skills.ok);
+  assert.match(skills.depth, /2 skill/, `depth should report 2 skills, got ${skills.depth}`);
+});
+
+test("MISS-ing checks carry no depth hint", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-d-miss-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "x" }));
+  const report = analyzeForTest(dir);
+  const tests = report.checks.find((c) => c.area === "Tests");
+  assert.ok(tests && !tests.ok, "Tests should MISS on empty project");
+  assert.equal(tests.depth, undefined, "MISS-ing check must not carry a depth hint");
+});
+
+test("Tests depth counts jsx/spec test files accepted by the Tests check", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-d-jsx-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "x" }));
+  fs.writeFileSync(path.join(dir, "App.test.jsx"), "export {};\n");
+  fs.writeFileSync(path.join(dir, "utils.spec.jsx"), "export {};\n");
+  const report = analyzeForTest(dir);
+  const tests = report.checks.find((c) => c.area === "Tests");
+  assert.ok(tests && tests.ok, "Tests should pass via .test.jsx");
+  assert.match(tests.depth, /2 test file/, `depth should count jsx test files, got ${tests.depth}`);
+});
+
+test("Architecture sensors depth counts validators grouped under a validate/ dir", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-valdir-"));
+  // scripts/validate/architecture.js -- hasValidateScript matches the full path
+  // (PASS), but the old basename counter only saw "architecture.js" and reported 0.
+  fs.mkdirSync(path.join(dir, "scripts", "validate"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "scripts", "validate", "architecture.js"), "module.exports = {};\n");
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x");
+  const report = analyzeForTest(dir);
+  const sensors = report.checks.find((c) => c.area === "Architecture sensors");
+  assert.ok(sensors && sensors.ok, "hasValidateScript matches the full path -> PASS");
+  assert.match(sensors.depth, /1 validator script/, `depth should count the validate-dir script, got ${sensors.depth}`);
+});
+
+test("Tests depth counts plain filenames inside a recognized test/ directory", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-testdir-"));
+  // Mocha-style layout: test/api.js has no .test/.spec suffix, so the Tests check
+  // passes via hasPrefixAt("test/") but the old suffix-only counter reported 0.
+  fs.mkdirSync(path.join(dir, "test"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "test", "api.js"), "const assert = require('assert');\n");
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x");
+  const report = analyzeForTest(dir);
+  const tests = report.checks.find((c) => c.area === "Tests");
+  assert.ok(tests && tests.ok, "hasPrefixAt('test/') -> PASS");
+  assert.match(tests.depth, /1 test file/, `depth should count test/api.js, got ${tests.depth}`);
+});
+
+test("depth counters scan submodule roots beyond the top-level walk", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-depthsub-"));
+  // Submodule nested deeper than listFiles(cwd, 7), so its test file is only in
+  // filesByRoot[submoduleRoot], not allFiles. The Tests check still passes via
+  // hasPrefixAt("tests/") (per-root), but the old counter only saw allFiles.
+  const sub = path.join(dir, "a", "b", "c", "d", "e", "f", "g", "h", "svc");
+  fs.mkdirSync(path.join(sub, "tests"), { recursive: true });
+  fs.writeFileSync(path.join(sub, "tests", "api_test.go"), "package tests\n");
+  fs.writeFileSync(path.join(sub, "go.mod"), "module svc\n");
+  fs.writeFileSync(
+    path.join(dir, ".gitmodules"),
+    '[submodule "svc"]\n\tpath = a/b/c/d/e/f/g/h/svc\n\turl = https://example.com/s.git\n',
+  );
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# root");
+  const report = analyzeForTest(dir);
+  const tests = report.checks.find((c) => c.area === "Tests");
+  assert.ok(tests && tests.ok, "submodule test file -> Tests PASS via per-root scan");
+  assert.match(tests.depth, /1 test file/, `deep-submodule test should be counted, got ${tests.depth}`);
+});
+
+test("Tests depth excludes placeholder and fixture files in test directories", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-testph-"));
+  fs.mkdirSync(path.join(dir, "test"), { recursive: true });
+  // Placeholders / binary fixtures under test/ must NOT inflate the depth count.
+  fs.writeFileSync(path.join(dir, "test", ".gitkeep"), "");
+  fs.writeFileSync(path.join(dir, "test", "fixture.bin"), "\0");
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x");
+  const report = analyzeForTest(dir);
+  const tests = report.checks.find((c) => c.area === "Tests");
+  assert.ok(tests && tests.ok, "hasPrefixAt('test/') still PASS");
+  assert.match(tests.depth, /0 test file/, `placeholder/fixture must not count, got ${tests.depth}`);
+});

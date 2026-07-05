@@ -147,6 +147,7 @@ for marketplace submission.
 - Deploy and post-deploy verification hooks
 - Cross-session memory: ADR decisions, agent memory, or a decisions log
 - Self-evolution loops that promote repeated work into durable harness assets
+- Depth hints on passing checks (test-file / instruction-line / skill counts) so a stub is distinguishable from a mature project at the same score
 - False-safety warnings when checks are partially present (tests without CI, agent rules without enforcement, no single validation command)
 
 ## Monorepo & Non-Standard Conventions
