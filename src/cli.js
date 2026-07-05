@@ -176,7 +176,25 @@ function analyzeProject(cwd) {
 
   const passed = checks.filter((item) => item.ok).length;
   const score = Math.round((passed / checks.length) * 100);
-  return { cwd, shape, roots, files: allFiles, packageJson, scripts, checks, score };
+  const warnings = detectWarnings(checks);
+  return { cwd, shape, roots, files: allFiles, packageJson, scripts, checks, score, warnings };
+}
+
+/** Surface false-safety combinations (grounded in SKILL.md Red Flags). */
+function detectWarnings(checks) {
+  const byArea = new Map(checks.map((c) => [c.area, c.ok]));
+  const ok = (area) => byArea.get(area) === true;
+  const warnings = [];
+  if (ok("Tests") && !ok("CI")) {
+    warnings.push({ code: "tests-without-ci", message: "Tests exist but no CI runs them -- they can drift to green-only-on-your-machine." });
+  }
+  if (ok("Agent instructions") && !ok("Tests") && !ok("CI")) {
+    warnings.push({ code: "rules-without-enforcement", message: "Agent rules exist but no tests or CI enforce them -- prose-only rules drift." });
+  }
+  if (!ok("Single validation command") && (ok("Tests") || ok("CI"))) {
+    warnings.push({ code: "no-single-command", message: "No single ci/validate command -- agents cannot prove the repo is healthy in one step." });
+  }
+  return warnings;
 }
 
 function check(area, ok, action) {
@@ -397,13 +415,17 @@ Commands:
 By default commands are read-only. Add --write to create missing harness files.`);
 }
 
-function printReport(report) {
+export function printReport(report) {
   console.log(`Vibe Coding Analytics: ${report.cwd}`);
   console.log(`Project shape: ${report.shape}`);
   console.log(`Harness score: ${report.score}/100\n`);
   for (const item of report.checks) {
     console.log(`${item.ok ? "PASS" : "MISS"}  ${item.area}`);
     if (!item.ok) console.log(`      ${item.action}`);
+  }
+  if (report.warnings && report.warnings.length) {
+    console.log("\nWarnings:");
+    for (const w of report.warnings) console.log(`! ${w.message}`);
   }
   if (report.shape !== "single project") {
     console.log(
