@@ -31,8 +31,10 @@ jobs:
           cache: "npm"
           registry-url: "https://registry.npmjs.org"
       - name: Upgrade npm for Trusted Publishing
-        # Node 22 ships npm 10.x; Trusted Publishing requires npm >= 11.5.1
-        run: npm install -g npm@latest
+        # Node 22 ships npm 10.x; Trusted Publishing requires npm >= 11.5.1.
+        # Pin to the npm 11 line: npm 10's self-upgrade into npm 12.x strips
+        # the new CLI's bundled deps (incl. `sigstore`), breaking --provenance.
+        run: npm install -g npm@11
       - name: Install
         run: npm ci
       - name: Validate
