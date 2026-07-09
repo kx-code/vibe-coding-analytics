@@ -1,4 +1,7 @@
 # Known Issues
 
-- The analytics score is intentionally heuristic. It is a conversation starter, not a compliance grade.
-- A package with `npm test` may score as having tests even if test coverage is minimal.
+- The analytics score is **opinionated and weighted**, not a flat pass/fail average. Critical foundations (single validation command, tests, CI) are weighted 3×; enablers (agent instructions, typecheck, sensors, deploy hooks) 2×; everything else 1×. The score is a conversation starter, not a compliance grade.
+- Maturity grades (`stub` / `functional` / `mature`) appear next to depth hints for graded areas (Tests, Agent instructions, Reusable skills, Architecture sensors, Steering loop). The thresholds are subjective and tuned to separate a stub from a genuinely mature project; a project sitting at the `functional`/`mature` boundary may flip between grades on a single-file change.
+- A package with `npm test` may score as having tests even if test coverage is minimal — the Tests check counts test files, not coverage.
+- The **Rules traceability** check extracts `规则 N` / `Rule N` headings and matches their keywords against the sensor corpus (test/validator files). A rule whose keywords don't lexically appear in any sensor will read as unenforced even if it is covered indirectly; rephrase the rule or add an explicitly named test to surface it.
+- **CI failure mining** (`evolve --ci-failures`) shells out to `gh run list` and is best-effort: it requires an authenticated `gh` and a git repo, and it only sees the workflow names GitHub returns. When `gh` is absent it degrades to a skip line rather than failing the command.

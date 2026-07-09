@@ -39,7 +39,7 @@ export async function runCli(argv) {
   }
 
   if (command === "evolve") {
-    const plan = buildEvolutionPlan(report);
+    const plan = buildEvolutionPlan(report, options);
     const files = buildEvolutionFiles(report, plan);
     printEvolution(report, plan);
     writeOrPreview(cwd, files, options.write);
@@ -60,13 +60,14 @@ export function analyzeForTest(cwd) {
   return analyzeProject(path.resolve(cwd));
 }
 
-function parseOptions(args) {
-  const options = { write: false, cwd: null, format: "text" };
+export function parseOptions(args) {
+  const options = { write: false, cwd: null, format: "text", ciFailures: false };
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i];
     if (arg === "--write") options.write = true;
     if (arg === "--cwd") options.cwd = args[++i];
     if (arg === "--format") options.format = args[++i] || "text";
+    if (arg === "--ci-failures") options.ciFailures = true;
   }
   return options;
 }
@@ -95,6 +96,7 @@ function analyzeProject(cwd) {
     countBasename(allFiles, "CLAUDE.md") >= 2 || countBasename(allFiles, "AGENTS.md") >= 2;
 
   const numberedRules = countNumberedRules(roots);
+  const ruleTrace = analyzeRuleTraceability(roots, allFiles, cwd);
   const checks = [
     check(
       "Project facts",
@@ -185,6 +187,15 @@ function analyzeProject(cwd) {
       "Rules in CLAUDE.md/AGENTS.md need computational sensors (tests, lint, validators); prose-only rules drift.",
     ),
     check(
+      "Rules traceability",
+      ruleTrace.ok,
+      ruleTrace.na
+        ? "Once you have many numbered rules, back each with a test/validator that references it by name -- aggregate enforcement alone hides prose-only rules."
+        : ruleTrace.unenforcedCount === 0
+          ? `All ${ruleTrace.total} numbered rule(s) appear referenced by a test or validator sensor.`
+          : `${ruleTrace.unenforcedCount}/${ruleTrace.total} numbered rule(s) are not referenced by any test or validator -- add sensors that enforce them by name. Examples: ${ruleTrace.examples.join("; ")}`,
+    ),
+    check(
       "Steering loop",
       numberedRules >= 5,
       numberedRules >= 5
@@ -211,8 +222,24 @@ function analyzeProject(cwd) {
   ];
 
   enrichDepth(checks, { allFiles, roots, filesByRoot });
-  const passed = checks.filter((item) => item.ok).length;
-  const score = Math.round((passed / checks.length) * 100);
+  // Weighted score: critical foundation checks (validation/tests/CI) and
+  // enforcement checks weigh more than depth/maturity checks, so missing CI
+  // hurts the score more than missing "Reusable skills".
+  const weightOf = (area) =>
+    ({
+      "Single validation command": 3, Tests: 3, CI: 3,
+      "Agent instructions": 2, Typecheck: 2, "Rule sensors": 2,
+      "Architecture sensors": 2, "Deploy hooks": 2, "Harness files committed": 2,
+    })[area] ?? 1;
+  let earned = 0;
+  let total = 0;
+  for (const c of checks) {
+    const w = weightOf(c.area);
+    c.weight = w;
+    total += w;
+    if (c.ok) earned += w;
+  }
+  const score = Math.round((earned / total) * 100);
   const warnings = detectWarnings(checks);
   return { cwd, shape, roots, files: allFiles, packageJson, scripts, checks, score, warnings, untrackedHarness };
 }
@@ -326,15 +353,36 @@ function enrichDepth(checks, ctx) {
     for (const f of files) allRootFiles.add(prefix ? `${prefix}/${f}` : f);
   }
   const merged = [...allRootFiles];
-  const set = (area, depth) => {
-    const c = checks.find((x) => x.area === area);
-    if (c && c.ok && depth) c.depth = depth;
+  // Maturity grade thresholds: count <= stub = "stub", <= functional = "functional",
+  // otherwise "mature". Subjective by nature; tuned to separate a stub from a mature project.
+  const gradeFor = (area, count) => {
+    const t =
+      ({
+        Tests: { stub: 2, functional: 10 },
+        "Agent instructions": { stub: 10, functional: 50 },
+        "Reusable skills": { stub: 1, functional: 3 },
+        "Architecture sensors": { stub: 1, functional: 3 },
+        "Steering loop": { stub: 9, functional: 19 },
+      })[area];
+    if (!t) return undefined;
+    if (count <= t.stub) return "stub";
+    if (count <= t.functional) return "functional";
+    return "mature";
   };
-  set("Tests", `${countTestFiles(merged)} test file(s)`);
-  set("Agent instructions", `${countInstructionLines(ctx.roots, ctx.filesByRoot)} instruction line(s)`);
-  set("Reusable skills", `${countSkills(merged)} skill(s)`);
-  set("Architecture sensors", `${countValidators(merged)} validator script(s)`);
-  set("Steering loop", `${countNumberedRules(ctx.roots)} numbered rule(s)`);
+  const set = (area, count, unit) => {
+    const c = checks.find((x) => x.area === area);
+    // count may legitimately be 0 (e.g. "0 test file(s)"); guard on ok + presence, not truthiness.
+    if (c && c.ok && count !== undefined) {
+      c.depth = `${count} ${unit}`;
+      const grade = gradeFor(area, count);
+      if (grade) c.grade = grade;
+    }
+  };
+  set("Tests", countTestFiles(merged), "test file(s)");
+  set("Agent instructions", countInstructionLines(ctx.roots, ctx.filesByRoot), "instruction line(s)");
+  set("Reusable skills", countSkills(merged), "skill(s)");
+  set("Architecture sensors", countValidators(merged), "validator script(s)");
+  set("Steering loop", countNumberedRules(ctx.roots), "numbered rule(s)");
 }
 
 function check(area, ok, action) {
@@ -409,6 +457,75 @@ function countNumberedRules(roots) {
     }
   }
   return count;
+}
+
+/** Per-rule traceability: extract numbered-rule prose, pull keywords, and check each
+ *  against a corpus of test/validator file contents. N/A (pass) when there are no
+ *  numbered rules or no sensor corpus -- the coarse "Rule sensors" check covers the
+ *  latter so we don't double-penalize. Chinese-only rules yield no keywords (no word
+ *  boundaries) and are skipped rather than false-flagged. */
+function analyzeRuleTraceability(roots, allFiles, cwd) {
+  const rules = [];
+  for (const root of roots) {
+    for (const name of ["CLAUDE.md", "AGENTS.md"]) {
+      try {
+        const text = fs.readFileSync(path.join(root, name), "utf8");
+        const re = /^[ \t]*(?:规则|Rule)\s*\d+\s*[:：.\-—)]?[ \t]*(.+)/gim;
+        let m;
+        while ((m = re.exec(text)) !== null) {
+          const t = m[1].trim();
+          if (t) rules.push(t);
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+  if (rules.length === 0) {
+    return { ok: true, total: 0, unenforcedCount: 0, examples: [], na: true };
+  }
+  const sensorFiles = [];
+  for (const f of allFiles) {
+    if (f.endsWith("/")) continue; // directory entry, not a file
+    const base = f.split("/").pop();
+    const isSensor =
+      isTestFile(base) ||
+      /(^|\/)(test|tests|__tests__|scripts)\//i.test(f) ||
+      /(validate|verify|check|lint)/i.test(f);
+    if (!isSensor) continue;
+    if (!/\.(?:[cm]?js|tsx?|jsx|py|go|rs|rb|ya?ml|md|sh|bash)$/i.test(base)) continue;
+    sensorFiles.push(f);
+  }
+  let corpus = "";
+  for (const f of sensorFiles.slice(0, 50)) {
+    try {
+      corpus += "\n" + fs.readFileSync(path.join(cwd, f), "utf8");
+    } catch {
+      /* ignore unreadable files */
+    }
+  }
+  corpus = corpus.toLowerCase();
+  if (!corpus.trim()) {
+    return { ok: true, total: rules.length, unenforcedCount: 0, examples: [], na: true };
+  }
+  const STOPWORDS = new Set(
+    "the a an to is are was must should may can cannot be in on at and or nor not do does for of with without when whenever before after each every all any no if then else this that these those it its their our your you we they them as by from into out up down using use used".split(" "),
+  );
+  let unenforced = 0;
+  const examples = [];
+  for (const rule of rules) {
+    const kws = rule
+      .toLowerCase()
+      .split(/[^a-z0-9]+/i)
+      .filter((w) => w.length >= 3 && !STOPWORDS.has(w));
+    const unique = [...new Set(kws)].slice(0, 6);
+    if (unique.length === 0) continue;
+    if (!unique.some((kw) => corpus.includes(kw))) {
+      unenforced += 1;
+      if (examples.length < 3) examples.push(rule.slice(0, 70));
+    }
+  }
+  return { ok: unenforced === 0, total: rules.length, unenforcedCount: unenforced, examples, na: false };
 }
 
 /** Detect test files by language conventions across the whole tree. */
@@ -598,14 +715,20 @@ function printHelp() {
 Usage:
   npx vibe-coding-analytics analytics [--cwd path]
   npx vibe-coding-analytics init [--cwd path] [--write]
-  npx vibe-coding-analytics evolve [--cwd path] [--write]
+  npx vibe-coding-analytics evolve [--cwd path] [--write] [--ci-failures]
 
 Commands:
   analytics  Audit the current project harness and print gaps.
   init       Propose or write baseline AI coding harness files.
   evolve     Propose or write self-evolution loop files.
 
-By default commands are read-only. Add --write to create missing harness files.`);
+Flags:
+  --write         Create missing harness files instead of previewing them.
+  --cwd path      Operate on a different directory.
+  --format json   (analytics) Emit the report as JSON.
+  --ci-failures   (evolve) Mine recent CI failures via \`gh\` and list the worst offenders.
+
+By default commands are read-only.`);
 }
 
 export function printReport(report) {
@@ -613,7 +736,8 @@ export function printReport(report) {
   console.log(`Project shape: ${report.shape}`);
   console.log(`Harness score: ${report.score}/100\n`);
   for (const item of report.checks) {
-    console.log(`${item.ok ? "PASS" : "MISS"}  ${item.area}${item.depth ? `  (${item.depth})` : ""}`);
+    const grade = item.grade ? ` · ${item.grade}` : "";
+    console.log(`${item.ok ? "PASS" : "MISS"}  ${item.area}${item.depth ? `  (${item.depth})` : ""}${grade}`);
     if (!item.ok) console.log(`      ${item.action}`);
   }
   if (report.warnings && report.warnings.length) {
@@ -642,6 +766,17 @@ export function printEvolution(report, plan) {
   if (safePlan.fixPatterns.hotFiles.length) {
     console.log(`Recent fix hotspots (${safePlan.fixPatterns.fixCommits} fix commits):`);
     for (const h of safePlan.fixPatterns.hotFiles) console.log(`- ${h.file} (${h.count}x)`);
+    console.log();
+  }
+  if (safePlan.ciFailures && !safePlan.ciFailures.available) {
+    console.log(`CI failure mining skipped (${safePlan.ciFailures.reason}): install and authenticate \`gh\` to enable --ci-failures.`);
+    console.log();
+  } else if (safePlan.ciFailures && safePlan.ciFailures.available && safePlan.ciFailures.failures.length) {
+    console.log("Recent CI failures:");
+    for (const f of safePlan.ciFailures.failures) console.log(`- ${f.workflow} (${f.count}x)`);
+    console.log();
+  } else if (safePlan.ciFailures && safePlan.ciFailures.available) {
+    console.log("No recent CI failures.");
     console.log();
   }
 }
@@ -746,12 +881,34 @@ function recentFixPatterns(cwd, limit = 40) {
   return { fixCommits, hotFiles };
 }
 
-/** Build a concrete evolution plan from analytics gaps + recent fix history. */
-export function buildEvolutionPlan(report) {
-  return {
+/** Build a concrete evolution plan from analytics gaps + recent fix history.
+ *  options.ciFailures opts into attaching a ciFailures block to the plan. */
+export function buildEvolutionPlan(report, options = {}) {
+  const plan = {
     recommendations: evolutionRecommendations(report),
     fixPatterns: recentFixPatterns(report.cwd),
   };
+  if (options.ciFailures) {
+    const gh = options.ghRunner || ((args, opts) => spawnSync("gh", args, opts));
+    const probe = gh(["--version"], {});
+    if (probe && probe.status === 0) {
+      const run = gh(
+        ["run", "list", "--status", "failure", "--limit", "10", "--json", "workflowName", "-q", ".[].workflowName"],
+        { cwd: report.cwd, encoding: "utf8" },
+      );
+      const counts = new Map();
+      for (const wf of (run && run.status === 0 ? run.stdout : "").split("\n").map((s) => s.trim()).filter(Boolean)) {
+        counts.set(wf, (counts.get(wf) || 0) + 1);
+      }
+      const failures = [...counts.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .map(([workflow, count]) => ({ workflow, count }));
+      plan.ciFailures = { available: true, failures };
+    } else {
+      plan.ciFailures = { available: false, reason: "gh-not-found", failures: [] };
+    }
+  }
+  return plan;
 }
 
 function buildEvolutionFiles(report, plan) {
