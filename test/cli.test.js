@@ -4,7 +4,7 @@ import path from "node:path";
 import test from "node:test";
 import { execSync } from "node:child_process";
 import assert from "node:assert/strict";
-import { analyzeForTest, runCli, buildEvolutionPlan, printEvolution, printReport } from "../src/cli.js";
+import { analyzeForTest, runCli, buildEvolutionPlan, printEvolution, printReport, parseOptions } from "../src/cli.js";
 
 test("analyzes an empty project with missing harness areas", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-empty-"));
@@ -456,6 +456,26 @@ test("Tests depth reports test file count", () => {
   assert.match(tests.depth, /3 test file/, `depth should report 3 test files, got ${tests.depth}`);
 });
 
+test("printReport shows the maturity grade beside the depth hint", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-grade-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "x" }));
+  for (const name of ["a.test.js", "b.test.js", "c.test.js", "d.test.js", "e.test.js"]) {
+    fs.writeFileSync(path.join(dir, name), "export {};\n");
+  }
+  const report = analyzeForTest(dir);
+  const logs = [];
+  const orig = console.log;
+  console.log = (...a) => logs.push(a.join(" "));
+  try {
+    printReport(report);
+  } finally {
+    console.log = orig;
+  }
+  const testsLine = logs.find((l) => /^PASS\s+Tests/.test(l));
+  assert.ok(testsLine, "a PASS Tests line exists");
+  assert.match(testsLine, /functional/, `Tests line shows maturity grade, got: ${testsLine}`);
+});
+
 test("Agent instructions depth reports instruction line count", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-d-lines-"));
   fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "x" }));
@@ -574,6 +594,19 @@ test("--version prints the package version and skips analysis", async () => {
   }
   const pkg = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8"));
   assert.equal(captured, pkg.version, `expected ${pkg.version}, got ${captured}`);
+});
+
+test("help text documents the --ci-failures flag", async () => {
+  const logs = [];
+  const orig = console.log;
+  console.log = (...a) => logs.push(a.join(" "));
+  try {
+    await runCli(["help"]);
+  } finally {
+    console.log = orig;
+  }
+  const blob = logs.join("\n");
+  assert.ok(/--ci-failures/.test(blob), `help mentions --ci-failures, got: ${blob}`);
 });
 
 test("analytics --format json emits parseable JSON with score and checks", async () => {
@@ -818,4 +851,261 @@ test("every analytics check has a non-empty action/hint", () => {
   const r = analyzeForTest(dir);
   const missing = r.checks.filter((c) => !c.action || typeof c.action !== "string" || c.action.trim() === "");
   assert.equal(missing.length, 0, `checks missing action: ${missing.map((c) => c.area).join(", ")}`);
+});
+
+test("missing CI drops the score more than missing Reusable skills", () => {
+  // Two projects identical except one lacks CI, the other lacks skills.
+  // CI is weighted 3x; Reusable skills 1x -> the CI-missing project scores lower.
+  // A non-deploy/non-review skill + a deploy script keep all OTHER checks symmetric.
+  const base = (dir) => {
+    fs.writeFileSync(
+      path.join(dir, "package.json"),
+      JSON.stringify({ name: "x", scripts: { ci: "node --test", deploy: "echo deploy", typecheck: "tsc" } }),
+    );
+    fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+    fs.writeFileSync(path.join(dir, "tsconfig.json"), "{}\n");
+    fs.writeFileSync(path.join(dir, "app.test.js"), "test('x', () => {});\n");
+    fs.mkdirSync(path.join(dir, ".claude", "skills", "utils"), { recursive: true });
+    fs.writeFileSync(path.join(dir, ".claude", "skills", "utils", "SKILL.md"), "utils\n");
+  };
+  const noCi = fs.mkdtempSync(path.join(os.tmpdir(), "vca-w-noci-"));
+  base(noCi);
+  // no .github/workflows -> CI MISSes; skills still present.
+
+  const noSkills = fs.mkdtempSync(path.join(os.tmpdir(), "vca-w-nosk-"));
+  base(noSkills);
+  fs.mkdirSync(path.join(noSkills, ".github", "workflows"), { recursive: true });
+  fs.writeFileSync(path.join(noSkills, ".github", "workflows", "ci.yml"), "on: push\n");
+  fs.rmSync(path.join(noSkills, ".claude", "skills"), { recursive: true, force: true });
+  // CI present; skills removed -> the only symmetric difference vs noCi.
+
+  const scoreNoCi = analyzeForTest(noCi).score;
+  const scoreNoSkills = analyzeForTest(noSkills).score;
+  assert.ok(scoreNoCi < scoreNoSkills, `missing CI (${scoreNoCi}) should score lower than missing skills (${scoreNoSkills})`);
+});
+
+test("every check carries an explicit weight", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-weights-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  const r = analyzeForTest(dir);
+  const unweighted = r.checks.filter((c) => typeof c.weight !== "number" || c.weight < 1);
+  assert.equal(unweighted.length, 0, `checks without weight: ${unweighted.map((c) => c.area).join(", ")}`);
+});
+
+// ---- #1 maturity grading: stub / functional / mature on depth signals ----
+
+test("Tests depth grades 1 file as stub and 15 files as mature", () => {
+  const stubDir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-gr-stub-"));
+  fs.writeFileSync(path.join(stubDir, "package.json"), JSON.stringify({ name: "x" }));
+  fs.writeFileSync(path.join(stubDir, "a.test.js"), "export {};\n");
+  let r = analyzeForTest(stubDir);
+  let tests = r.checks.find((c) => c.area === "Tests");
+  assert.equal(tests.grade, "stub", `1 test file -> stub, got ${tests.grade}`);
+
+  const matureDir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-gr-mat-"));
+  fs.writeFileSync(path.join(matureDir, "package.json"), JSON.stringify({ name: "x" }));
+  for (let i = 0; i < 15; i += 1) fs.writeFileSync(path.join(matureDir, `t${i}.test.js`), "export {};\n");
+  r = analyzeForTest(matureDir);
+  tests = r.checks.find((c) => c.area === "Tests");
+  assert.equal(tests.grade, "mature", `15 test files -> mature, got ${tests.grade}`);
+});
+
+test("MISS-ing checks carry no grade", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-gr-miss-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "x" }));
+  const r = analyzeForTest(dir);
+  const tests = r.checks.find((c) => c.area === "Tests");
+  assert.ok(tests && !tests.ok);
+  assert.equal(tests.grade, undefined, "MISS-ing check must not carry a grade");
+});
+
+// ---- #2 Rules traceability: per-rule enforcement, not just aggregate ----
+
+test("Rules traceability flags numbered rules not referenced by any sensor", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-rt-miss-"));
+  fs.writeFileSync(
+    path.join(dir, "CLAUDE.md"),
+    "# rules\n\nRule 1: All payment amounts must be validated through the ledger reconciler.\nRule 2: Secrets live only in the vault provider.\n",
+  );
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "x", scripts: {} }));
+  // A test file that mentions neither "ledger" nor "vault" -> both rules unenforced.
+  fs.writeFileSync(path.join(dir, "smoke.test.js"), "test('boot', () => { expect(1).toBe(1); });\n");
+  const r = analyzeForTest(dir);
+  const trace = r.checks.find((c) => c.area === "Rules traceability");
+  assert.ok(trace, "has a Rules traceability check");
+  assert.equal(trace.ok, false, "rules whose keywords no sensor references should MISS");
+});
+
+test("Rules traceability passes when a sensor references the rule keyword", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-rt-ok-"));
+  fs.writeFileSync(
+    path.join(dir, "CLAUDE.md"),
+    "# rules\n\nRule 1: All payment amounts must go through the ledger reconciler.\n",
+  );
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "x", scripts: {} }));
+  fs.writeFileSync(path.join(dir, "ledger.test.js"), "test('ledger reconciler', () => {});\n");
+  const r = analyzeForTest(dir);
+  const trace = r.checks.find((c) => c.area === "Rules traceability");
+  assert.ok(trace && trace.ok, "a sensor referencing the rule keyword should PASS");
+});
+
+test("Rules traceability is N/A (pass) when no numbered rules exist", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-rt-na-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "x", scripts: {} }));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# just prose, no numbered rules\n");
+  fs.writeFileSync(path.join(dir, "app.test.js"), "test('x', () => {});\n");
+  const r = analyzeForTest(dir);
+  const trace = r.checks.find((c) => c.area === "Rules traceability");
+  assert.ok(trace && trace.ok, "no numbered rules -> N/A -> pass");
+});
+
+// ---- #3 evolve --ci-failures: opt-in gh-based CI failure mining ----
+
+test("--ci-failures flag surfaces a ciFailures block even when gh is absent", () => {
+  // Graceful degradation: with the flag set, buildEvolutionPlan attaches a
+  // ciFailures block whose `available` is a boolean (false where `gh` is missing).
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-ci-flag-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "x" }));
+  const report = analyzeForTest(dir);
+  const plan = buildEvolutionPlan(report, { ciFailures: true, ghRunner: () => ({ status: 127 }) });
+  assert.ok(plan.ciFailures, "ciFailures flag attaches a ciFailures block to the plan");
+  assert.equal(typeof plan.ciFailures.available, "boolean", "available is boolean (gh present or not)");
+  assert.ok(Array.isArray(plan.ciFailures.failures), "failures is always an array");
+});
+
+test("buildEvolutionPlan without --ci-failures leaves ciFailures unset", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-ci-off-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "x" }));
+  const report = analyzeForTest(dir);
+  const plan = buildEvolutionPlan(report);
+  assert.equal(plan.ciFailures, undefined, "without the flag, ciFailures must not be attached");
+});
+
+test("--ci-failures reports available when the gh runner responds", () => {
+  // Inject a fake runner so the test does not depend on a real `gh` binary on PATH.
+  const fakeRunner = (args) => {
+    if (args[0] === "--version") return { status: 0, stdout: "gh version 2.0.0\n" };
+    return { status: 1, stdout: "" };
+  };
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-ci-mine-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "x" }));
+  const report = analyzeForTest(dir);
+  const plan = buildEvolutionPlan(report, { ciFailures: true, ghRunner: fakeRunner });
+  assert.equal(plan.ciFailures.available, true, "runner responded -> available");
+});
+
+test("--ci-failures counts and dedupes failing workflows from gh run list", () => {
+  const fakeRunner = (args) => {
+    if (args[0] === "--version") return { status: 0, stdout: "gh version 2.0.0\n" };
+    if (args[0] === "run") return { status: 0, stdout: "ci\nlint\nci\n" };
+    return { status: 1, stdout: "" };
+  };
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-ci-parse-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "x" }));
+  const report = analyzeForTest(dir);
+  const plan = buildEvolutionPlan(report, { ciFailures: true, ghRunner: fakeRunner });
+  const ci = plan.ciFailures.failures.find((f) => f.workflow === "ci");
+  assert.ok(ci && ci.count === 2, `ci counted twice, got ${JSON.stringify(plan.ciFailures.failures)}`);
+  const lint = plan.ciFailures.failures.find((f) => f.workflow === "lint");
+  assert.ok(lint && lint.count === 1, "lint counted once");
+});
+
+test("printEvolution prints a skip line when --ci-failures is set but gh is absent", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-ci-print-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "x" }));
+  const report = analyzeForTest(dir);
+  const plan = buildEvolutionPlan(report, { ciFailures: true, ghRunner: () => ({ status: 127 }) });
+  const logs = [];
+  const orig = console.log;
+  console.log = (...a) => logs.push(a.join(" "));
+  try {
+    printEvolution(report, plan);
+  } finally {
+    console.log = orig;
+  }
+  const blob = logs.join("\n");
+  assert.ok(/CI failure mining skipped/.test(blob), `prints skip line, got: ${blob}`);
+});
+
+test("printEvolution lists mined CI failures with a promotion target", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-ci-list-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "x" }));
+  const report = analyzeForTest(dir);
+  const fakeRunner = (args) => {
+    if (args[0] === "--version") return { status: 0, stdout: "gh 2.0\n" };
+    if (args[0] === "run") return { status: 0, stdout: "tests\nbuild\n" };
+    return { status: 1, stdout: "" };
+  };
+  const plan = buildEvolutionPlan(report, { ciFailures: true, ghRunner: fakeRunner });
+  const logs = [];
+  const orig = console.log;
+  console.log = (...a) => logs.push(a.join(" "));
+  try {
+    printEvolution(report, plan);
+  } finally {
+    console.log = orig;
+  }
+  const blob = logs.join("\n");
+  assert.ok(/Recent CI failures/.test(blob), `prints CI failures header, got: ${blob}`);
+  assert.ok(/tests \(1x\)/.test(blob), "lists the failing workflow with its count");
+  assert.ok(/build \(1x\)/.test(blob), "lists the second failing workflow");
+});
+
+test("--ci-failures degrades gracefully when the gh runner reports not-found", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-ci-nogh-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "x" }));
+  const report = analyzeForTest(dir);
+  const plan = buildEvolutionPlan(report, { ciFailures: true, ghRunner: () => ({ status: 127 }) });
+  assert.equal(plan.ciFailures.available, false, "runner exit 127 -> not available");
+  assert.equal(plan.ciFailures.failures.length, 0, "no failures mined");
+});
+
+test("evolve --ci-failures runs end-to-end without crashing (default gh runner)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-evolve-ci-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "x" }));
+  const logs = [];
+  const orig = console.log;
+  console.log = (...a) => logs.push(a.join(" "));
+  try {
+    await runCli(["evolve", "--cwd", dir, "--ci-failures"]);
+  } finally {
+    console.log = orig;
+  }
+  const blob = logs.join("\n");
+  assert.ok(/Vibe Coding Evolution/.test(blob), `evolve ran, got: ${blob}`);
+  assert.ok(/CI failure mining skipped|Recent CI failures|No recent CI failures/.test(blob), `--ci-failures surfaces a CI section, got: ${blob}`);
+});
+
+test("parseOptions recognizes --ci-failures", () => {
+  const options = parseOptions(["--ci-failures"]);
+  assert.equal(options.ciFailures, true, "--ci-failures sets ciFailures flag");
+  const plain = parseOptions([]);
+  assert.equal(plain.ciFailures, false, "ciFailures defaults to false");
+});
+
+test("buildEvolutionPlan uses a default gh runner when none injected (no crash)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-default-gh-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "x" }));
+  const report = analyzeForTest(dir);
+  const plan = buildEvolutionPlan(report, { ciFailures: true });
+  assert.ok(plan.ciFailures, "ciFailures block attached even without injected runner");
+  assert.ok(typeof plan.ciFailures.available === "boolean", "available is a boolean");
+});
+
+test("printEvolution notes when CI mining found no failures", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-ci-none-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "x" }));
+  const report = analyzeForTest(dir);
+  const plan = buildEvolutionPlan(report, { ciFailures: true, ghRunner: (args) =>
+    args[0] === "--version" ? { status: 0, stdout: "gh 2.0\n" } : { status: 0, stdout: "" } });
+  const logs = [];
+  const orig = console.log;
+  console.log = (...a) => logs.push(a.join(" "));
+  try {
+    printEvolution(report, plan);
+  } finally {
+    console.log = orig;
+  }
+  const blob = logs.join("\n");
+  assert.ok(/No recent CI failures/.test(blob), `prints no-failures line, got: ${blob}`);
 });
