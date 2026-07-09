@@ -6,3 +6,7 @@ coverage/
 .env
 .env.*
 !.env.example
+
+# Local agent/tool working dirs (per-machine config, not project state)
+.claude/
+.serena/
