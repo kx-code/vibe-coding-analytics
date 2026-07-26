@@ -1137,6 +1137,30 @@ test("Agent hooks PASS when PostToolUse(Edit|Write) runs eslint + prettier", () 
   assert.ok(hooks && hooks.ok, "PostToolUse with eslint+prettier should PASS");
 });
 
+test("Agent hooks PASS when PostToolUse hooks live in settings.local.json (Codex P2)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-hooks-local-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.writeFileSync(
+    path.join(dir, "package.json"),
+    JSON.stringify({ name: "x", devDependencies: { prettier: "*", eslint: "*" } }),
+  );
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  // Hooks in the gitignored settings.local.json — a supported Claude location.
+  // Must be detected (parity with deny rules), not only the shared settings.json.
+  fs.writeFileSync(
+    path.join(dir, ".claude", "settings.local.json"),
+    JSON.stringify({
+      hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [
+        { type: "command", command: "npx prettier --write" },
+        { type: "command", command: "npx eslint" },
+      ] }] },
+    }),
+  );
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  assert.ok(hooks && hooks.ok, "PostToolUse hooks in settings.local.json must be detected (Agent hooks PASS)");
+});
+
 test("Agent hooks MISS when only prettier is wired (no lint)", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-hooks-fmt-"));
   fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");

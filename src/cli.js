@@ -760,22 +760,26 @@ function detectHooksConfig(roots) {
   let permissionsDeny = false;
   for (const root of roots) {
     const settings = readJson(path.join(root, ".claude", "settings.json"));
-    const postTool = settings?.hooks?.PostToolUse;
-    const entries = Array.isArray(postTool) ? postTool : postTool ? [postTool] : [];
-    for (const entry of entries) {
-      // The matcher must cover BOTH Edit and Write — the scaffold promises
-      // `Edit|Write`. An unanchored `/Edit|Write/` would accept a matcher that
-      // hooks only one of the two, leaving the other mutation tool unchecked.
-      const matcher = entry?.matcher || "";
-      if (!/Edit/i.test(matcher) || !/Write/i.test(matcher)) continue;
-      const cmds = (entry.hooks || []).map((h) => h?.command || "").join("\n");
-      if (/eslint|lint/i.test(cmds)) postToolUseLint = true;
-      if (/prettier|format/i.test(cmds)) postToolUseFormat = true;
-    }
-    // permissions.deny may live in the shared settings.json OR the gitignored
-    // settings.local.json — check both so a project keeping its deny list in
-    // shared settings isn't falsely reported as missing the guard.
     const local = readJson(path.join(root, ".claude", "settings.local.json"));
+    // PostToolUse hooks and permissions.deny may each live in the shared
+    // settings.json OR the gitignored settings.local.json — both are supported
+    // Claude settings locations. Inspect both for hooks (as we already do for
+    // deny) so a project keeping its hooks in settings.local.json isn't falsely
+    // reported as missing Agent hooks and handed redundant init/evolve output.
+    for (const file of [settings, local]) {
+      const postTool = file?.hooks?.PostToolUse;
+      const entries = Array.isArray(postTool) ? postTool : postTool ? [postTool] : [];
+      for (const entry of entries) {
+        // The matcher must cover BOTH Edit and Write — the scaffold promises
+        // `Edit|Write`. An unanchored `/Edit|Write/` would accept a matcher that
+        // hooks only one of the two, leaving the other mutation tool unchecked.
+        const matcher = entry?.matcher || "";
+        if (!/Edit/i.test(matcher) || !/Write/i.test(matcher)) continue;
+        const cmds = (entry.hooks || []).map((h) => h?.command || "").join("\n");
+        if (/eslint|lint/i.test(cmds)) postToolUseLint = true;
+        if (/prettier|format/i.test(cmds)) postToolUseFormat = true;
+      }
+    }
     for (const denyList of [settings?.permissions?.deny, local?.permissions?.deny]) {
       if (Array.isArray(denyList) && denyList.some((d) => DANGEROUS_DENY_PATTERN.test(String(d)))) {
         permissionsDeny = true;
