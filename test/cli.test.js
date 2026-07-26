@@ -1904,3 +1904,85 @@ test("scaffolded hooks use the detected package manager executor (yarn, not npx)
   assert.ok(cmds.some((c) => /yarn exec eslint/.test(c)), "eslint hook uses yarn exec");
   assert.ok(!cmds.some((c) => /npx/.test(c)), "no npx executor in a yarn project");
 });
+
+// ---- Codex round 10: regex matcher semantics, partial-wildcard workspace globs ----
+
+test("Agent hooks PASS for an anchored regex matcher and evolve does not duplicate it (Codex P2)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-hooks-regex-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {}, devDependencies: { prettier: "*", eslint: "*" } }));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  // Claude Code treats the matcher as a REGEX. The anchored form fires on
+  // exactly Edit and Write. Splitting on "|" and comparing bare fragments
+  // ("^(Edit" / "Write)$") would miss both, falsely reporting MISS and making
+  // evolve append a duplicate Edit|Write entry.
+  fs.writeFileSync(
+    path.join(dir, ".claude", "settings.json"),
+    JSON.stringify({
+      hooks: { PostToolUse: [{ matcher: "^(Edit|Write)$", hooks: [
+        { type: "command", command: "npx prettier --write" },
+        { type: "command", command: "npx eslint" },
+      ] }] },
+    }),
+  );
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  assert.equal(hooks.ok, true, "anchored regex matcher covers Edit+Write -> Agent hooks PASS (was MISS under bare-fragment parsing)");
+  // The merge path must treat the regex entry as an Edit+Write target and not
+  // append a second Edit|Write entry.
+  await runCli(["evolve", "--cwd", dir, "--write"]);
+  const merged = JSON.parse(fs.readFileSync(path.join(dir, ".claude", "settings.json"), "utf8"));
+  const coversEditWrite = (e) => {
+    const m = String(e.matcher ?? "").trim();
+    if (m === "") return false; // catch-all excluded from the Edit+Write count
+    try {
+      const re = new RegExp(m);
+      return re.test("Edit") && re.test("Write");
+    } catch {
+      return false;
+    }
+  };
+  const editWriteEntries = (merged.hooks?.PostToolUse || []).filter(coversEditWrite);
+  assert.equal(editWriteEntries.length, 1, "exactly one Edit+Write entry (regex matcher recognized, not duplicated)");
+  assert.equal(editWriteEntries[0].matcher, "^(Edit|Write)$", "original regex matcher preserved on merge");
+});
+
+test("Agent hooks N/A when formatters live only in a dir that does NOT match a partial-wildcard glob (Codex P2)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-ws-partial-nomatch-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  // workspaces uses a PARTIAL wildcard: only members ending in -app are real.
+  fs.writeFileSync(
+    path.join(dir, "package.json"),
+    JSON.stringify({ name: "root", scripts: {}, workspaces: ["packages/*-app"] }),
+  );
+  // `packages/other` has formatters but does NOT match the `*-app` suffix.
+  // Treating every starred segment as a bare single star would include it and
+  // falsely detect formatters, scaffolding hooks at the root that npm cannot
+  // resolve (other is not a workspace member).
+  fs.mkdirSync(path.join(dir, "packages", "other"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, "packages", "other", "package.json"),
+    JSON.stringify({ name: "other", devDependencies: { prettier: "*", eslint: "*" } }),
+  );
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  assert.equal(hooks.na, true, "non-matching dir excluded by partial wildcard -> Agent hooks N/A (was wrongly detected when starred segments matched all children)");
+});
+
+test("Agent hooks detected when a workspace member matches a partial-wildcard glob suffix (Codex P2)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-ws-partial-match-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.writeFileSync(
+    path.join(dir, "package.json"),
+    JSON.stringify({ name: "root", scripts: {}, workspaces: ["packages/*-app"] }),
+  );
+  // my-app matches the `*-app` suffix -> its formatters count toward detection.
+  fs.mkdirSync(path.join(dir, "packages", "my-app"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, "packages", "my-app", "package.json"),
+    JSON.stringify({ name: "my-app", devDependencies: { prettier: "*", eslint: "*" } }),
+  );
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  assert.equal(hooks.na, false, "my-app matches packages star -app -> formatters detected -> NOT N/A");
+});

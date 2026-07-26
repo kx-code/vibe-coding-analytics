@@ -750,32 +750,45 @@ function readJson(filePath) {
  *  pass. Matches the same families that defaultDenyList scaffolds. */
 const DANGEROUS_DENY_PATTERN = /rm\s+-r|git\s+push.*(-f|force)|git\s+reset.*--hard|git\s+clean|mkfs|dd\s+if|drop\s+(table|database)|truncate|>\s*\/dev\/sd|curl.*\|\s*(sh|bash)|wget.*\|\s*(sh|bash)/i;
 
-/** Split a Claude Code PostToolUse matcher into its individual tool-name
- *  alternatives. A matcher is a literal tool name, an `|`-separated list
- *  (`Edit|Write|MultiEdit`), or a regex (`/Edit|Write/i`). Empty/whitespace
- *  means a catch-all (matches every tool). Returns [] for a catch-all so both
- *  predicates below branch on it identically. */
-function matcherAlternatives(matcher) {
+/** Classify a Claude Code PostToolUse matcher by whether it fires on the Edit
+ *  and Write tools. Claude Code interprets the matcher field as a REGEX tested
+ *  against the tool name, so we compile it and test it against "Edit" and
+ *  "Write" rather than splitting on "|" and comparing bare fragments. That way
+ *  anchored forms (`^(Edit|Write)$`) and delimited regexes (`/Edit|Write/i`)
+ *  are honored exactly like the bare alternation (`Edit|Write`) the scaffold
+ *  emits — previously `^(Edit|Write)$` was split into `^(Edit` and `Write)$`,
+ *  neither a bare tool name, so detection falsely reported MISS and the merge
+ *  appended a duplicate entry. Returns "catch-all" (empty matcher, fires on
+ *  every tool), "both" (non-empty regex matching Edit AND Write), or "no".
+ *
+ *  NotebookEdit|Write still does NOT cover Edit: as a regex, `NotebookEdit`
+ *  is not a substring of the tool name "Edit", so the test fails — the exact
+ *  tool-name semantics from earlier rounds are preserved. An unparseable regex
+ *  falls back to "no" so detection never falsely PASSES. */
+function matcherCoverage(matcher) {
   let m = String(matcher ?? "").trim();
-  if (m === "") return [];
-  if (m.startsWith("/") && m.length > 1) {
-    m = m.replace(/^\/(.+)\/[a-z]*$/, "$1");
+  if (m === "") return "catch-all";
+  let flags = "";
+  const delimited = m.match(/^\/(.+)\/([a-z]*)$/);
+  if (delimited) {
+    m = delimited[1];
+    flags = delimited[2];
   }
-  return m.split("|").map((s) => s.trim()).filter(Boolean);
+  let re;
+  try {
+    re = new RegExp(m, flags);
+  } catch {
+    return "no";
+  }
+  return re.test("Edit") && re.test("Write") ? "both" : "no";
 }
 
-/** True when a PostToolUse matcher fires on BOTH the Edit and Write tools.
- *  Used by DETECTION: a catch-all (empty) matcher covers everything, so it
- *  honors a no-explicit-matcher lint+format setup rather than skipping it.
- *  Alternatives are matched against the EXACT tool names — `NotebookEdit|Write`
- *  has a `Write` exact alternative but no `Edit` exact alternative, so it does
- *  NOT cover Edit. Substring matching would wrongly PASS (the "Edit" inside
- *  "NotebookEdit" is not the Edit tool) and let the merge append formatter hooks
- *  to an entry that never fires on Edit. */
+/** True when a PostToolUse matcher fires on BOTH Edit and Write. Used by
+ *  DETECTION: a catch-all (empty) matcher covers everything, so it honors a
+ *  no-explicit-matcher lint+format setup rather than skipping it. */
 function matcherCoversEditWrite(matcher) {
-  const alts = matcherAlternatives(matcher);
-  if (alts.length === 0) return true; // catch-all
-  return alts.some((a) => /^edit$/i.test(a)) && alts.some((a) => /^write$/i.test(a));
+  const c = matcherCoverage(matcher);
+  return c === "catch-all" || c === "both";
 }
 
 /** True only for a NON-catch-all matcher that fires on both Edit and Write.
@@ -785,9 +798,7 @@ function matcherCoversEditWrite(matcher) {
  *  on every file read. A catch-all is preserved untouched and a separate
  *  Edit|Write entry is added instead. */
 function matcherIsEditWriteEntry(matcher) {
-  const alts = matcherAlternatives(matcher);
-  if (alts.length === 0) return false; // catch-all is never a merge target
-  return alts.some((a) => /^edit$/i.test(a)) && alts.some((a) => /^write$/i.test(a));
+  return matcherCoverage(matcher) === "both";
 }
 
 /** Shared classification of a PostToolUse command's formatter purpose. Detection
@@ -892,12 +903,23 @@ function listAllDirs(dir) {
   return out;
 }
 
+/** Convert a single workspace-glob segment (no slash) into an anchored regex
+ *  where a star matches any run of non-slash characters. Regex metacharacters
+ *  are escaped first so literal dots and plus signs stay literal; only the star
+ *  is special. This lets a partial-wildcard segment such as `*-app` match only
+ *  members with that suffix, instead of every child of the parent directory. */
+function globSegmentToRegex(seg) {
+  const body = seg.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, "[^/]*");
+  return new RegExp(`^${body}$`);
+}
+
 /** Resolve a workspace glob against `root` to the concrete member directories it
- *  matches. Segments are literal directory names, a single star (one level), or
- *  a double star (zero or more levels, recursive). This covers literal member
- *  paths, single-level wildcard patterns, and nested or recursive wildcard
- *  patterns, without pulling in a glob dependency. Any segment containing a star
- *  that is not exactly a double star is treated as a single-level wildcard. */
+ *  matches. A segment is a literal directory name, a single star (one level), a
+ *  double star (zero or more levels, recursive), or a partial wildcard that
+ *  mixes a star with a literal prefix or suffix (e.g. `pkg-*` or `*-app`). A
+ *  starred segment that is not a double star is compiled to a per-segment regex
+ *  via globSegmentToRegex and tested against each child name, so siblings that
+ *  do not match the partial wildcard are excluded rather than over-matched. */
 function resolveWorkspacePattern(root, pattern) {
   const segs = String(pattern ?? "").split("/").map((s) => s.trim()).filter(Boolean);
   let dirs = [root];
@@ -906,7 +928,12 @@ function resolveWorkspacePattern(root, pattern) {
     if (seg === "**") {
       for (const d of dirs) next.push(...listAllDirs(d));
     } else if (seg.includes("*")) {
-      for (const d of dirs) next.push(...listChildDirs(d));
+      const segRe = globSegmentToRegex(seg);
+      for (const d of dirs) {
+        for (const child of listChildDirs(d)) {
+          if (segRe.test(path.basename(child))) next.push(child);
+        }
+      }
     } else {
       for (const d of dirs) {
         const child = path.join(d, seg);
