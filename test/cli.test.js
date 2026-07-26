@@ -1986,3 +1986,80 @@ test("Agent hooks detected when a workspace member matches a partial-wildcard gl
   const hooks = r.checks.find((c) => c.area === "Agent hooks");
   assert.equal(hooks.na, false, "my-app matches packages star -app -> formatters detected -> NOT N/A");
 });
+
+// ---- Codex round 11: pnpm non-hoisting, partial-purpose scaffolding, deny-skip ----
+
+test("Agent hooks N/A when formatters live only in a pnpm workspace member: deps don't hoist (Codex P2)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-fmt-pnpm-ws-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  // pnpm workspace: root has no formatters, member does. pnpm does NOT hoist
+  // member binaries into the root node_modules, so `pnpm exec prettier` run from
+  // the root (where settings.json is written) fails with "Command not found".
+  fs.writeFileSync(path.join(dir, "pnpm-lock.yaml"), "");
+  fs.writeFileSync(
+    path.join(dir, "package.json"),
+    JSON.stringify({ name: "root", scripts: {}, workspaces: ["packages/*"] }),
+  );
+  fs.mkdirSync(path.join(dir, "packages", "ui"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, "packages", "ui", "package.json"),
+    JSON.stringify({ name: "ui", devDependencies: { prettier: "*", eslint: "*" } }),
+  );
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  assert.equal(hooks.na, true, "pnpm member deps don't hoist to root -> Agent hooks N/A (was wrongly detected, scaffolding unresolvable hooks)");
+  await runCli(["init", "--cwd", dir, "--write"]);
+  assert.equal(fs.existsSync(path.join(dir, ".claude", "settings.json")), false, "init does NOT scaffold settings.json hooks when the only formatters are in a non-hoisting pnpm member");
+});
+
+test("init --write emits only the MISSING formatter purpose when the other is already in settings.local.json (Codex P2)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-hooks-partial-local-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {}, devDependencies: { prettier: "*", eslint: "*" } }));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  // eslint already wired in settings.local.json; prettier is missing. Claude
+  // loads hooks from BOTH settings files, so scaffolding BOTH into a fresh
+  // settings.json would run eslint twice on every edit.
+  fs.writeFileSync(
+    path.join(dir, ".claude", "settings.local.json"),
+    JSON.stringify({
+      hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [
+        { type: "command", command: "npx eslint --no-warn-ignored" },
+      ] }] },
+    }),
+  );
+  await runCli(["init", "--cwd", dir, "--write"]);
+  const settings = JSON.parse(fs.readFileSync(path.join(dir, ".claude", "settings.json"), "utf8"));
+  const cmds = (settings.hooks?.PostToolUse || []).flatMap((e) => (e.hooks || []).map((h) => h.command));
+  assert.ok(cmds.some((c) => /prettier/.test(c)), "missing format purpose scaffolded (prettier)");
+  assert.ok(!cmds.some((c) => /eslint/.test(c)), "already-covered lint purpose NOT re-emitted (would double-run eslint)");
+});
+
+test("evolve --write skips deny scaffolding when a dangerous-command guard is already detected (Codex P2)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-deny-skip-evolve-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {} }));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  // Committed settings.json already has a detected dangerous-command guard.
+  // evolve --write must NOT create/expand settings.local.json with the full
+  // default deny list — that would duplicate (or expand beyond) the existing guard.
+  fs.writeFileSync(
+    path.join(dir, ".claude", "settings.json"),
+    JSON.stringify({ permissions: { deny: ["Bash(rm -rf:*)"] } }),
+  );
+  await runCli(["evolve", "--cwd", dir, "--write"]);
+  assert.equal(fs.existsSync(path.join(dir, ".claude", "settings.local.json")), false, "deny list NOT scaffolded when a dangerous-command guard already exists");
+});
+
+test("init --write skips deny scaffolding when a dangerous-command guard is already detected (Codex P2)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-deny-skip-init-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {} }));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, ".claude", "settings.json"),
+    JSON.stringify({ permissions: { deny: ["Bash(git push --force:*)"] } }),
+  );
+  await runCli(["init", "--cwd", dir, "--write"]);
+  assert.equal(fs.existsSync(path.join(dir, ".claude", "settings.local.json")), false, "deny list NOT scaffolded by init when a dangerous-command guard already exists");
+});

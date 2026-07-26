@@ -967,19 +967,27 @@ function readWorkspaceMemberPackages(root, pkg) {
 }
 
 /** Hooks are scaffolded at the PRIMARY root (roots[0], where settings.json is
- *  written) and run `npx prettier`/`npx eslint` from there, so only formatters
+ *  written) and run the package-manager executor from there, so only formatters
  *  RESOLVABLE from that root count: its own manifest plus its npm workspace
  *  members (npm hoists member deps into the primary node_modules, so `npx` at the
- *  primary resolves them). Git submodule deps do NOT hoist — a submodule keeps
- *  its own node_modules, invisible to `npx` run at the primary — so submodule
- *  roots are deliberately excluded; counting them would scaffold hooks at the
- *  primary that fail (or make npx fetch an unrelated latest package) on every
- *  edit. Run vca from inside the submodule to scaffold hooks there instead. */
+ *  primary resolves them; yarn PnP resolves member binaries at the root too).
+ *  pnpm does NOT hoist by default — a member keeps its own node_modules, and
+ *  `pnpm exec <tool>` run at the root cannot find a member-only binary — so for
+ *  pnpm, member-only formatters are not resolvable from the root, exactly like a
+ *  git submodule. Counting them would scaffold hooks at the primary that fail
+ *  with "Command not found" on every edit. Run vca from inside the member
+ *  instead. */
 function hasNodeFormattersAnywhere(roots) {
   const primary = roots?.[0];
   if (!primary) return false;
   const pkg = readJson(path.join(primary, "package.json"));
   if (hasNodeFormatters(pkg)) return true;
+  // pnpm member deps don't hoist to the primary root, so a member-only
+  // prettier/eslint is invisible to `pnpm exec` run from the primary — the
+  // scaffolded hook would fail on every edit. npm/yarn do hoist/resolve, so
+  // only pnpm skips workspace members here.
+  const pm = detectPackageManager(primary, pkg);
+  if (pm === "pnpm") return false;
   for (const memberPkg of readWorkspaceMemberPackages(primary, pkg)) {
     if (hasNodeFormatters(memberPkg)) return true;
   }
@@ -1059,27 +1067,36 @@ function packageManagerExecutor(pm) {
  *  so we never scaffold Node hooks that would fail on every edit in a non-Node
  *  stack; or (b) Edit/Write lint+format hooks are already wired in either
  *  settings file — Claude loads hooks from both, so emitting a second set would
- *  run the tools twice. The executor follows the detected package manager so the
- *  hook resolves the project's own binaries (yarn/pnpm/bun, not just npx).
- *  `--ignore-unknown` keeps prettier from erroring on edits to file types it has
- *  no parser for (custom config extensions, lockfiles, …); eslint already exits
- *  cleanly on unmatched files via `--no-warn-ignored`. */
+ *  run the tools twice. Only the MISSING purpose(s) are emitted: if, say, eslint
+ *  is already wired in settings.local.json but prettier is not, the scaffold
+ *  emits only prettier — re-emitting eslint here would make Claude run it twice
+ *  on every edit (once from each settings file). The executor follows the
+ *  detected package manager so the hook resolves the project's own binaries
+ *  (yarn/pnpm/bun, not just npx). `--ignore-unknown` keeps prettier from erroring
+ *  on edits to file types it has no parser for (custom config extensions,
+ *  lockfiles, …); eslint already exits cleanly on unmatched files via
+ *  `--no-warn-ignored`. */
 function claudeHooksSettings(report) {
   const roots = report.roots;
   if (!hasNodeFormattersAnywhere(roots)) return null;
   const { postToolUseLint, postToolUseFormat } = detectHooksConfig(roots);
   if (postToolUseLint && postToolUseFormat) return null;
   const exec = packageManagerExecutor(detectPackageManager(report.cwd, report.packageJson));
+  // Emit only the formatter purpose(s) not already satisfied in EITHER settings
+  // file. Claude loads PostToolUse hooks from settings.json AND settings.local.json,
+  // so a freshly-created settings.json that re-emits a purpose already covered in
+  // settings.local.json would run that tool twice on every edit.
+  const hooks = [];
+  if (!postToolUseFormat) {
+    hooks.push({ type: "command", command: `${HOOK_READ_PATH} | xargs -0 -I{} ${exec} prettier --write --ignore-unknown {}` });
+  }
+  if (!postToolUseLint) {
+    hooks.push({ type: "command", command: `${HOOK_READ_PATH} | xargs -0 -I{} ${exec} eslint --no-warn-ignored {}` });
+  }
   const config = {
     hooks: {
       PostToolUse: [
-        {
-          matcher: "Edit|Write",
-          hooks: [
-            { type: "command", command: `${HOOK_READ_PATH} | xargs -0 -I{} ${exec} prettier --write --ignore-unknown {}` },
-            { type: "command", command: `${HOOK_READ_PATH} | xargs -0 -I{} ${exec} eslint --no-warn-ignored {}` },
-          ],
-        },
+        { matcher: "Edit|Write", hooks },
       ],
     },
   };
@@ -1213,9 +1230,14 @@ function buildInitFiles(report) {
   // of irreversible commands. Skipped for non-Claude stacks (Codex/Cursor).
   // Hooks (settings.json) are also gated on prettier+eslint being present so we
   // don't break every edit in a non-Node stack. The deny list (settings.local.json)
-  // is tool-agnostic and valuable for any Claude project, so it is always emitted.
+  // is tool-agnostic and valuable for any Claude project — but it is SKIPPED when
+  // a dangerous-command guard is already detected in either settings file, so
+  // init does not duplicate (or expand beyond) an existing committed guard.
   if (isClaudeCodeProject(report.roots)) {
-    files.push(file(".claude/settings.local.json", claudePermissionsLocal(report), mergePermissionsLocal));
+    const { permissionsDeny } = detectHooksConfig(report.roots);
+    if (!permissionsDeny) {
+      files.push(file(".claude/settings.local.json", claudePermissionsLocal(report), mergePermissionsLocal));
+    }
     const hooksContent = claudeHooksSettings(report);
     if (hooksContent) files.push(file(".claude/settings.json", hooksContent, mergeHooksSettings));
   }
@@ -1334,9 +1356,14 @@ function buildEvolutionFiles(report, plan) {
   // evolve also backfills hooks + deny list when missing on Claude Code projects.
   // When settings already exist (but lack the hook/deny entry), writeOrPreview
   // MERGES the missing keys instead of skipping — otherwise the backfill this
-  // command advertises would be a no-op and the next scan would still MISS.
+  // command advertises would be a no-op and the next scan would still MISS. The
+  // deny list is skipped when a dangerous-command guard is already detected in
+  // either settings file, so evolve does not duplicate or expand an existing one.
   if (isClaudeCodeProject(report.roots)) {
-    files.push(file(".claude/settings.local.json", claudePermissionsLocal(report), mergePermissionsLocal));
+    const { permissionsDeny } = detectHooksConfig(report.roots);
+    if (!permissionsDeny) {
+      files.push(file(".claude/settings.local.json", claudePermissionsLocal(report), mergePermissionsLocal));
+    }
     const hooksContent = claudeHooksSettings(report);
     if (hooksContent) files.push(file(".claude/settings.json", hooksContent, mergeHooksSettings));
   }
