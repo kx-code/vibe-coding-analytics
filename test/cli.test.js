@@ -1663,12 +1663,16 @@ test("evolve --write merges into a semantically-equivalent matcher (Write|Edit),
   assert.equal(entries[0].matcher, "Write|Edit", "original matcher preserved on merge");
 });
 
-test("Agent hooks MISS (not N/A) and init scaffolds hooks when formatters live only in a nested submodule package (Codex P2)", async () => {
+test("Agent hooks N/A (not MISS) when formatters live only in a git submodule: deps don't hoist, hooks scaffolded at the root can't resolve them (Codex P2)", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-fmt-roots-"));
   fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
   // Root package.json declares NO prettier/eslint.
   fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "root", scripts: {} }));
-  // The nested submodule declares them.
+  // The nested submodule declares them, but a git submodule keeps its OWN
+  // node_modules — its deps do not hoist into the root, so `npx prettier`/`npx
+  // eslint` run from the root cannot resolve them. Counting the submodule would
+  // scaffold PostToolUse hooks at the root that fail (or fetch an unrelated
+  // latest package) on every edit. Run vca from inside the submodule instead.
   fs.mkdirSync(path.join(dir, "sub"), { recursive: true });
   fs.writeFileSync(path.join(dir, "sub", "package.json"), JSON.stringify({ name: "sub", devDependencies: { prettier: "*", eslint: "*" } }));
   fs.writeFileSync(path.join(dir, "sub", "CLAUDE.md"), "# sub\n");
@@ -1676,11 +1680,10 @@ test("Agent hooks MISS (not N/A) and init scaffolds hooks when formatters live o
   const r = analyzeForTest(dir);
   const hooks = r.checks.find((c) => c.area === "Agent hooks");
   assert.ok(hooks, "Agent hooks check present");
-  assert.equal(hooks.na, false, "formatters present in a nested root -> Agent hooks is NOT N/A");
-  assert.equal(hooks.ok, false, "no hooks wired -> Agent hooks MISS (was wrongly N/A when only root package.json was read)");
-  // init must scaffold hooks even though the root package.json lacks the formatters.
+  assert.equal(hooks.na, true, "submodule deps don't hoist to the root -> Agent hooks N/A (root can't resolve them)");
+  // init must NOT scaffold formatter hooks at the root (they'd be unresolvable).
   await runCli(["init", "--cwd", dir, "--write"]);
-  assert.equal(fs.existsSync(path.join(dir, ".claude", "settings.json")), true, "init scaffolds settings.json when formatters are in a nested root");
+  assert.equal(fs.existsSync(path.join(dir, ".claude", "settings.json")), false, "init does NOT scaffold settings.json hooks when formatters are only in a non-hoisting submodule");
 });
 
 test("Project facts MISS recommends docs, not a manifest (Codex P2 duplicate-key fix)", () => {
@@ -1775,4 +1778,74 @@ test("Agent hooks MISS (not N/A) and init scaffolds hooks when formatters live o
   assert.equal(hooks.ok, false, "no hooks wired -> Agent hooks MISS (was wrongly N/A when only root package.json was inspected)");
   await runCli(["init", "--cwd", dir, "--write"]);
   assert.equal(fs.existsSync(path.join(dir, ".claude", "settings.json")), true, "init scaffolds settings.json when formatters are in a workspace member");
+});
+
+// ---- Codex round 8: explicit workspace paths, purpose-based hook dedup ----
+
+test("Agent hooks detected when formatters live in an EXPLICIT (non-glob) workspace member (Codex P2)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-fmt-ws-explicit-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  // workspaces lists a literal member path (no glob) -> read its manifest directly.
+  fs.writeFileSync(
+    path.join(dir, "package.json"),
+    JSON.stringify({ name: "root", scripts: {}, workspaces: ["packages/ui"] }),
+  );
+  fs.mkdirSync(path.join(dir, "packages", "ui"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, "packages", "ui", "package.json"),
+    JSON.stringify({ name: "ui", devDependencies: { prettier: "*", eslint: "*" } }),
+  );
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  assert.equal(hooks.na, false, "explicit workspace member with formatters -> NOT N/A");
+});
+
+test("evolve --write does not duplicate formatter hooks already covered by custom commands (Codex P2)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-merge-purpose-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {}, devDependencies: { prettier: "*", eslint: "*" } }));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  // Existing Edit/Write entry already wires custom, semantically-equivalent
+  // eslint + prettier commands. Exact-string comparison treats them as unknown
+  // and would append the scaffold's `npx ...` commands, running each tool twice.
+  fs.writeFileSync(
+    path.join(dir, ".claude", "settings.json"),
+    JSON.stringify({
+      hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [
+        { type: "command", command: "prettier --write ." },
+        { type: "command", command: "eslint --fix ." },
+      ] }] },
+    }),
+  );
+  await runCli(["evolve", "--cwd", dir, "--write"]);
+  const merged = JSON.parse(fs.readFileSync(path.join(dir, ".claude", "settings.json"), "utf8"));
+  const entry = (merged.hooks?.PostToolUse || []).find((e) => e.matcher === "Edit|Write");
+  assert.ok(entry, "Edit|Write entry preserved");
+  const cmds = (entry.hooks || []).map((h) => h.command);
+  assert.equal(cmds.length, 2, "no scaffold formatter appended when both purposes are already covered");
+  assert.ok(!cmds.some((c) => /npx prettier/.test(c)), "scaffold prettier not appended (custom prettier already covers it)");
+  assert.ok(!cmds.some((c) => /npx eslint/.test(c)), "scaffold eslint not appended (custom eslint already covers it)");
+});
+
+test("evolve --write adds only the MISSING formatter purpose (custom eslint, no prettier) (Codex P2)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-merge-partial-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {}, devDependencies: { prettier: "*", eslint: "*" } }));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, ".claude", "settings.json"),
+    JSON.stringify({
+      hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [
+        { type: "command", command: "eslint --fix ." },
+      ] }] },
+    }),
+  );
+  await runCli(["evolve", "--cwd", dir, "--write"]);
+  const merged = JSON.parse(fs.readFileSync(path.join(dir, ".claude", "settings.json"), "utf8"));
+  const entry = (merged.hooks?.PostToolUse || []).find((e) => e.matcher === "Edit|Write");
+  const cmds = (entry.hooks || []).map((h) => h.command);
+  // lint purpose already covered by custom eslint -> scaffold eslint NOT appended;
+  // format purpose missing -> scaffold prettier IS appended.
+  assert.equal(cmds.filter((c) => /eslint/.test(c)).length, 1, "exactly one eslint command (custom kept, scaffold eslint deduped by purpose)");
+  assert.ok(cmds.some((c) => /prettier/.test(c)), "scaffold prettier appended (format purpose was missing)");
 });

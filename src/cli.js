@@ -790,6 +790,20 @@ function matcherIsEditWriteEntry(matcher) {
   return alts.some((a) => /^edit$/i.test(a)) && alts.some((a) => /^write$/i.test(a));
 }
 
+/** Shared classification of a PostToolUse command's formatter purpose. Detection
+ *  (detectHooksConfig) and merging (mergeHooksSettings) MUST agree on what counts
+ *  as "lint" / "format": if a command already satisfies detection, the merge must
+ *  not append a scaffolded command of the same purpose (or every edit runs the
+ *  formatter and linter twice). Defined once here so the two stay in lockstep. */
+const LINT_CMD_RE = /eslint|lint/i;
+const FORMAT_CMD_RE = /prettier|format/i;
+function commandPurpose(cmd) {
+  const c = String(cmd || "");
+  if (LINT_CMD_RE.test(c)) return "lint";
+  if (FORMAT_CMD_RE.test(c)) return "format";
+  return null;
+}
+
 /** Detect Claude Code hooks + permission-guard config across project roots.
  *  PostToolUse(Edit|Write)->lint+format stops style drift at edit time; a
  *  non-empty permissions.deny blocks irreversible commands. Both are the
@@ -816,8 +830,8 @@ function detectHooksConfig(roots) {
         // than skipped — which would falsely report Agent hooks as MISS.
         if (!matcherCoversEditWrite(entry?.matcher)) continue;
         const cmds = (entry.hooks || []).map((h) => h?.command || "").join("\n");
-        if (/eslint|lint/i.test(cmds)) postToolUseLint = true;
-        if (/prettier|format/i.test(cmds)) postToolUseFormat = true;
+        if (LINT_CMD_RE.test(cmds)) postToolUseLint = true;
+        if (FORMAT_CMD_RE.test(cmds)) postToolUseFormat = true;
       }
     }
     for (const denyList of [settings?.permissions?.deny, local?.permissions?.deny]) {
@@ -859,15 +873,25 @@ function workspacePatterns(pkg) {
   return [];
 }
 
-/** Read the manifests of npm workspace members under `root`. Supports the
- *  common `dir/*` and `dir/**` patterns by listing each pattern's base
- *  directory; a full glob engine is intentionally avoided to stay
+/** Read the manifests of npm workspace members under `root`. Supports two forms
+ *  of workspace entry: a literal member path (`packages/ui`) whose own manifest
+ *  is read directly, and a glob (`packages/*`, `apps/**`) resolved by listing the
+ *  pattern's base directory. A full glob engine is intentionally avoided to stay
  *  dependency-free. Members are directories (skipping node_modules) that ship
  *  their own package.json. */
 function readWorkspaceMemberPackages(root, pkg) {
   const members = [];
   for (const pat of workspacePatterns(pkg)) {
-    const base = String(pat ?? "").replace(/\/+\*+.*$/, "").trim();
+    const p = String(pat ?? "").trim();
+    if (!p) continue;
+    if (!p.includes("*")) {
+      // Explicit member path (no glob): read its own manifest directly rather
+      // than treating it as a directory to list children of.
+      const memberPkg = readJson(path.join(root, p, "package.json"));
+      if (memberPkg) members.push(memberPkg);
+      continue;
+    }
+    const base = p.replace(/\/+\*+.*$/, "").trim();
     if (!base) continue;
     const dir = path.join(root, base);
     let entries = [];
@@ -885,19 +909,22 @@ function readWorkspaceMemberPackages(root, pkg) {
   return members;
 }
 
-/** prettier/eslint may be declared in a nested package (npm workspace member
- *  or git submodule) rather than the root package.json. The analyzer scans
- *  nested roots (git submodules) and npm workspace members, so the formatter
- *  check must too — otherwise a Claude Code subproject that has the deps but no
- *  hooks is classified N/A instead of MISS, and init/evolve never scaffold the
- *  advertised hooks for it. */
+/** Hooks are scaffolded at the PRIMARY root (roots[0], where settings.json is
+ *  written) and run `npx prettier`/`npx eslint` from there, so only formatters
+ *  RESOLVABLE from that root count: its own manifest plus its npm workspace
+ *  members (npm hoists member deps into the primary node_modules, so `npx` at the
+ *  primary resolves them). Git submodule deps do NOT hoist — a submodule keeps
+ *  its own node_modules, invisible to `npx` run at the primary — so submodule
+ *  roots are deliberately excluded; counting them would scaffold hooks at the
+ *  primary that fail (or make npx fetch an unrelated latest package) on every
+ *  edit. Run vca from inside the submodule to scaffold hooks there instead. */
 function hasNodeFormattersAnywhere(roots) {
-  for (const root of roots) {
-    const pkg = readJson(path.join(root, "package.json"));
-    if (hasNodeFormatters(pkg)) return true;
-    for (const memberPkg of readWorkspaceMemberPackages(root, pkg)) {
-      if (hasNodeFormatters(memberPkg)) return true;
-    }
+  const primary = roots?.[0];
+  if (!primary) return false;
+  const pkg = readJson(path.join(primary, "package.json"));
+  if (hasNodeFormatters(pkg)) return true;
+  for (const memberPkg of readWorkspaceMemberPackages(primary, pkg)) {
+    if (hasNodeFormatters(memberPkg)) return true;
   }
   return false;
 }
@@ -1272,11 +1299,25 @@ function mergeHooksSettings(existingContent, incomingContent) {
       const existingEntry = existing.hooks.PostToolUse[idx];
       existingEntry.hooks ??= [];
       const knownCmds = new Set(existingEntry.hooks.map((h) => h?.command));
+      // Track which formatter purposes the entry already covers, so a scaffolded
+      // command is skipped when a semantically-equivalent custom command already
+      // satisfies it. Exact-string dedup alone would treat `prettier --write .`
+      // as different from the scaffold's `npx prettier --write` and append it,
+      // running the formatter and linter twice on every edit. Classification
+      // mirrors detectHooksConfig (commandPurpose), so "already satisfies
+      // detection" and "already merged" stay consistent.
+      const coveredPurposes = new Set();
+      for (const h of existingEntry.hooks) {
+        const purpose = commandPurpose(h?.command);
+        if (purpose) coveredPurposes.add(purpose);
+      }
       for (const h of entry.hooks || []) {
-        if (h?.command && !knownCmds.has(h.command)) {
-          existingEntry.hooks.push(h);
-          knownCmds.add(h.command);
-        }
+        if (!h?.command || knownCmds.has(h.command)) continue;
+        const purpose = commandPurpose(h.command);
+        if (purpose && coveredPurposes.has(purpose)) continue;
+        existingEntry.hooks.push(h);
+        knownCmds.add(h.command);
+        if (purpose) coveredPurposes.add(purpose);
       }
     }
   }
