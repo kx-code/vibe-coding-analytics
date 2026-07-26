@@ -103,6 +103,13 @@ function analyzeProject(cwd) {
   const hooks = detectHooksConfig(roots);
   const isClaude = isClaudeCodeProject(roots);
   const hasFormatters = hasNodeFormatters(packageJson);
+  // N/A semantics: a check that does not apply to this project should neither
+  // count as a "missing area" nor earn score weight. We mark it `na` so the
+  // scoring loop and printReport can exclude it (a check that is merely `ok`
+  // but inapplicable would otherwise inflate the score — a perverse incentive).
+  const hooksPresent = hooks.postToolUseLint && hooks.postToolUseFormat;
+  const hooksNa = !isClaude || (!hasFormatters && !hooksPresent);
+  const guardNa = !isClaude;
   const checks = [
     check(
       "Project facts",
@@ -179,19 +186,21 @@ function analyzeProject(cwd) {
     ),
     check(
       "Agent hooks",
-      !isClaude || (hooks.postToolUseLint && hooks.postToolUseFormat) || !hasFormatters,
+      hooksNa || hooksPresent,
       !isClaude
         ? "N/A — not a Claude Code project (no CLAUDE.md / .claude/settings*.json). PostToolUse hooks apply to Claude Code; skip for Codex/Cursor/Copilot stacks."
         : !hasFormatters
           ? "N/A — prettier + eslint not found in dependencies. Install them (npm i -D prettier eslint) then run `vca init --write` to scaffold edit-time lint+format hooks; omitted so non-Node stacks don't fail on every edit."
           : "Add .claude/settings.json hooks.PostToolUse on Edit|Write to run eslint + prettier -- format-on-save stops style drift and catches errors at edit time. (vca init --write scaffolds this.)",
+      hooksNa,
     ),
     check(
       "Dangerous-command guard",
-      !isClaude || hooks.permissionsDeny,
-      !isClaude
+      guardNa || hooks.permissionsDeny,
+      guardNa
         ? "N/A — not a Claude Code project (no CLAUDE.md / .claude/settings*.json). permissions.deny is a Claude Code settings mechanism."
         : "Add .claude/settings.local.json permissions.deny for irreversible commands (rm -rf, git push -f, git reset --hard, mkfs, dd, DROP TABLE) so agents cannot run them. (vca init --write scaffolds a default list.)",
+      guardNa,
     ),
     check(
       "Deploy hooks",
@@ -216,6 +225,7 @@ function analyzeProject(cwd) {
         : ruleTrace.unenforcedCount === 0
           ? `All ${ruleTrace.total} numbered rule(s) appear referenced by a test or validator sensor.`
           : `${ruleTrace.unenforcedCount}/${ruleTrace.total} numbered rule(s) are not referenced by any test or validator -- add sensors that enforce them by name. Examples: ${ruleTrace.examples.join("; ")}`,
+      ruleTrace.na,
     ),
     check(
       "Steering loop",
@@ -258,10 +268,14 @@ function analyzeProject(cwd) {
   for (const c of checks) {
     const w = weightOf(c.area);
     c.weight = w;
+    // N/A checks are excluded from the denominator entirely: an inapplicable
+    // check must not dilute a passing score, nor pad it when it would otherwise
+    // be low. Only applicable checks (na === false) count toward earned/total.
+    if (c.na) continue;
     total += w;
     if (c.ok) earned += w;
   }
-  const score = Math.round((earned / total) * 100);
+  const score = total === 0 ? 100 : Math.round((earned / total) * 100);
   const warnings = detectWarnings(checks);
   return { cwd, shape, roots, files: allFiles, packageJson, scripts, checks, score, warnings, untrackedHarness };
 }
@@ -407,8 +421,8 @@ function enrichDepth(checks, ctx) {
   set("Steering loop", countNumberedRules(ctx.roots), "numbered rule(s)");
 }
 
-function check(area, ok, action) {
-  return { area, ok, action };
+function check(area, ok, action, na = false) {
+  return { area, ok, action, na: Boolean(na) };
 }
 
 /** Project roots = cwd plus every git submodule path declared in .gitmodules. */
@@ -749,15 +763,23 @@ function detectHooksConfig(roots) {
     const postTool = settings?.hooks?.PostToolUse;
     const entries = Array.isArray(postTool) ? postTool : postTool ? [postTool] : [];
     for (const entry of entries) {
-      if (!/Edit|Write/i.test(entry?.matcher || "")) continue;
+      // The matcher must cover BOTH Edit and Write — the scaffold promises
+      // `Edit|Write`. An unanchored `/Edit|Write/` would accept a matcher that
+      // hooks only one of the two, leaving the other mutation tool unchecked.
+      const matcher = entry?.matcher || "";
+      if (!/Edit/i.test(matcher) || !/Write/i.test(matcher)) continue;
       const cmds = (entry.hooks || []).map((h) => h?.command || "").join("\n");
       if (/eslint|lint/i.test(cmds)) postToolUseLint = true;
       if (/prettier|format/i.test(cmds)) postToolUseFormat = true;
     }
+    // permissions.deny may live in the shared settings.json OR the gitignored
+    // settings.local.json — check both so a project keeping its deny list in
+    // shared settings isn't falsely reported as missing the guard.
     const local = readJson(path.join(root, ".claude", "settings.local.json"));
-    const denyList = Array.isArray(local?.permissions?.deny) ? local.permissions.deny : [];
-    if (denyList.some((d) => DANGEROUS_DENY_PATTERN.test(String(d)))) {
-      permissionsDeny = true;
+    for (const denyList of [settings?.permissions?.deny, local?.permissions?.deny]) {
+      if (Array.isArray(denyList) && denyList.some((d) => DANGEROUS_DENY_PATTERN.test(String(d)))) {
+        permissionsDeny = true;
+      }
     }
   }
   return { postToolUseLint, postToolUseFormat, permissionsDeny };
@@ -820,12 +842,18 @@ function defaultDenyList(report) {
   return deny;
 }
 
+/** Read the edited file path from the hook's stdin JSON payload using the Node
+ *  runtime — guaranteed present because prettier/eslint are npm deps — instead
+ *  of the external `jq` executable, which minimal CI/dev images may not ship and
+ *  which is not a declared prerequisite of this package. Piped through
+ *  `xargs -I{}` so paths with spaces/quotes survive (bare `xargs` word-splits
+ *  `docs/my file.md` into two targets). */
+const HOOK_READ_PATH = `node -e "const f=JSON.parse(require('fs').readFileSync(0,'utf8')).tool_input?.file_path;if(f)console.log(f)"`;
+
 /** Claude Code settings.json with PostToolUse(Edit|Write) -> prettier + eslint.
  *  Format-on-save + lint-on-edit are the cheapest computational sensors.
  *  Returns null when prettier/eslint aren't declared deps, so we never scaffold
- *  Node hooks that would fail on every edit in a non-Node stack. Paths flow
- *  through `xargs -I{}` so spaces/quotes in an edited file path survive intact
- *  (bare `xargs` word-splits `docs/my file.md` into two targets). */
+ *  Node hooks that would fail on every edit in a non-Node stack. */
 function claudeHooksSettings(packageJson) {
   if (!hasNodeFormatters(packageJson)) return null;
   const config = {
@@ -834,8 +862,8 @@ function claudeHooksSettings(packageJson) {
         {
           matcher: "Edit|Write",
           hooks: [
-            { type: "command", command: "jq -r '.tool_input.file_path' | xargs -I{} npx prettier --write {}" },
-            { type: "command", command: "jq -r '.tool_input.file_path' | xargs -I{} npx eslint --no-warn-ignored {}" },
+            { type: "command", command: `${HOOK_READ_PATH} | xargs -I{} npx prettier --write {}` },
+            { type: "command", command: `${HOOK_READ_PATH} | xargs -I{} npx eslint --no-warn-ignored {}` },
           ],
         },
       ],
@@ -878,14 +906,15 @@ export function printReport(report) {
   console.log(`Harness score: ${report.score}/100\n`);
   for (const item of report.checks) {
     const grade = item.grade ? ` · ${item.grade}` : "";
-    console.log(`${item.ok ? "PASS" : "MISS"}  ${item.area}${item.depth ? `  (${item.depth})` : ""}${grade}`);
-    if (!item.ok) console.log(`      ${item.action}`);
+    const label = item.na ? "N/A" : item.ok ? "PASS" : "MISS";
+    console.log(`${label}  ${item.area}${item.depth ? `  (${item.depth})` : ""}${grade}`);
+    if (!item.ok && !item.na) console.log(`      ${item.action}`);
   }
   if (report.warnings && report.warnings.length) {
     console.log("\nWarnings:");
     for (const w of report.warnings) console.log(`! ${w.message}`);
   }
-  const missing = report.checks.filter((c) => !c.ok);
+  const missing = report.checks.filter((c) => !c.ok && !c.na);
   if (missing.length) {
     console.log(
       `\n→ ${missing.length} missing area(s). Run \`vca evolve --write\` to backfill hooks, deny list, commands, and sensors — or \`vca init --write\` for the full baseline harness.`,
@@ -1119,9 +1148,20 @@ function mergeHooksSettings(existingContent, incomingContent) {
     if (idx === -1) {
       existing.hooks.PostToolUse.push(entry);
     } else {
-      const cmds = new Set((existing.hooks.PostToolUse[idx].hooks || []).map((h) => h.command));
-      for (const h of entry.hooks || []) cmds.add(h.command);
-      existing.hooks.PostToolUse[idx].hooks = [...cmds].map((command) => ({ type: "command", command }));
+      // Preserve existing hook objects (which may carry `timeout`, `prompt`,
+      // or other fields) and only append incoming *command* hooks whose command
+      // string is not already present. Rebuilding the whole list from a Set of
+      // command strings would (a) drop `timeout`, and (b) turn prompt/agent
+      // hooks (no `command` field) into invalid `{type:"command",command:undefined}`.
+      const existingEntry = existing.hooks.PostToolUse[idx];
+      existingEntry.hooks ??= [];
+      const knownCmds = new Set(existingEntry.hooks.map((h) => h?.command));
+      for (const h of entry.hooks || []) {
+        if (h?.command && !knownCmds.has(h.command)) {
+          existingEntry.hooks.push(h);
+          knownCmds.add(h.command);
+        }
+      }
     }
   }
   return `${JSON.stringify(existing, null, 2)}\n`;

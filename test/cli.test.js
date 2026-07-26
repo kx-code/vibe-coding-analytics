@@ -1345,7 +1345,7 @@ test("printReport prints NO fix hint when every check passes", () => {
   assert.ok(!/vca evolve --write/.test(blob), "no fix hint when all checks pass");
 });
 
-// ---- codex review fixes: jq path, deny pattern depth, non-Claude N/A ----
+// ---- codex review fixes: node stdin parser, deny pattern depth, non-Claude N/A ----
 
 test("Dangerous-command guard MISS when deny list lacks irreversible commands", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-deny-weak-"));
@@ -1373,15 +1373,17 @@ test("Agent hooks + guard are N/A (pass) for non-Claude-Code projects", () => {
   assert.ok(guard && guard.ok, "Dangerous-command guard N/A for non-Claude project");
 });
 
-test("scaffolded hooks read file_path from stdin JSON, not an undefined \$FILE_PATH var", async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-hooks-jq-"));
+test("scaffolded hooks read file_path from stdin JSON via the Node runtime, not an undefined \$FILE_PATH var or external jq", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-hooks-node-"));
   fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {}, devDependencies: { prettier: "*", eslint: "*" } }));
   fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
   await runCli(["init", "--cwd", dir, "--write"]);
   const settings = fs.readFileSync(path.join(dir, ".claude", "settings.json"), "utf8");
-  assert.ok(/tool_input\.file_path/.test(settings), "hook reads .tool_input.file_path from stdin");
+  assert.ok(/tool_input\??\.file_path/.test(settings), "hook reads .tool_input.file_path from stdin");
   assert.ok(!/\$FILE_PATH/.test(settings), "hook must NOT use undefined \$FILE_PATH variable");
-  assert.ok(/jq/.test(settings), "hook uses jq to parse the stdin payload");
+  assert.ok(/node -e/.test(settings), "hook parses stdin via the guaranteed Node runtime");
+  assert.ok(/readFileSync\(0/.test(settings), "hook reads stdin (fd 0) with readFileSync(0)");
+  assert.ok(!/\bjq\b/.test(settings), "hook must NOT depend on the external jq executable (jq is not a declared prerequisite)");
 });
 
 // ---- Codex round 2: hooks/settings correctness ----
@@ -1462,6 +1464,104 @@ test("init on a non-Claude project does not flip Claude detection on the next sc
   const guard = r.checks.find((c) => c.area === "Dangerous-command guard");
   assert.ok(hooks && hooks.ok, "Agent hooks N/A — commands-only .claude/ is not a Claude project");
   assert.ok(guard && guard.ok, "Dangerous-command guard N/A — commands-only .claude/ is not a Claude project");
+});
+
+// ---- Codex round 3: hook-merge preservation, N/A scoring, shared deny, matcher coverage ----
+
+test("evolve --write merge preserves existing hook objects (timeout/prompt), only appends new command hooks (Codex P1)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-merge-preserve-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {}, devDependencies: { prettier: "*", eslint: "*" } }));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  // Existing settings with a PostToolUse entry carrying a `timeout` and a
+  // prompt-style hook (no `command` field). A naive merge that rebuilds hooks
+  // from a Set of command strings would drop `timeout` and emit a broken
+  // {type:"command",command:undefined} for the prompt hook.
+  fs.writeFileSync(
+    path.join(dir, ".claude", "settings.json"),
+    JSON.stringify({
+      hooks: {
+        PostToolUse: [
+          {
+            matcher: "Edit|Write",
+            timeout: 60,
+            hooks: [{ type: "prompt", prompt: "Review this edit for secrets." }],
+          },
+        ],
+      },
+    }),
+  );
+  await runCli(["evolve", "--cwd", dir, "--write"]);
+  const merged = JSON.parse(fs.readFileSync(path.join(dir, ".claude", "settings.json"), "utf8"));
+  const entry = (merged.hooks?.PostToolUse || []).find((e) => (e.matcher || "") === "Edit|Write");
+  assert.ok(entry, "merged entry for Edit|Write exists");
+  assert.equal(entry.timeout, 60, "existing `timeout` field preserved across merge");
+  const promptHook = (entry.hooks || []).find((h) => h.type === "prompt");
+  assert.ok(promptHook, "existing prompt-style hook preserved (not converted to a broken command hook)");
+  assert.ok(!(entry.hooks || []).some((h) => h.type === "command" && h.command === undefined), "no broken {type:command,command:undefined} hooks emitted");
+  const cmds = (entry.hooks || []).filter((h) => h.type === "command").map((h) => h.command).join("\n");
+  assert.ok(/prettier/.test(cmds) && /eslint/.test(cmds), "new prettier+eslint command hooks appended");
+});
+
+test("N/A checks are excluded from the score (inapplicable checks don't pad a low score) (Codex P1)", () => {
+  // A non-Claude project (no CLAUDE.md / .claude) missing real checks (no tests,
+  // no CI, no validation command). Agent hooks + guard are N/A here, so they
+  // must contribute zero to earned AND total — otherwise a low score is padded
+  // by inapplicable checks that merely happen to be ok:true.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-na-score-"));
+  fs.writeFileSync(path.join(dir, "AGENTS.md"), "# x\n");
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  const guard = r.checks.find((c) => c.area === "Dangerous-command guard");
+  assert.ok(hooks && hooks.na, "Agent hooks is N/A for non-Claude project");
+  assert.ok(guard && guard.na, "Dangerous-command guard is N/A for non-Claude project");
+  // Recompute the score over ONLY applicable (non-na) checks and confirm the
+  // reported score matches — i.e. na checks contribute zero to earned and total.
+  const applicable = r.checks.filter((c) => !c.na);
+  const earned = applicable.filter((c) => c.ok).reduce((s, c) => s + (c.weight || 1), 0);
+  const total = applicable.reduce((s, c) => s + (c.weight || 1), 0);
+  const expected = total === 0 ? 100 : Math.round((earned / total) * 100);
+  assert.equal(r.score, expected, `score ${r.score} must be computed over applicable checks only (expected ${expected} from ${earned}/${total})`);
+  // N/A checks must never appear as a missing area / recommendation.
+  assert.ok(!r.checks.some((c) => c.na && !c.ok), "N/A checks are not flagged as missing");
+});
+
+test("Dangerous-command guard PASS when deny list is in the shared settings.json (Codex P2)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-deny-shared-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  // deny list lives in the SHARED, committed settings.json — must be detected,
+  // not only the gitignored settings.local.json.
+  fs.writeFileSync(
+    path.join(dir, ".claude", "settings.json"),
+    JSON.stringify({ permissions: { deny: ["Bash(rm -rf:*)"] } }),
+  );
+  const r = analyzeForTest(dir);
+  const guard = r.checks.find((c) => c.area === "Dangerous-command guard");
+  assert.ok(guard && guard.ok, "deny in shared settings.json must PASS the guard");
+});
+
+test("Agent hooks MISS when matcher covers only Edit (not Write) (Codex P2)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-hooks-matcher-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.writeFileSync(
+    path.join(dir, "package.json"),
+    JSON.stringify({ name: "x", devDependencies: { prettier: "*", eslint: "*" } }),
+  );
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  // Matcher targets only "Edit" — Write edits would skip lint+format entirely.
+  fs.writeFileSync(
+    path.join(dir, ".claude", "settings.json"),
+    JSON.stringify({
+      hooks: { PostToolUse: [{ matcher: "Edit", hooks: [
+        { type: "command", command: "npx prettier --write" },
+        { type: "command", command: "npx eslint" },
+      ] }] },
+    }),
+  );
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  assert.ok(hooks && !hooks.ok, "matcher covering only Edit (not Write) must MISS");
 });
 
 test("Project facts MISS recommends docs, not a manifest (Codex P2 duplicate-key fix)", () => {
