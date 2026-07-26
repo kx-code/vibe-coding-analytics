@@ -102,7 +102,7 @@ function analyzeProject(cwd) {
   const ruleTrace = analyzeRuleTraceability(roots, allFiles, cwd);
   const hooks = detectHooksConfig(roots);
   const isClaude = isClaudeCodeProject(roots);
-  const hasFormatters = hasNodeFormatters(packageJson);
+  const hasFormatters = hasNodeFormattersAnywhere(roots);
   // N/A semantics: a check that does not apply to this project should neither
   // count as a "missing area" nor earn score weight. We mark it `na` so the
   // scoring loop and printReport can exclude it (a check that is merely `ok`
@@ -750,6 +750,20 @@ function readJson(filePath) {
  *  pass. Matches the same families that defaultDenyList scaffolds. */
 const DANGEROUS_DENY_PATTERN = /rm\s+-r|git\s+push.*(-f|force)|git\s+reset.*--hard|git\s+clean|mkfs|dd\s+if|drop\s+(table|database)|truncate|>\s*\/dev\/sd|curl.*\|\s*(sh|bash)|wget.*\|\s*(sh|bash)/i;
 
+/** A PostToolUse matcher "covers" Edit+Write when Claude Code would fire the
+ *  hook on both tools. An empty/omitted matcher is a catch-all (matches every
+ *  tool, including Edit and Write), so it covers both. A non-empty matcher must
+ *  name both Edit and Write — in any order, possibly among other tools (e.g.
+ *  `Write|Edit`, `Edit|Write|MultiEdit`). Used both to detect existing hooks
+ *  (a catch-all entry is a valid lint+format setup, not a skip) and to dedupe
+ *  semantically-equivalent matchers when merging (literal equality would miss
+ *  `Write|Edit` and append a duplicate entry, running the formatter twice). */
+function matcherCoversEditWrite(matcher) {
+  const m = String(matcher || "").trim();
+  if (m === "") return true; // catch-all
+  return /Edit/i.test(m) && /Write/i.test(m);
+}
+
 /** Detect Claude Code hooks + permission-guard config across project roots.
  *  PostToolUse(Edit|Write)->lint+format stops style drift at edit time; a
  *  non-empty permissions.deny blocks irreversible commands. Both are the
@@ -770,11 +784,11 @@ function detectHooksConfig(roots) {
       const postTool = file?.hooks?.PostToolUse;
       const entries = Array.isArray(postTool) ? postTool : postTool ? [postTool] : [];
       for (const entry of entries) {
-        // The matcher must cover BOTH Edit and Write — the scaffold promises
-        // `Edit|Write`. An unanchored `/Edit|Write/` would accept a matcher that
-        // hooks only one of the two, leaving the other mutation tool unchecked.
-        const matcher = entry?.matcher || "";
-        if (!/Edit/i.test(matcher) || !/Write/i.test(matcher)) continue;
+        // The matcher must cover BOTH Edit and Write. matcherCoversEditWrite
+        // treats an empty matcher as a catch-all (it fires on every tool), so a
+        // valid lint+format setup with no explicit matcher is honored rather
+        // than skipped — which would falsely report Agent hooks as MISS.
+        if (!matcherCoversEditWrite(entry?.matcher)) continue;
         const cmds = (entry.hooks || []).map((h) => h?.command || "").join("\n");
         if (/eslint|lint/i.test(cmds)) postToolUseLint = true;
         if (/prettier|format/i.test(cmds)) postToolUseFormat = true;
@@ -807,6 +821,15 @@ function isClaudeCodeProject(roots) {
 function hasNodeFormatters(packageJson) {
   const deps = { ...packageJson?.dependencies, ...packageJson?.devDependencies };
   return Boolean(deps?.prettier) && Boolean(deps?.eslint);
+}
+
+/** prettier/eslint may be declared in a nested package (workspace member or
+ *  git submodule) rather than the root package.json. The analyzer otherwise
+ *  scans nested roots, so the formatter check must too — otherwise a Claude
+ *  Code subproject that has the deps but no hooks is classified N/A instead of
+ *  MISS, and init/evolve never scaffold the advertised hooks for it. */
+function hasNodeFormattersAnywhere(roots) {
+  return roots.some((root) => hasNodeFormatters(readJson(path.join(root, "package.json"))));
 }
 
 /** DB projects get extra deny guards (DROP/TRUNCATE) since those are
@@ -869,8 +892,8 @@ const HOOK_READ_PATH = `node -e "const f=JSON.parse(require('fs').readFileSync(0
  *  keeps prettier from erroring on edits to file types it has no parser for
  *  (custom config extensions, lockfiles, …); eslint already exits cleanly on
  *  unmatched files via `--no-warn-ignored`. */
-function claudeHooksSettings(packageJson) {
-  if (!hasNodeFormatters(packageJson)) return null;
+function claudeHooksSettings(roots) {
+  if (!hasNodeFormattersAnywhere(roots)) return null;
   const config = {
     hooks: {
       PostToolUse: [
@@ -1017,7 +1040,7 @@ function buildInitFiles(report) {
   // is tool-agnostic and valuable for any Claude project, so it is always emitted.
   if (isClaudeCodeProject(report.roots)) {
     files.push(file(".claude/settings.local.json", claudePermissionsLocal(report), mergePermissionsLocal));
-    const hooksContent = claudeHooksSettings(report.packageJson);
+    const hooksContent = claudeHooksSettings(report.roots);
     if (hooksContent) files.push(file(".claude/settings.json", hooksContent, mergeHooksSettings));
   }
   return files;
@@ -1138,7 +1161,7 @@ function buildEvolutionFiles(report, plan) {
   // command advertises would be a no-op and the next scan would still MISS.
   if (isClaudeCodeProject(report.roots)) {
     files.push(file(".claude/settings.local.json", claudePermissionsLocal(report), mergePermissionsLocal));
-    const hooksContent = claudeHooksSettings(report.packageJson);
+    const hooksContent = claudeHooksSettings(report.roots);
     if (hooksContent) files.push(file(".claude/settings.json", hooksContent, mergeHooksSettings));
   }
   return files;
@@ -1158,8 +1181,12 @@ function mergeHooksSettings(existingContent, incomingContent) {
   existing.hooks ??= {};
   existing.hooks.PostToolUse ??= [];
   for (const entry of incoming.hooks?.PostToolUse || []) {
-    const matcher = entry.matcher || "";
-    const idx = existing.hooks.PostToolUse.findIndex((e) => (e.matcher || "") === matcher);
+    // Identify an existing entry whose matcher already covers Edit+Write (incl.
+    // catch-all, `Write|Edit`, `Edit|Write|MultiEdit`) rather than by literal
+    // string equality. The scaffold always emits `Edit|Write`; exact comparison
+    // would miss a semantically-equivalent existing matcher and append a
+    // duplicate entry, so every edit would run the formatter and linter twice.
+    const idx = existing.hooks.PostToolUse.findIndex((e) => matcherCoversEditWrite(e.matcher));
     if (idx === -1) {
       existing.hooks.PostToolUse.push(entry);
     } else {

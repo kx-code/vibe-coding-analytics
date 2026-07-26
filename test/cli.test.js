@@ -1609,6 +1609,80 @@ test("Agent hooks MISS when matcher covers only Edit (not Write) (Codex P2)", ()
   assert.ok(hooks && !hooks.ok, "matcher covering only Edit (not Write) must MISS");
 });
 
+// ---- Codex round 6: catch-all matcher, semantic merge, formatters across roots ----
+
+test("Agent hooks PASS when PostToolUse matcher is a catch-all (omitted/empty) (Codex P2)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-hooks-catchall-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.writeFileSync(
+    path.join(dir, "package.json"),
+    JSON.stringify({ name: "x", devDependencies: { prettier: "*", eslint: "*" } }),
+  );
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  // No matcher -> Claude Code treats the entry as catch-all (fires on every tool,
+  // including Edit and Write). Skipping it would falsely report Agent hooks MISS.
+  fs.writeFileSync(
+    path.join(dir, ".claude", "settings.json"),
+    JSON.stringify({
+      hooks: { PostToolUse: [{ hooks: [
+        { type: "command", command: "npx prettier --write" },
+        { type: "command", command: "npx eslint" },
+      ] }] },
+    }),
+  );
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  assert.ok(hooks && hooks.ok, "catch-all (empty matcher) PostToolUse with eslint+prettier must PASS");
+});
+
+test("evolve --write merges into a semantically-equivalent matcher (Write|Edit), no duplicate entry (Codex P2)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-merge-semeq-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {}, devDependencies: { prettier: "*", eslint: "*" } }));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  // Existing hook uses "Write|Edit" -- semantically equivalent to the scaffold's
+  // "Edit|Write". Exact-string matching would miss it and append a second entry,
+  // so every edit would run the formatter and linter twice.
+  fs.writeFileSync(
+    path.join(dir, ".claude", "settings.json"),
+    JSON.stringify({
+      hooks: { PostToolUse: [{ matcher: "Write|Edit", hooks: [
+        { type: "command", command: "npx prettier --write" },
+        { type: "command", command: "npx eslint" },
+      ] }] },
+    }),
+  );
+  await runCli(["evolve", "--cwd", dir, "--write"]);
+  const merged = JSON.parse(fs.readFileSync(path.join(dir, ".claude", "settings.json"), "utf8"));
+  const coversEditWrite = (e) => {
+    const m = String(e.matcher || "").trim();
+    return m === "" || (/Edit/i.test(m) && /Write/i.test(m));
+  };
+  const entries = (merged.hooks?.PostToolUse || []).filter(coversEditWrite);
+  assert.equal(entries.length, 1, "exactly one Edit+Write-covering entry (merged, not duplicated)");
+  assert.equal(entries[0].matcher, "Write|Edit", "original matcher preserved on merge");
+});
+
+test("Agent hooks MISS (not N/A) and init scaffolds hooks when formatters live only in a nested submodule package (Codex P2)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-fmt-roots-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  // Root package.json declares NO prettier/eslint.
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "root", scripts: {} }));
+  // The nested submodule declares them.
+  fs.mkdirSync(path.join(dir, "sub"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "sub", "package.json"), JSON.stringify({ name: "sub", devDependencies: { prettier: "*", eslint: "*" } }));
+  fs.writeFileSync(path.join(dir, "sub", "CLAUDE.md"), "# sub\n");
+  fs.writeFileSync(path.join(dir, ".gitmodules"), '[submodule "sub"]\n\tpath = sub\n\turl = https://example.com/s.git\n');
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  assert.ok(hooks, "Agent hooks check present");
+  assert.equal(hooks.na, false, "formatters present in a nested root -> Agent hooks is NOT N/A");
+  assert.equal(hooks.ok, false, "no hooks wired -> Agent hooks MISS (was wrongly N/A when only root package.json was read)");
+  // init must scaffold hooks even though the root package.json lacks the formatters.
+  await runCli(["init", "--cwd", dir, "--write"]);
+  assert.equal(fs.existsSync(path.join(dir, ".claude", "settings.json")), true, "init scaffolds settings.json when formatters are in a nested root");
+});
+
 test("Project facts MISS recommends docs, not a manifest (Codex P2 duplicate-key fix)", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-promo-facts-"));
   // Has a manifest but NO README/CLAUDE.md/AGENTS.md -> Project facts check fails (needs docs).
