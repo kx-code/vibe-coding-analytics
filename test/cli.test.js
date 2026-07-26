@@ -1337,3 +1337,42 @@ test("printReport prints NO fix hint when every check passes", () => {
   const blob = logs.join("\n");
   assert.ok(!/vca evolve --write/.test(blob), "no fix hint when all checks pass");
 });
+
+// ---- codex review fixes: jq path, deny pattern depth, non-Claude N/A ----
+
+test("Dangerous-command guard MISS when deny list lacks irreversible commands", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-deny-weak-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  // deny list has only a harmless entry — must NOT pass as a safety guard.
+  fs.writeFileSync(
+    path.join(dir, ".claude", "settings.local.json"),
+    JSON.stringify({ permissions: { deny: ["WebFetch(*)", "Bash(echo:*)"] } }),
+  );
+  const r = analyzeForTest(dir);
+  const guard = r.checks.find((c) => c.area === "Dangerous-command guard");
+  assert.ok(guard && !guard.ok, "deny without irreversible commands must MISS");
+});
+
+test("Agent hooks + guard are N/A (pass) for non-Claude-Code projects", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-nonclaude-"));
+  // Codex/Cursor-style project: no CLAUDE.md, no .claude/ — only AGENTS.md.
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "x", scripts: {} }));
+  fs.writeFileSync(path.join(dir, "AGENTS.md"), "# x\n");
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  const guard = r.checks.find((c) => c.area === "Dangerous-command guard");
+  assert.ok(hooks && hooks.ok, "Agent hooks N/A for non-Claude project");
+  assert.ok(guard && guard.ok, "Dangerous-command guard N/A for non-Claude project");
+});
+
+test("scaffolded hooks read file_path from stdin JSON, not an undefined \$FILE_PATH var", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-hooks-jq-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {} }));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
+  await runCli(["init", "--cwd", dir, "--write"]);
+  const settings = fs.readFileSync(path.join(dir, ".claude", "settings.json"), "utf8");
+  assert.ok(/tool_input\.file_path/.test(settings), "hook reads .tool_input.file_path from stdin");
+  assert.ok(!/\$FILE_PATH/.test(settings), "hook must NOT use undefined \$FILE_PATH variable");
+  assert.ok(/jq/.test(settings), "hook uses jq to parse the stdin payload");
+});

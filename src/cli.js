@@ -101,6 +101,7 @@ function analyzeProject(cwd) {
   const numberedRules = countNumberedRules(roots);
   const ruleTrace = analyzeRuleTraceability(roots, allFiles, cwd);
   const hooks = detectHooksConfig(roots);
+  const isClaude = isClaudeCodeProject(roots);
   const checks = [
     check(
       "Project facts",
@@ -177,13 +178,17 @@ function analyzeProject(cwd) {
     ),
     check(
       "Agent hooks",
-      hooks.postToolUseLint && hooks.postToolUseFormat,
-      "Add .claude/settings.json hooks.PostToolUse on Edit|Write to run eslint + prettier -- format-on-save stops style drift and catches errors at edit time. (vca init --write scaffolds this for Claude Code projects.)",
+      !isClaude || (hooks.postToolUseLint && hooks.postToolUseFormat),
+      !isClaude
+        ? "N/A — not a Claude Code project (no CLAUDE.md / .claude/). PostToolUse hooks apply to Claude Code; skip for Codex/Cursor/Copilot stacks."
+        : "Add .claude/settings.json hooks.PostToolUse on Edit|Write to run eslint + prettier -- format-on-save stops style drift and catches errors at edit time. (vca init --write scaffolds this.)",
     ),
     check(
       "Dangerous-command guard",
-      hooks.permissionsDeny,
-      "Add .claude/settings.local.json permissions.deny for irreversible commands (rm -rf, git push -f, git reset --hard, mkfs, dd, DROP TABLE) so agents cannot run them. (vca init --write scaffolds a default list.)",
+      !isClaude || hooks.permissionsDeny,
+      !isClaude
+        ? "N/A — not a Claude Code project (no CLAUDE.md / .claude/). permissions.deny is a Claude Code settings mechanism."
+        : "Add .claude/settings.local.json permissions.deny for irreversible commands (rm -rf, git push -f, git reset --hard, mkfs, dd, DROP TABLE) so agents cannot run them. (vca init --write scaffolds a default list.)",
     ),
     check(
       "Deploy hooks",
@@ -723,6 +728,11 @@ function readJson(filePath) {
   }
 }
 
+/** A deny list only counts as a real guard if it actually blocks at least one
+ *  irreversible command — a list of only `WebFetch` or harmless entries must not
+ *  pass. Matches the same families that defaultDenyList scaffolds. */
+const DANGEROUS_DENY_PATTERN = /rm\s+-r|git\s+push.*(-f|force)|git\s+reset.*--hard|git\s+clean|mkfs|dd\s+if|drop\s+(table|database)|truncate|>\s*\/dev\/sd|curl.*\|\s*(sh|bash)|wget.*\|\s*(sh|bash)/i;
+
 /** Detect Claude Code hooks + permission-guard config across project roots.
  *  PostToolUse(Edit|Write)->lint+format stops style drift at edit time; a
  *  non-empty permissions.deny blocks irreversible commands. Both are the
@@ -742,7 +752,8 @@ function detectHooksConfig(roots) {
       if (/prettier|format/i.test(cmds)) postToolUseFormat = true;
     }
     const local = readJson(path.join(root, ".claude", "settings.local.json"));
-    if (Array.isArray(local?.permissions?.deny) && local.permissions.deny.length > 0) {
+    const denyList = Array.isArray(local?.permissions?.deny) ? local.permissions.deny : [];
+    if (denyList.some((d) => DANGEROUS_DENY_PATTERN.test(String(d)))) {
       permissionsDeny = true;
     }
   }
@@ -803,8 +814,8 @@ function claudeHooksSettings() {
         {
           matcher: "Edit|Write",
           hooks: [
-            { type: "command", command: "npx prettier --write \"$FILE_PATH\" 2>/dev/null || true" },
-            { type: "command", command: "npx eslint --no-warn-ignored \"$FILE_PATH\" 2>/dev/null || true" },
+            { type: "command", command: "jq -r '.tool_input.file_path' | xargs npx prettier --write" },
+            { type: "command", command: "jq -r '.tool_input.file_path' | xargs npx eslint --no-warn-ignored" },
           ],
         },
       ],
