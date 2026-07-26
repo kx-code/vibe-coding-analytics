@@ -2132,3 +2132,68 @@ test("init --write skips deny scaffolding when a dangerous-command guard is alre
   await runCli(["init", "--cwd", dir, "--write"]);
   assert.equal(fs.existsSync(path.join(dir, ".claude", "settings.local.json")), false, "deny list NOT scaffolded by init when a dangerous-command guard already exists");
 });
+
+test("Agent hooks MISS when lint+format coverage is split across the primary root and a submodule (Codex P2)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-hooks-split-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.writeFileSync(
+    path.join(dir, "package.json"),
+    JSON.stringify({ name: "x", scripts: {}, devDependencies: { prettier: "*", eslint: "*" } }),
+  );
+  // PRIMARY root wires ONLY prettier (format present, lint missing).
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, ".claude", "settings.json"),
+    JSON.stringify({
+      hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [
+        { type: "command", command: "npx prettier --write \"$FILE_PATH\"" },
+      ] }] },
+    }),
+  );
+  // SUBMODULE wires ONLY eslint. Coverage is split across roots, NOT complete.
+  fs.mkdirSync(path.join(dir, "backend", ".claude"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, "backend", ".claude", "settings.json"),
+    JSON.stringify({
+      hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [
+        { type: "command", command: "npx eslint \"$FILE_PATH\"" },
+      ] }] },
+    }),
+  );
+  fs.writeFileSync(
+    path.join(dir, ".gitmodules"),
+    '[submodule "backend"]\n\tpath = backend\n\turl = https://example.com/b.git\n',
+  );
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  // Before the fix, detectHooksConfig accumulated lint+format across BOTH roots
+  // and combined the split coverage into a false PASS. Scope detection to the
+  // primary root so split coverage honestly reports MISS — the primary is
+  // missing eslint, and init/evolve can now scaffold it.
+  assert.ok(hooks && !hooks.ok, "split lint/format coverage across roots must MISS, not PASS");
+});
+
+test("detects Claude config in a workspace member and scaffolds the deny guard (Codex P2)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-cc-member-"));
+  // Primary has NO root-level Claude config — the only CLAUDE.md lives in a
+  // workspace member. Before the fix, isClaudeCodeProject only checked roots[0]
+  // (+ git submodules), missing apps/web/CLAUDE.md, so the hooks + deny checks
+  // were N/A and init never scaffolded the deny guard.
+  fs.writeFileSync(
+    path.join(dir, "package.json"),
+    JSON.stringify({ name: "ws", scripts: {}, workspaces: ["apps/*"] }),
+  );
+  fs.mkdirSync(path.join(dir, "apps", "web"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, "apps", "web", "package.json"),
+    JSON.stringify({ name: "web", devDependencies: { prettier: "*", eslint: "*" } }),
+  );
+  fs.writeFileSync(path.join(dir, "apps", "web", "CLAUDE.md"), "# web\n");
+  const r = analyzeForTest(dir);
+  const guard = r.checks.find((c) => c.area === "Dangerous-command guard");
+  assert.ok(guard && guard.na !== true, "member-only CLAUDE.md => isClaude=true => deny guard applicable (not N/A)");
+  // init must scaffold the deny guard at the primary root now that the project
+  // is recognized as a Claude Code project.
+  await runCli(["init", "--cwd", dir, "--write"]);
+  assert.equal(fs.existsSync(path.join(dir, ".claude", "settings.local.json")), true, "deny list scaffolded for member-only Claude project");
+});

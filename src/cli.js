@@ -101,7 +101,7 @@ function analyzeProject(cwd) {
   const numberedRules = countNumberedRules(roots);
   const ruleTrace = analyzeRuleTraceability(roots, allFiles, cwd);
   const hooks = detectHooksConfig(roots);
-  const isClaude = isClaudeCodeProject(roots);
+  const isClaude = isClaudeCodeProject(allFiles);
   const hasFormatters = hasNodeFormattersAnywhere(roots);
   // N/A semantics: a check that does not apply to this project should neither
   // count as a "missing area" nor earn score weight. We mark it `na` so the
@@ -815,54 +815,69 @@ function commandPurpose(cmd) {
   return null;
 }
 
-/** Detect Claude Code hooks + permission-guard config across project roots.
+/** Detect Claude Code hooks + permission-guard config for the PRIMARY project
+ *  root (roots[0], where Claude runs and where init/evolve scaffold settings).
  *  PostToolUse(Edit|Write)->lint+format stops style drift at edit time; a
  *  non-empty permissions.deny blocks irreversible commands. Both are the
- *  highest-leverage agent safety nets after tests/CI. */
+ *  highest-leverage agent safety nets after tests/CI.
+ *
+ *  Coverage is evaluated for the PRIMARY root only, NOT accumulated across every
+ *  git-submodule root: a lint hook in the primary and a format hook in a
+ *  submodule are two INCOMPLETE setups, not one complete one. Accumulating the
+ *  flags globally would merge that split coverage into a false PASS and — because
+ *  claudeHooksSettings() also reads these flags — return null so init/evolve
+ *  could not repair either half. Scoping to the primary keeps the check honest
+ *  (split coverage reports MISS) and the repair working (the missing purpose is
+ *  scaffolded at the primary). */
 function detectHooksConfig(roots) {
+  const primary = roots?.[0];
+  const settings = primary ? readJson(path.join(primary, ".claude", "settings.json")) : null;
+  const local = primary ? readJson(path.join(primary, ".claude", "settings.local.json")) : null;
   let postToolUseLint = false;
   let postToolUseFormat = false;
   let permissionsDeny = false;
-  for (const root of roots) {
-    const settings = readJson(path.join(root, ".claude", "settings.json"));
-    const local = readJson(path.join(root, ".claude", "settings.local.json"));
-    // PostToolUse hooks and permissions.deny may each live in the shared
-    // settings.json OR the gitignored settings.local.json — both are supported
-    // Claude settings locations. Inspect both for hooks (as we already do for
-    // deny) so a project keeping its hooks in settings.local.json isn't falsely
-    // reported as missing Agent hooks and handed redundant init/evolve output.
-    for (const file of [settings, local]) {
-      const postTool = file?.hooks?.PostToolUse;
-      const entries = Array.isArray(postTool) ? postTool : postTool ? [postTool] : [];
-      for (const entry of entries) {
-        // The matcher must cover BOTH Edit and Write. matcherCoversEditWrite
-        // treats an empty matcher as a catch-all (it fires on every tool), so a
-        // valid lint+format setup with no explicit matcher is honored rather
-        // than skipped — which would falsely report Agent hooks as MISS.
-        if (!matcherCoversEditWrite(entry?.matcher)) continue;
-        const cmds = (entry.hooks || []).map((h) => h?.command || "").join("\n");
-        if (LINT_CMD_RE.test(cmds)) postToolUseLint = true;
-        if (FORMAT_CMD_RE.test(cmds)) postToolUseFormat = true;
-      }
+  // PostToolUse hooks and permissions.deny may each live in the shared
+  // settings.json OR the gitignored settings.local.json — both are supported
+  // Claude settings locations. Inspect both for hooks (as we already do for
+  // deny) so a project keeping its hooks in settings.local.json isn't falsely
+  // reported as missing Agent hooks and handed redundant init/evolve output.
+  for (const file of [settings, local]) {
+    const postTool = file?.hooks?.PostToolUse;
+    const entries = Array.isArray(postTool) ? postTool : postTool ? [postTool] : [];
+    for (const entry of entries) {
+      // The matcher must cover BOTH Edit and Write. matcherCoversEditWrite
+      // treats an empty matcher as a catch-all (it fires on every tool), so a
+      // valid lint+format setup with no explicit matcher is honored rather
+      // than skipped — which would falsely report Agent hooks as MISS.
+      if (!matcherCoversEditWrite(entry?.matcher)) continue;
+      const cmds = (entry.hooks || []).map((h) => h?.command || "").join("\n");
+      if (LINT_CMD_RE.test(cmds)) postToolUseLint = true;
+      if (FORMAT_CMD_RE.test(cmds)) postToolUseFormat = true;
     }
-    for (const denyList of [settings?.permissions?.deny, local?.permissions?.deny]) {
-      if (Array.isArray(denyList) && denyList.some((d) => DANGEROUS_DENY_PATTERN.test(String(d)))) {
-        permissionsDeny = true;
-      }
+  }
+  for (const denyList of [settings?.permissions?.deny, local?.permissions?.deny]) {
+    if (Array.isArray(denyList) && denyList.some((d) => DANGEROUS_DENY_PATTERN.test(String(d)))) {
+      permissionsDeny = true;
     }
   }
   return { postToolUseLint, postToolUseFormat, permissionsDeny };
 }
 
 /** A project is "Claude Code" when it ships CLAUDE.md or a .claude/settings*.json
- *  file. A bare `.claude/commands/` dir is NOT enough — `vca init` scaffolds those
- *  slash commands for any stack, so counting them would make a fresh non-Claude
+ *  file ANYWHERE in the tree — including an npm workspace member such as
+ *  apps/web/CLAUDE.md, which is the sole Claude config in many monorepos. We scan
+ *  the full file inventory (not just roots[0] + git submodules) so a member-only
+ *  Claude setup still makes the hooks + deny-list checks applicable. A bare
+ *  `.claude/commands/` dir is NOT enough — `vca init` scaffolds those slash
+ *  commands for any stack, so counting them would make a fresh non-Claude
  *  baseline fail its own newly-added hook checks on the next scan. */
-function isClaudeCodeProject(roots) {
-  return roots.some((root) =>
-    fs.existsSync(path.join(root, "CLAUDE.md")) ||
-    fs.existsSync(path.join(root, ".claude", "settings.json")) ||
-    fs.existsSync(path.join(root, ".claude", "settings.local.json")));
+function isClaudeCodeProject(allFiles) {
+  for (const f of allFiles) {
+    if (f === "CLAUDE.md" || f.endsWith("/CLAUDE.md")) return true;
+    if (f === ".claude/settings.json" || f.endsWith("/.claude/settings.json")) return true;
+    if (f === ".claude/settings.local.json" || f.endsWith("/.claude/settings.local.json")) return true;
+  }
+  return false;
 }
 
 /** Detect whether the project declares prettier + eslint as dependencies, so we
@@ -1271,7 +1286,7 @@ function buildInitFiles(report) {
   // is tool-agnostic and valuable for any Claude project — but it is SKIPPED when
   // a dangerous-command guard is already detected in either settings file, so
   // init does not duplicate (or expand beyond) an existing committed guard.
-  if (isClaudeCodeProject(report.roots)) {
+  if (isClaudeCodeProject(report.files)) {
     const { permissionsDeny } = detectHooksConfig(report.roots);
     if (!permissionsDeny) {
       files.push(file(".claude/settings.local.json", claudePermissionsLocal(report), mergePermissionsLocal));
@@ -1397,7 +1412,7 @@ function buildEvolutionFiles(report, plan) {
   // command advertises would be a no-op and the next scan would still MISS. The
   // deny list is skipped when a dangerous-command guard is already detected in
   // either settings file, so evolve does not duplicate or expand an existing one.
-  if (isClaudeCodeProject(report.roots)) {
+  if (isClaudeCodeProject(report.files)) {
     const { permissionsDeny } = detectHooksConfig(report.roots);
     if (!permissionsDeny) {
       files.push(file(".claude/settings.local.json", claudePermissionsLocal(report), mergePermissionsLocal));
