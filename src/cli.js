@@ -873,36 +873,66 @@ function workspacePatterns(pkg) {
   return [];
 }
 
-/** Read the manifests of npm workspace members under `root`. Supports two forms
- *  of workspace entry: a literal member path (`packages/ui`) whose own manifest
- *  is read directly, and a glob (`packages/*`, `apps/**`) resolved by listing the
- *  pattern's base directory. A full glob engine is intentionally avoided to stay
- *  dependency-free. Members are directories (skipping node_modules) that ship
- *  their own package.json. */
+/** Immediate subdirectories of `dir`, skipping node_modules/.git. */
+function listChildDirs(dir) {
+  try {
+    return fs.readdirSync(dir, { withFileTypes: true })
+      .filter((e) => e.isDirectory() && !["node_modules", ".git"].includes(e.name))
+      .map((e) => path.join(dir, e.name));
+  } catch {
+    return [];
+  }
+}
+
+/** `dir` itself plus every descendant directory (BFS), skipping node_modules/.git.
+ *  Used to expand `**` in workspace globs. */
+function listAllDirs(dir) {
+  const out = [dir];
+  for (let i = 0; i < out.length; i++) out.push(...listChildDirs(out[i]));
+  return out;
+}
+
+/** Resolve a workspace glob against `root` to the concrete member directories it
+ *  matches. Segments are literal directory names, a single star (one level), or
+ *  a double star (zero or more levels, recursive). This covers literal member
+ *  paths, single-level wildcard patterns, and nested or recursive wildcard
+ *  patterns, without pulling in a glob dependency. Any segment containing a star
+ *  that is not exactly a double star is treated as a single-level wildcard. */
+function resolveWorkspacePattern(root, pattern) {
+  const segs = String(pattern ?? "").split("/").map((s) => s.trim()).filter(Boolean);
+  let dirs = [root];
+  for (const seg of segs) {
+    const next = [];
+    if (seg === "**") {
+      for (const d of dirs) next.push(...listAllDirs(d));
+    } else if (seg.includes("*")) {
+      for (const d of dirs) next.push(...listChildDirs(d));
+    } else {
+      for (const d of dirs) {
+        const child = path.join(d, seg);
+        try {
+          if (fs.statSync(child).isDirectory()) next.push(child);
+        } catch {
+          /* segment doesn't exist */
+        }
+      }
+    }
+    dirs = next;
+    if (dirs.length === 0) break;
+  }
+  return dirs;
+}
+
+/** Read the manifests of npm workspace members under `root` by resolving each
+ *  workspace pattern (literal path, `*`, or `**`) to its concrete directories and
+ *  reading each one's package.json. Members without a manifest are skipped. */
 function readWorkspaceMemberPackages(root, pkg) {
   const members = [];
   for (const pat of workspacePatterns(pkg)) {
     const p = String(pat ?? "").trim();
     if (!p) continue;
-    if (!p.includes("*")) {
-      // Explicit member path (no glob): read its own manifest directly rather
-      // than treating it as a directory to list children of.
-      const memberPkg = readJson(path.join(root, p, "package.json"));
-      if (memberPkg) members.push(memberPkg);
-      continue;
-    }
-    const base = p.replace(/\/+\*+.*$/, "").trim();
-    if (!base) continue;
-    const dir = path.join(root, base);
-    let entries = [];
-    try {
-      entries = fs.readdirSync(dir, { withFileTypes: true });
-    } catch {
-      continue;
-    }
-    for (const e of entries) {
-      if (!e.isDirectory() || ["node_modules", ".git"].includes(e.name)) continue;
-      const memberPkg = readJson(path.join(dir, e.name, "package.json"));
+    for (const dir of resolveWorkspacePattern(root, p)) {
+      const memberPkg = readJson(path.join(dir, "package.json"));
       if (memberPkg) members.push(memberPkg);
     }
   }
@@ -982,23 +1012,45 @@ function defaultDenyList(report) {
  *  the embedded JS source. */
 const HOOK_READ_PATH = `node -e "const f=JSON.parse(require('fs').readFileSync(0,'utf8')).tool_input?.file_path;if(f)process.stdout.write(f+String.fromCharCode(0))"`;
 
+/** Map the detected package manager to the executor that runs a LOCAL binary
+ *  declared in dependencies. Yarn Plug'n'Play exposes prettier/eslint through
+ *  Yarn (no node_modules/.bin), pnpm via `pnpm exec`, bun via `bunx`; only npm
+ *  uses `npx`. Hard-coding `npx` would fail (or fetch an unpinned remote copy)
+ *  on every edit in non-npm projects. */
+function packageManagerExecutor(pm) {
+  switch (pm) {
+    case "pnpm": return "pnpm exec";
+    case "yarn": return "yarn exec";
+    case "bun": return "bunx";
+    default: return "npx";
+  }
+}
+
 /** Claude Code settings.json with PostToolUse(Edit|Write) -> prettier + eslint.
  *  Format-on-save + lint-on-edit are the cheapest computational sensors.
- *  Returns null when prettier/eslint aren't declared deps, so we never scaffold
- *  Node hooks that would fail on every edit in a non-Node stack. `--ignore-unknown`
- *  keeps prettier from erroring on edits to file types it has no parser for
- *  (custom config extensions, lockfiles, …); eslint already exits cleanly on
- *  unmatched files via `--no-warn-ignored`. */
-function claudeHooksSettings(roots) {
+ *  Returns null (no scaffold) when: (a) prettier/eslint aren't declared deps,
+ *  so we never scaffold Node hooks that would fail on every edit in a non-Node
+ *  stack; or (b) Edit/Write lint+format hooks are already wired in either
+ *  settings file — Claude loads hooks from both, so emitting a second set would
+ *  run the tools twice. The executor follows the detected package manager so the
+ *  hook resolves the project's own binaries (yarn/pnpm/bun, not just npx).
+ *  `--ignore-unknown` keeps prettier from erroring on edits to file types it has
+ *  no parser for (custom config extensions, lockfiles, …); eslint already exits
+ *  cleanly on unmatched files via `--no-warn-ignored`. */
+function claudeHooksSettings(report) {
+  const roots = report.roots;
   if (!hasNodeFormattersAnywhere(roots)) return null;
+  const { postToolUseLint, postToolUseFormat } = detectHooksConfig(roots);
+  if (postToolUseLint && postToolUseFormat) return null;
+  const exec = packageManagerExecutor(detectPackageManager(report.cwd, report.packageJson));
   const config = {
     hooks: {
       PostToolUse: [
         {
           matcher: "Edit|Write",
           hooks: [
-            { type: "command", command: `${HOOK_READ_PATH} | xargs -0 -I{} npx prettier --write --ignore-unknown {}` },
-            { type: "command", command: `${HOOK_READ_PATH} | xargs -0 -I{} npx eslint --no-warn-ignored {}` },
+            { type: "command", command: `${HOOK_READ_PATH} | xargs -0 -I{} ${exec} prettier --write --ignore-unknown {}` },
+            { type: "command", command: `${HOOK_READ_PATH} | xargs -0 -I{} ${exec} eslint --no-warn-ignored {}` },
           ],
         },
       ],
@@ -1137,7 +1189,7 @@ function buildInitFiles(report) {
   // is tool-agnostic and valuable for any Claude project, so it is always emitted.
   if (isClaudeCodeProject(report.roots)) {
     files.push(file(".claude/settings.local.json", claudePermissionsLocal(report), mergePermissionsLocal));
-    const hooksContent = claudeHooksSettings(report.roots);
+    const hooksContent = claudeHooksSettings(report);
     if (hooksContent) files.push(file(".claude/settings.json", hooksContent, mergeHooksSettings));
   }
   return files;
@@ -1258,7 +1310,7 @@ function buildEvolutionFiles(report, plan) {
   // command advertises would be a no-op and the next scan would still MISS.
   if (isClaudeCodeProject(report.roots)) {
     files.push(file(".claude/settings.local.json", claudePermissionsLocal(report), mergePermissionsLocal));
-    const hooksContent = claudeHooksSettings(report.roots);
+    const hooksContent = claudeHooksSettings(report);
     if (hooksContent) files.push(file(".claude/settings.json", hooksContent, mergeHooksSettings));
   }
   return files;

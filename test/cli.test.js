@@ -1849,3 +1849,58 @@ test("evolve --write adds only the MISSING formatter purpose (custom eslint, no 
   assert.equal(cmds.filter((c) => /eslint/.test(c)).length, 1, "exactly one eslint command (custom kept, scaffold eslint deduped by purpose)");
   assert.ok(cmds.some((c) => /prettier/.test(c)), "scaffold prettier appended (format purpose was missing)");
 });
+
+// ---- Codex round 9: skip when satisfied, nested workspace globs, package-manager executor ----
+
+test("init --write does NOT scaffold settings.json hooks when Edit/Write hooks already exist in settings.local.json (Codex P2)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-hooks-local-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {}, devDependencies: { prettier: "*", eslint: "*" } }));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  // Hooks already wired in the gitignored settings.local.json. Detection reads
+  // both settings files, so the check PASSES; scaffolding a second set in
+  // settings.json would make Claude run prettier/eslint twice per edit.
+  fs.writeFileSync(
+    path.join(dir, ".claude", "settings.local.json"),
+    JSON.stringify({
+      hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [
+        { type: "command", command: "npx prettier --write --ignore-unknown" },
+        { type: "command", command: "npx eslint --no-warn-ignored" },
+      ] }] },
+    }),
+  );
+  const before = analyzeForTest(dir);
+  assert.ok(before.checks.find((c) => c.area === "Agent hooks" && c.ok), "hooks already PASS via settings.local.json");
+  await runCli(["init", "--cwd", dir, "--write"]);
+  assert.equal(fs.existsSync(path.join(dir, ".claude", "settings.json")), false, "no settings.json hooks scaffolded when already satisfied in settings.local.json");
+});
+
+test("Agent hooks detected via a RECURSIVE workspace glob (apps double-star) member (Codex P2)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-fmt-ws-nested-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.writeFileSync(
+    path.join(dir, "package.json"),
+    JSON.stringify({ name: "root", scripts: {}, workspaces: ["apps/**"] }),
+  );
+  // Member nested under apps/ (matched only by a recursive double-star walk).
+  fs.mkdirSync(path.join(dir, "apps", "web"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, "apps", "web", "package.json"),
+    JSON.stringify({ name: "web", devDependencies: { prettier: "*", eslint: "*" } }),
+  );
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  assert.equal(hooks.na, false, "recursive workspace member with formatters -> NOT N/A");
+});
+
+test("scaffolded hooks use the detected package manager executor (yarn, not npx) (Codex P2)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-hooks-pm-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {}, packageManager: "yarn@4.0.0", devDependencies: { prettier: "*", eslint: "*" } }));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
+  await runCli(["init", "--cwd", dir, "--write"]);
+  const settings = JSON.parse(fs.readFileSync(path.join(dir, ".claude", "settings.json"), "utf8"));
+  const cmds = (settings.hooks?.PostToolUse || []).flatMap((e) => (e.hooks || []).map((h) => h.command));
+  assert.ok(cmds.some((c) => /yarn exec prettier/.test(c)), "prettier hook uses yarn exec (PnP-resolvable)");
+  assert.ok(cmds.some((c) => /yarn exec eslint/.test(c)), "eslint hook uses yarn exec");
+  assert.ok(!cmds.some((c) => /npx/.test(c)), "no npx executor in a yarn project");
+});
