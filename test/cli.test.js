@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { execSync } from "node:child_process";
+import { execSync, execFileSync } from "node:child_process";
 import assert from "node:assert/strict";
 import { analyzeForTest, runCli, buildEvolutionPlan, printEvolution, printReport, parseOptions } from "../src/cli.js";
 
@@ -1441,14 +1441,35 @@ test("init --write omits prettier/eslint hooks when the stack lacks them (Codex 
   assert.ok(hooks && hooks.ok, "Agent hooks N/A (pass) when formatters absent — non-Node stacks are not penalized");
 });
 
-test("scaffolded hooks use xargs -I{} so paths with spaces survive (Codex P2)", async () => {
+test("scaffolded hooks pass paths NUL-delimited via xargs -0 and skip unknown parsers (Codex P2)", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-hooks-xargs-"));
   fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {}, devDependencies: { prettier: "*", eslint: "*" } }));
   fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
   await runCli(["init", "--cwd", dir, "--write"]);
   const settings = fs.readFileSync(path.join(dir, ".claude", "settings.json"), "utf8");
-  assert.ok(/xargs -I\{\}/.test(settings), "hooks use xargs -I{} (argument-safe; no word-splitting)");
+  // Plain `xargs -I{}` (newline-delimited) does shell-style quote/backslash
+  // processing: an apostrophe aborts with "unterminated quote", a backslash is
+  // stripped. NUL-delimited `xargs -0 -I{}` preserves the path byte-for-byte.
+  assert.ok(/xargs -0 -I\{\}/.test(settings), "hooks use xargs -0 -I{} (NUL-delimited; quotes/backslashes preserved)");
+  assert.ok(!/xargs -I\{\}/.test(settings), "hooks must NOT use bare `xargs -I{}` (newline-delimited; quote/backslash processing)");
+  assert.ok(/String\.fromCharCode\(0\)/.test(settings), "path emitted NUL-terminated (a trailing newline would be included in the arg under -0)");
+  // prettier errors on edits to file types it has no parser for; --ignore-unknown skips them.
+  assert.ok(/prettier --write --ignore-unknown/.test(settings), "prettier skips file types it has no parser for");
   assert.ok(!/xargs npx/.test(settings), "hooks must NOT use bare `xargs npx` which splits paths on whitespace");
+});
+
+test("generated read-path pipeline preserves quotes/backslashes/spaces end-to-end (Codex P2)", () => {
+  // Reproduce the exact stdin -> path -> consumer pipeline the scaffolded hook
+  // uses (node extractor, then NUL-delimited xargs), proving a quote + backslash
+  // + space path reaches the consumer byte-for-byte. Plain `xargs` (no -0)
+  // aborts on the apostrophe ("unterminated quote") and strips the backslash.
+  // execFileSync (array argv) avoids any shell, so there is no injection surface.
+  const script = "const f=JSON.parse(require('fs').readFileSync(0,'utf8')).tool_input?.file_path;if(f)process.stdout.write(f+String.fromCharCode(0))";
+  const tricky = "docs/it's a\\b.md"; // apostrophe + spaces + backslash
+  const payload = JSON.stringify({ tool_input: { file_path: tricky } });
+  const pathPlusNul = execFileSync("node", ["-e", script], { input: payload, encoding: "utf8" });
+  const out = execFileSync("xargs", ["-0", "-I{}", "printf", "%s\\n", "{}"], { input: pathPlusNul, encoding: "utf8" });
+  assert.equal(out.trim(), tricky, "quote+backslash+space path survives the NUL-delimited pipeline");
 });
 
 test("init on a non-Claude project does not flip Claude detection on the next scan (Codex P2)", async () => {

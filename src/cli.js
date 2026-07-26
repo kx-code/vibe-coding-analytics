@@ -845,15 +845,26 @@ function defaultDenyList(report) {
 /** Read the edited file path from the hook's stdin JSON payload using the Node
  *  runtime — guaranteed present because prettier/eslint are npm deps — instead
  *  of the external `jq` executable, which minimal CI/dev images may not ship and
- *  which is not a declared prerequisite of this package. Piped through
- *  `xargs -I{}` so paths with spaces/quotes survive (bare `xargs` word-splits
- *  `docs/my file.md` into two targets). */
-const HOOK_READ_PATH = `node -e "const f=JSON.parse(require('fs').readFileSync(0,'utf8')).tool_input?.file_path;if(f)console.log(f)"`;
+ *  which is not a declared prerequisite of this package.
+ *
+ *  The path is emitted **NUL-delimited** and consumed with `xargs -0 -I{}`.
+ *  Plain `xargs -I{}` (newline-delimited) performs shell-style quote and
+ *  backslash processing on its input: a path containing `'` aborts with
+ *  "unterminated quote" and a `\` is silently stripped. `-0` switches the
+ *  delimiter to NUL and disables that processing, so `docs/it's a\b.md` survives
+ *  byte-for-byte. We emit the NUL ourselves (rather than relying on a trailing
+ *  newline) because `console.log` would append `\n`, which `-0` treats as part
+ *  of the argument. `String.fromCharCode(0)` avoids any backslash ambiguity in
+ *  the embedded JS source. */
+const HOOK_READ_PATH = `node -e "const f=JSON.parse(require('fs').readFileSync(0,'utf8')).tool_input?.file_path;if(f)process.stdout.write(f+String.fromCharCode(0))"`;
 
 /** Claude Code settings.json with PostToolUse(Edit|Write) -> prettier + eslint.
  *  Format-on-save + lint-on-edit are the cheapest computational sensors.
  *  Returns null when prettier/eslint aren't declared deps, so we never scaffold
- *  Node hooks that would fail on every edit in a non-Node stack. */
+ *  Node hooks that would fail on every edit in a non-Node stack. `--ignore-unknown`
+ *  keeps prettier from erroring on edits to file types it has no parser for
+ *  (custom config extensions, lockfiles, …); eslint already exits cleanly on
+ *  unmatched files via `--no-warn-ignored`. */
 function claudeHooksSettings(packageJson) {
   if (!hasNodeFormatters(packageJson)) return null;
   const config = {
@@ -862,8 +873,8 @@ function claudeHooksSettings(packageJson) {
         {
           matcher: "Edit|Write",
           hooks: [
-            { type: "command", command: `${HOOK_READ_PATH} | xargs -I{} npx prettier --write {}` },
-            { type: "command", command: `${HOOK_READ_PATH} | xargs -I{} npx eslint --no-warn-ignored {}` },
+            { type: "command", command: `${HOOK_READ_PATH} | xargs -0 -I{} npx prettier --write --ignore-unknown {}` },
+            { type: "command", command: `${HOOK_READ_PATH} | xargs -0 -I{} npx eslint --no-warn-ignored {}` },
           ],
         },
       ],
