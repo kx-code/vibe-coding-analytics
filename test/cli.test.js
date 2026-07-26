@@ -1109,3 +1109,231 @@ test("printEvolution notes when CI mining found no failures", () => {
   const blob = logs.join("\n");
   assert.ok(/No recent CI failures/.test(blob), `prints no-failures line, got: ${blob}`);
 });
+
+// ---- Agent hooks + dangerous-command guard: detect + scaffold (PR: hooks) ----
+
+test("Agent hooks PASS when PostToolUse(Edit|Write) runs eslint + prettier", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-hooks-ok-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, ".claude", "settings.json"),
+    JSON.stringify({
+      hooks: {
+        PostToolUse: [
+          {
+            matcher: "Edit|Write",
+            hooks: [
+              { type: "command", command: "npx prettier --write \"$FILE_PATH\"" },
+              { type: "command", command: "npx eslint \"$FILE_PATH\"" },
+            ],
+          },
+        ],
+      },
+    }),
+  );
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  assert.ok(hooks && hooks.ok, "PostToolUse with eslint+prettier should PASS");
+});
+
+test("Agent hooks MISS when only prettier is wired (no lint)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-hooks-fmt-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, ".claude", "settings.json"),
+    JSON.stringify({
+      hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [{ type: "command", command: "prettier --write" }] }] },
+    }),
+  );
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  assert.ok(hooks && !hooks.ok, "missing eslint -> Agent hooks should MISS");
+});
+
+test("Dangerous-command guard PASS when settings.local.json has a deny list", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-deny-ok-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, ".claude", "settings.local.json"),
+    JSON.stringify({ permissions: { deny: ["Bash(rm -rf:*)"] } }),
+  );
+  const r = analyzeForTest(dir);
+  const guard = r.checks.find((c) => c.area === "Dangerous-command guard");
+  assert.ok(guard && guard.ok, "non-empty permissions.deny should PASS");
+});
+
+test("Agent hooks + guard both MISS on a bare project", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-hooks-bare-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "x" }));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  const r = analyzeForTest(dir);
+  assert.ok(r.checks.find((c) => c.area === "Agent hooks" && !c.ok), "no hooks -> MISS");
+  assert.ok(r.checks.find((c) => c.area === "Dangerous-command guard" && !c.ok), "no deny -> MISS");
+});
+
+test("init --write scaffolds hooks + deny list for Claude Code projects", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-init-hooks-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {} }));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
+  await runCli(["init", "--cwd", dir, "--write"]);
+  const settings = fs.readFileSync(path.join(dir, ".claude", "settings.json"), "utf8");
+  assert.ok(/PostToolUse/.test(settings), "settings.json has PostToolUse hooks");
+  assert.ok(/Edit\|Write/.test(settings), "matcher targets Edit|Write");
+  assert.ok(/prettier/.test(settings), "runs prettier on edit");
+  assert.ok(/eslint/.test(settings), "runs eslint on edit");
+  const local = fs.readFileSync(path.join(dir, ".claude", "settings.local.json"), "utf8");
+  assert.ok(/permissions/.test(local), "settings.local.json has permissions");
+  assert.ok(/Bash\(rm -rf:\*\)/.test(local), "deny list includes rm -rf");
+  assert.ok(/Bash\(git push --force:\*\)/.test(local), "deny list includes git push --force");
+});
+
+test("init --write does NOT scaffold hooks for non-Claude-Code projects", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-init-nohooks-"));
+  // package.json but no CLAUDE.md and no .claude/ -> not a Claude Code project.
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {} }));
+  await runCli(["init", "--cwd", dir, "--write"]);
+  assert.equal(fs.existsSync(path.join(dir, ".claude", "settings.json")), false, "no settings.json for non-CC project");
+  assert.equal(fs.existsSync(path.join(dir, ".claude", "settings.local.json")), false, "no settings.local.json for non-CC project");
+});
+
+test("init --write adds DROP TABLE deny for DB projects", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-init-db-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {} }));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
+  fs.mkdirSync(path.join(dir, "supabase", "migrations"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "supabase", "migrations", "0001.sql"), "CREATE TABLE x;\n");
+  await runCli(["init", "--cwd", dir, "--write"]);
+  const local = fs.readFileSync(path.join(dir, ".claude", "settings.local.json"), "utf8");
+  assert.ok(/DROP TABLE/.test(local), "DB project deny list includes DROP TABLE");
+  assert.ok(/TRUNCATE TABLE/.test(local), "DB project deny list includes TRUNCATE TABLE");
+});
+
+test("evolve --write backfills hooks + deny list on a Claude Code project", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-evolve-hooks-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {} }));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
+  await runCli(["evolve", "--cwd", dir, "--write"]);
+  assert.equal(fs.existsSync(path.join(dir, ".claude", "settings.json")), true, "evolve backfills settings.json");
+  assert.equal(fs.existsSync(path.join(dir, ".claude", "settings.local.json")), true, "evolve backfills settings.local.json");
+});
+
+test("scan is an alias for analytics (same JSON output)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-scan-alias-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  const orig = console.log;
+  let captured = "";
+  console.log = (s) => { captured = String(s); };
+  try {
+    await runCli(["scan", "--cwd", dir, "--format", "json"]);
+  } finally {
+    console.log = orig;
+  }
+  const obj = JSON.parse(captured);
+  assert.equal(typeof obj.score, "number", "scan emits parseable JSON with a score");
+  assert.ok(obj.checks.some((c) => c.area === "Agent hooks"), "scan runs the full check set including Agent hooks");
+});
+
+// ---- PR2: every MISS check has an evolve promotion (no silent skips) ----
+
+test("evolve gives a promotion for every missing check (no silent skips)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-evolve-all-"));
+  // Minimal project: package.json only -> most checks MISS.
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo" }));
+  const report = analyzeForTest(dir);
+  const plan = buildEvolutionPlan(report);
+  const missed = report.checks.filter((c) => !c.ok);
+  const promoted = new Set(plan.recommendations.map((r) => r.area));
+  const skipped = missed.filter((c) => !promoted.has(c.area));
+  assert.equal(skipped.length, 0, `these MISS checks have no evolve promotion: ${skipped.map((c) => c.area).join(", ")}`);
+});
+
+test("evolve maps Rules traceability MISS to a named-sensor promotion", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-evolve-rt-"));
+  fs.writeFileSync(
+    path.join(dir, "CLAUDE.md"),
+    "# rules\n\nRule 1: All payment amounts must go through the ledger reconciler.\n",
+  );
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "x", scripts: {} }));
+  // A sensor that mentions neither keyword -> rule unenforced.
+  fs.writeFileSync(path.join(dir, "smoke.test.js"), "test('boot', () => {});\n");
+  const report = analyzeForTest(dir);
+  const plan = buildEvolutionPlan(report);
+  const rt = plan.recommendations.find((r) => r.area === "Rules traceability");
+  assert.ok(rt, "Rules traceability gap produces a recommendation");
+  assert.ok(/named test|validator/i.test(rt.promoteTo), `promoteTo names a sensor target, got: ${rt.promoteTo}`);
+});
+
+// ---- PR3: /steer command scaffolds the steering loop ----
+
+test("init --write scaffolds a /steer command for the steering loop", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-steer-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {} }));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
+  await runCli(["init", "--cwd", dir, "--write"]);
+  assert.equal(fs.existsSync(path.join(dir, ".claude", "commands", "steer.md")), true, "steer.md scaffolded");
+  const steer = fs.readFileSync(path.join(dir, ".claude", "commands", "steer.md"), "utf8");
+  assert.ok(/steering loop|Why did the harness/i.test(steer), "steer.md describes the steering loop");
+});
+
+test("evolve --write backfills the /steer command", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-steer-ev-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {} }));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
+  await runCli(["evolve", "--cwd", dir, "--write"]);
+  assert.equal(fs.existsSync(path.join(dir, ".claude", "commands", "steer.md")), true, "evolve backfills steer.md");
+});
+
+// ---- 3 polish: curl|sh deny + scan one-click fix hint ----
+
+test("deny list blocks remote-execution pipes (curl|sh / wget|bash)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-deny-rce-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {} }));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
+  await runCli(["init", "--cwd", dir, "--write"]);
+  const local = fs.readFileSync(path.join(dir, ".claude", "settings.local.json"), "utf8");
+  assert.ok(/curl \* \| sh/.test(local), "deny list includes curl|sh");
+  assert.ok(/wget \* \| bash/.test(local), "deny list includes wget|bash");
+});
+
+test("printReport prints a one-click fix hint when checks MISS", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-fixhint-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo" }));
+  // No CLAUDE.md, no tests -> several checks MISS.
+  const report = analyzeForTest(dir);
+  const logs = [];
+  const orig = console.log;
+  console.log = (...a) => logs.push(a.join(" "));
+  try {
+    printReport(report);
+  } finally {
+    console.log = orig;
+  }
+  const blob = logs.join("\n");
+  assert.ok(/vca evolve --write/.test(blob), `hint mentions evolve --write, got: ${blob}`);
+  assert.ok(/missing area/.test(blob), "hint names the missing-area count");
+});
+
+test("printReport prints NO fix hint when every check passes", () => {
+  // A synthetic all-pass report: missing.length === 0 -> hint must not render.
+  const report = {
+    cwd: "/fake",
+    shape: "single project",
+    score: 100,
+    checks: [{ area: "X", ok: true, action: "a", weight: 1 }],
+    warnings: [],
+    roots: ["/fake"],
+  };
+  const logs = [];
+  const orig = console.log;
+  console.log = (...a) => logs.push(a.join(" "));
+  try {
+    printReport(report);
+  } finally {
+    console.log = orig;
+  }
+  const blob = logs.join("\n");
+  assert.ok(!/vca evolve --write/.test(blob), "no fix hint when all checks pass");
+});

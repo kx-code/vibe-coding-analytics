@@ -48,27 +48,27 @@ Requires Node.js `>= 18`.
 
 ```bash
 # One-off, no install
-npx vibe-coding-analytics analytics
-npx vibe-coding-analytics init --write
-npx vibe-coding-analytics evolve --write
+npx vibe-coding-analytics scan            # audit (alias: analytics)
+npx vibe-coding-analytics init --write    # scaffold missing harness files
+npx vibe-coding-analytics evolve --write  # evolve harness from recent fixes
 ```
 
 `vca` is also exposed as a CLI alias. With `npx`, use `--package` so npm
 installs the `vibe-coding-analytics` package and then runs its `vca` binary:
 
 ```bash
-npx --package vibe-coding-analytics vca analytics
+npx --package vibe-coding-analytics vca scan
 ```
 
 With a global install:
 
 ```bash
-vibe-coding-analytics analytics
+vibe-coding-analytics scan
 vibe-coding-analytics init --write
 vibe-coding-analytics evolve --write
 
 # or the short alias
-vca analytics
+vca scan
 vca init --write
 vca evolve --write
 ```
@@ -83,9 +83,9 @@ files.
 
 | Command | Purpose |
 | --- | --- |
-| `analytics` | Audit the current project for AI coding readiness. |
-| `init` | Propose or create baseline harness files. |
-| `evolve` | Propose or create self-evolution loop files for repeated improvements. |
+| `scan` | Audit the current project for AI coding readiness (`analytics` is an alias). |
+| `init` | Propose or create baseline harness files, including Claude Code hooks + a deny list for projects with `CLAUDE.md` / `.claude/`. |
+| `evolve` | Propose or create self-evolution loop files for repeated improvements; also backfills hooks + deny list when missing. |
 
 ## Integrations
 
@@ -97,12 +97,14 @@ The generated project templates support:
 /analytics
 /init
 /evolve
+/steer
 ```
 
-The `evolve` command is designed to pair with local loops:
+The `evolve` and `steer` commands are designed to pair with local loops:
 
 ```text
 /loop 30m /evolve
+/loop 30m /steer   # after each bug fix: add the smallest sensor that would have caught it
 ```
 
 Use it to extract repeated user corrections, failed checks, review feedback,
@@ -147,6 +149,11 @@ for marketplace submission.
 - Failure observability: monitoring, alerting, or error counters so critical-path
   failures surface instead of failing silently
 - Deploy and post-deploy verification hooks
+- Agent hooks: `PostToolUse` on `Edit|Write` running eslint + prettier
+  (format-on-save + lint-on-edit at edit time), plus a `permissions.deny`
+  list blocking irreversible commands (`rm -rf`, `git push -f`, `git reset --hard`,
+  `curl | sh`, `DROP TABLE`, …). `vca init --write` scaffolds both for Claude Code projects;
+  the deny list gains `DROP TABLE` / `TRUNCATE TABLE` on database projects
 - Cross-session memory: ADR decisions, agent memory, or a decisions log
 - Self-evolution loops that promote repeated work into durable harness assets
 - Depth hints on passing checks (test-file / instruction-line / skill counts) so a stub is distinguishable from a mature project at the same score

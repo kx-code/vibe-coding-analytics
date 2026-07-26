@@ -3,7 +3,7 @@ import path from "node:path";
 import process from "node:process";
 import { execSync, spawnSync } from "node:child_process";
 
-const COMMANDS = new Set(["init", "analytics", "evolve", "help"]);
+const COMMANDS = new Set(["init", "analytics", "scan", "evolve", "help"]);
 
 export async function runCli(argv) {
   if (argv.includes("--version") || argv.includes("-V")) {
@@ -11,7 +11,10 @@ export async function runCli(argv) {
     return;
   }
 
-  const command = COMMANDS.has(argv[0]) ? argv[0] : argv[0] ? "help" : "help";
+  const rawCommand = COMMANDS.has(argv[0]) ? argv[0] : argv[0] ? "help" : "help";
+  // "scan" is the intuitive read-only audit name; "analytics" remains as a
+  // backward-compatible alias (already shipped on npm).
+  const command = rawCommand === "scan" ? "analytics" : rawCommand;
   const options = parseOptions(argv.slice(command === "help" && argv[0] !== "help" ? 0 : 1));
 
   if (command === "help") {
@@ -97,6 +100,7 @@ function analyzeProject(cwd) {
 
   const numberedRules = countNumberedRules(roots);
   const ruleTrace = analyzeRuleTraceability(roots, allFiles, cwd);
+  const hooks = detectHooksConfig(roots);
   const checks = [
     check(
       "Project facts",
@@ -172,6 +176,16 @@ function analyzeProject(cwd) {
       "Add project-specific validators (scripts/*validate*/*verify*) for rules that should not rely on memory.",
     ),
     check(
+      "Agent hooks",
+      hooks.postToolUseLint && hooks.postToolUseFormat,
+      "Add .claude/settings.json hooks.PostToolUse on Edit|Write to run eslint + prettier -- format-on-save stops style drift and catches errors at edit time. (vca init --write scaffolds this for Claude Code projects.)",
+    ),
+    check(
+      "Dangerous-command guard",
+      hooks.permissionsDeny,
+      "Add .claude/settings.local.json permissions.deny for irreversible commands (rm -rf, git push -f, git reset --hard, mkfs, dd, DROP TABLE) so agents cannot run them. (vca init --write scaffolds a default list.)",
+    ),
+    check(
       "Deploy hooks",
       hasScriptPrefix(scripts, ["deploy", "release"]) ||
         anyMakefileTarget(roots, ["deploy", "release"]) ||
@@ -229,7 +243,7 @@ function analyzeProject(cwd) {
     ({
       "Single validation command": 3, Tests: 3, CI: 3,
       "Agent instructions": 2, Typecheck: 2, "Rule sensors": 2,
-      "Architecture sensors": 2, "Deploy hooks": 2, "Harness files committed": 2,
+      "Architecture sensors": 2, "Agent hooks": 2, "Deploy hooks": 2, "Harness files committed": 2,
     })[area] ?? 1;
   let earned = 0;
   let total = 0;
@@ -709,16 +723,112 @@ function readJson(filePath) {
   }
 }
 
+/** Detect Claude Code hooks + permission-guard config across project roots.
+ *  PostToolUse(Edit|Write)->lint+format stops style drift at edit time; a
+ *  non-empty permissions.deny blocks irreversible commands. Both are the
+ *  highest-leverage agent safety nets after tests/CI. */
+function detectHooksConfig(roots) {
+  let postToolUseLint = false;
+  let postToolUseFormat = false;
+  let permissionsDeny = false;
+  for (const root of roots) {
+    const settings = readJson(path.join(root, ".claude", "settings.json"));
+    const postTool = settings?.hooks?.PostToolUse;
+    const entries = Array.isArray(postTool) ? postTool : postTool ? [postTool] : [];
+    for (const entry of entries) {
+      if (!/Edit|Write/i.test(entry?.matcher || "")) continue;
+      const cmds = (entry.hooks || []).map((h) => h?.command || "").join("\n");
+      if (/eslint|lint/i.test(cmds)) postToolUseLint = true;
+      if (/prettier|format/i.test(cmds)) postToolUseFormat = true;
+    }
+    const local = readJson(path.join(root, ".claude", "settings.local.json"));
+    if (Array.isArray(local?.permissions?.deny) && local.permissions.deny.length > 0) {
+      permissionsDeny = true;
+    }
+  }
+  return { postToolUseLint, postToolUseFormat, permissionsDeny };
+}
+
+/** A project is "Claude Code" when it ships CLAUDE.md or a .claude/ dir --
+ * only then do we scaffold Claude-specific hooks/settings. */
+function isClaudeCodeProject(roots) {
+  return roots.some((root) =>
+    fs.existsSync(path.join(root, "CLAUDE.md")) ||
+    fs.existsSync(path.join(root, ".claude")));
+}
+
+/** DB projects get extra deny guards (DROP/TRUNCATE) since those are
+ *  irreversible in any stack with a database. Detected from migrations,
+ *  ORM configs, or package deps. */
+function isDbProject(report) {
+  const paths = [...report.files].join("\n").toLowerCase();
+  const dbFileSignals = ["prisma/schema", "drizzle", "knexfile", "migrations/", "schema.sql", "/supabase/"];
+  if (dbFileSignals.some((sig) => paths.includes(sig))) return true;
+  const deps = { ...report.packageJson?.dependencies, ...report.packageJson?.devDependencies };
+  return Boolean(deps?.prisma || deps?.drizzle || deps?.knex || deps?.typeorm || deps?.sequelize);
+}
+
+/** Default irreversible-command deny list, generalized from production rules.
+ *  Bash(...) patterns follow Claude Code permission syntax. */
+function defaultDenyList(report) {
+  const deny = [
+    "Bash(rm -rf:*)",
+    "Bash(rm -r /)",
+    "Bash(git push --force:*)",
+    "Bash(git push -f:*)",
+    "Bash(git reset --hard:*)",
+    "Bash(git clean -fd:*)",
+    "Bash(sudo rm:*)",
+    "Bash(mkfs:*)",
+    "Bash(dd if=:*)",
+    "Bash(> /dev/sd:*)",
+    "Bash(:> *)",
+    "Bash(curl * | sh)",
+    "Bash(curl * | bash)",
+    "Bash(wget * | sh)",
+    "Bash(wget * | bash)",
+  ];
+  if (isDbProject(report)) {
+    deny.push("Bash(DROP TABLE:*)", "Bash(DROP DATABASE:*)", "Bash(TRUNCATE TABLE:*)");
+  }
+  return deny;
+}
+
+/** Claude Code settings.json with PostToolUse(Edit|Write) -> prettier + eslint.
+ *  Format-on-save + lint-on-edit are the cheapest computational sensors. */
+function claudeHooksSettings() {
+  const config = {
+    hooks: {
+      PostToolUse: [
+        {
+          matcher: "Edit|Write",
+          hooks: [
+            { type: "command", command: "npx prettier --write \"$FILE_PATH\" 2>/dev/null || true" },
+            { type: "command", command: "npx eslint --no-warn-ignored \"$FILE_PATH\" 2>/dev/null || true" },
+          ],
+        },
+      ],
+    },
+  };
+  return `${JSON.stringify(config, null, 2)}\n`;
+}
+
+/** Claude Code settings.local.json with a deny list of irreversible commands. */
+function claudePermissionsLocal(report) {
+  const config = { permissions: { allow: [], ask: [], deny: defaultDenyList(report) } };
+  return `${JSON.stringify(config, null, 2)}\n`;
+}
+
 function printHelp() {
   console.log(`vibe-coding-analytics
 
 Usage:
-  npx vibe-coding-analytics analytics [--cwd path]
+  npx vibe-coding-analytics scan [--cwd path]
   npx vibe-coding-analytics init [--cwd path] [--write]
   npx vibe-coding-analytics evolve [--cwd path] [--write] [--ci-failures]
 
 Commands:
-  analytics  Audit the current project harness and print gaps.
+  scan       Audit the current project harness and print gaps (alias: analytics).
   init       Propose or write baseline AI coding harness files.
   evolve     Propose or write self-evolution loop files.
 
@@ -743,6 +853,12 @@ export function printReport(report) {
   if (report.warnings && report.warnings.length) {
     console.log("\nWarnings:");
     for (const w of report.warnings) console.log(`! ${w.message}`);
+  }
+  const missing = report.checks.filter((c) => !c.ok);
+  if (missing.length) {
+    console.log(
+      `\n→ ${missing.length} missing area(s). Run \`vca evolve --write\` to backfill hooks, deny list, commands, and sensors — or \`vca init --write\` for the full baseline harness.`,
+    );
   }
   if (report.shape !== "single project") {
     console.log(
@@ -808,7 +924,7 @@ function detectPackageManager(cwd, packageJson) {
 
 function buildInitFiles(report) {
   const name = report.packageJson?.name || path.basename(report.cwd);
-  return [
+  const files = [
     file("AGENTS.md", agentInstructions(name, report.packageJson?.scripts, Boolean(report.packageJson), detectPackageManager(report.cwd, report.packageJson))),
     file(".github/copilot-instructions.md", copilotInstructions(name)),
     file("docs/knowledge-base/patterns.md", "# Patterns\n\nDocument project-specific code patterns that agents should reuse.\n"),
@@ -816,8 +932,16 @@ function buildInitFiles(report) {
     file("docs/knowledge-base/known-issues.md", "# Known Issues\n\nTrack recurring failures, root causes, and the sensor added to prevent recurrence.\n"),
     file(".claude/commands/analytics.md", slashAnalyticsCommand()),
     file(".claude/commands/init.md", slashInitCommand()),
-    file(".claude/commands/evolve.md", slashEvolveCommand())
+    file(".claude/commands/evolve.md", slashEvolveCommand()),
+    file(".claude/commands/steer.md", slashSteerCommand()),
   ];
+  // Claude Code projects: scaffold PostToolUse lint+format hooks + a deny list
+  // of irreversible commands. Skipped for non-Claude stacks (Codex/Cursor).
+  if (isClaudeCodeProject(report.roots)) {
+    files.push(file(".claude/settings.json", claudeHooksSettings()));
+    files.push(file(".claude/settings.local.json", claudePermissionsLocal(report)));
+  }
+  return files;
 }
 
 const EVOLVE_PROMOTIONS = {
@@ -831,6 +955,18 @@ const EVOLVE_PROMOTIONS = {
   "Reusable skills": { promoteTo: "project skill", action: "Create a skill for a repeated workflow (validate, deploy, migrate, debug)." },
   "Specialist reviewers": { promoteTo: "reviewer agent", action: "Add a reviewer agent for the highest-risk domain." },
   "Architecture sensors": { promoteTo: "architecture validator", action: "Add a scripts/validate validator for rules that should not rely on memory." },
+  "Agent hooks": { promoteTo: ".claude/settings.json PostToolUse hooks", action: "Add PostToolUse(Edit|Write) hooks running eslint + prettier so every edit is lint+format checked at edit time." },
+  "Dangerous-command guard": { promoteTo: ".claude/settings.local.json deny list", action: "Add permissions.deny for irreversible commands (rm -rf, git push -f, git reset --hard, mkfs, dd, DROP TABLE)." },
+  "Project facts": { promoteTo: "package.json / go.mod / Cargo.toml", action: "Add a manifest declaring the project name, scripts, and dependencies so agents can reason about the stack." },
+  "Agent instructions": { promoteTo: "AGENTS.md / CLAUDE.md", action: "Add an AGENTS.md or CLAUDE.md with the stack, commands, and hard rules agents must follow." },
+  "Single validation command": { promoteTo: "scripts.ci / Makefile validate", action: "Add a single ci/validate script (or Makefile target) running typecheck + lint + test so agents and CI run the same check." },
+  "Deploy hooks": { promoteTo: "deploy script / CI workflow", action: "Add a deploy/release script or .github/workflows/*.yml so deployments are repeatable and auditable." },
+  "Rule sensors": { promoteTo: "test / validator / lint rule", action: "Back prose rules with a computational sensor (test, lint rule, or scripts/validator) so violations are caught, not just documented." },
+  "Rules traceability": { promoteTo: "named test / validator per rule", action: "For each numbered rule no sensor references, add a test or validator whose name/path mentions the rule keyword." },
+  "Steering loop": { promoteTo: "numbered rules section in CLAUDE.md", action: "Start a numbered rules section (Rule N) in CLAUDE.md/AGENTS.md and add a rule after each bug fix; the rising count is the feedback-loop heartbeat." },
+  "Failure observability": { promoteTo: "monitor / alert / health-check", action: "Add a monitor, alert, or health-check (script or CI cron) so critical-path failures surface instead of failing silently." },
+  "Cross-session memory": { promoteTo: "ADR / decisions log", action: "Add docs/decisions/ ADRs or a .claude/memory log so decisions survive across sessions." },
+  "Harness files committed": { promoteTo: "git-tracked harness files", action: "git add harness files that are gitignored or untracked so the next agent inherits them." },
 };
 
 /** Map each missing analytics check to a concrete promotion target (the "evolve" half of analytics). */
@@ -914,11 +1050,18 @@ export function buildEvolutionPlan(report, options = {}) {
 function buildEvolutionFiles(report, plan) {
   const name = report.packageJson?.name || path.basename(report.cwd);
   const safePlan = plan || buildEvolutionPlan(report);
-  return [
+  const files = [
     file("docs/knowledge-base/agent-evolution.md", evolutionDoc(name, safePlan)),
     file(".claude/commands/evolve.md", slashEvolveCommand()),
-    file(".claude/skills/project-evolution/SKILL.md", projectEvolutionSkill(name))
+    file(".claude/commands/steer.md", slashSteerCommand()),
+    file(".claude/skills/project-evolution/SKILL.md", projectEvolutionSkill(name)),
   ];
+  // evolve also backfills hooks + deny list when missing on Claude Code projects.
+  if (isClaudeCodeProject(report.roots)) {
+    files.push(file(".claude/settings.json", claudeHooksSettings()));
+    files.push(file(".claude/settings.local.json", claudePermissionsLocal(report)));
+  }
+  return files;
 }
 
 function file(relativePath, content) {
@@ -1032,6 +1175,29 @@ Promote each repeated pattern into one of:
 This command is designed for loop usage, for example:
 \`\`\`text
 /loop 30m /evolve
+\`\`\`
+`;
+}
+
+function slashSteerCommand() {
+  return `Steer the harness after a bug fix or a repeated failure.
+
+For the issue just fixed, run the steering loop:
+
+1. **Root-cause the harness gap** — ask "Why did the harness (tests, lint, validators, rules) NOT catch this?" Name the specific missing sensor.
+2. **Add the smallest durable sensor** that would have caught it, in order of preference:
+   - a regression test that reproduces the bug (preferred — computational and self-verifying)
+   - a lint rule or a scripts/ architecture validator
+   - a numbered rule (Rule N) in CLAUDE.md / AGENTS.md
+   - a slash command or a specialist reviewer agent
+3. **Verify the sensor fires** — confirm it fails on the pre-fix code and passes after the fix.
+4. **Record it** — append a numbered rule and note which sensor now enforces it.
+
+A rule without a sensor is documentation that decays; a sensor without a rule is silent enforcement. Add both when it matters.
+
+Designed for loop usage, for example:
+\`\`\`text
+/loop 30m /steer
 \`\`\`
 `;
 }
