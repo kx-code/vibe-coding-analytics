@@ -1218,7 +1218,9 @@ test("init --write scaffolds hooks + deny list for Claude Code projects", async 
   const local = fs.readFileSync(path.join(dir, ".claude", "settings.local.json"), "utf8");
   assert.ok(/permissions/.test(local), "settings.local.json has permissions");
   assert.ok(/Bash\(rm -rf:\*\)/.test(local), "deny list includes rm -rf");
-  assert.ok(/Bash\(git push --force:\*\)/.test(local), "deny list includes git push --force");
+  assert.ok(/Bash\(git push --force:\*\)/.test(local), "deny list includes git push --force (leading flag)");
+  assert.ok(/Bash\(git push \* --force\)/.test(local), "deny list covers force flag AFTER the refspec (git push origin main --force)");
+  assert.ok(/Bash\(git push \* -f\)/.test(local), "deny list covers -f flag AFTER the refspec (git push origin main -f)");
 });
 
 test("init --write does NOT scaffold hooks for non-Claude-Code projects", async () => {
@@ -2010,6 +2012,73 @@ test("Agent hooks N/A when formatters live only in a pnpm workspace member: deps
   assert.equal(hooks.na, true, "pnpm member deps don't hoist to root -> Agent hooks N/A (was wrongly detected, scaffolding unresolvable hooks)");
   await runCli(["init", "--cwd", dir, "--write"]);
   assert.equal(fs.existsSync(path.join(dir, ".claude", "settings.json")), false, "init does NOT scaffold settings.json hooks when the only formatters are in a non-hoisting pnpm member");
+});
+
+test("Agent hooks N/A when formatters live only in a Yarn Berry workspace member: PnP doesn't resolve member binaries at the root (Codex P1)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-fmt-yarnberry-ws-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  // Yarn Berry monorepo (.yarnrc.yml present): root has no formatters, member
+  // does. Berry's Plug'n'Play linker resolves binaries through the root
+  // workspace's dependency store, so `yarn exec prettier` run from the root
+  // (where settings.json is written) cannot find a member-only binary — it
+  // exits 127 there and only resolves inside the owning workspace. Counting the
+  // member would scaffold hooks that fail on every edit.
+  fs.writeFileSync(path.join(dir, ".yarnrc.yml"), "nodeLinker: node-modules\n");
+  fs.writeFileSync(path.join(dir, "yarn.lock"), "");
+  fs.writeFileSync(
+    path.join(dir, "package.json"),
+    JSON.stringify({ name: "root", scripts: {}, workspaces: ["packages/*"] }),
+  );
+  fs.mkdirSync(path.join(dir, "packages", "ui"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, "packages", "ui", "package.json"),
+    JSON.stringify({ name: "ui", devDependencies: { prettier: "*", eslint: "*" } }),
+  );
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  assert.equal(hooks.na, true, "yarn berry member binaries don't resolve at root -> Agent hooks N/A (was wrongly detected, scaffolding unresolvable hooks)");
+  await runCli(["init", "--cwd", dir, "--write"]);
+  assert.equal(fs.existsSync(path.join(dir, ".claude", "settings.json")), false, "init does NOT scaffold settings.json hooks when the only formatters are in a non-root-resolvable Yarn Berry member");
+});
+
+test("Agent hooks detected when formatters live in a Yarn CLASSIC (v1) workspace member: deps hoist to root (Codex P1)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-fmt-yarnclassic-ws-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  // Yarn Classic (v1): no `.yarnrc.yml`, just a yarn.lock. Classic hoists member
+  // deps into the root node_modules, so `yarn exec` at the root DOES resolve a
+  // member-only binary — members are still counted (only Berry/PnP is skipped).
+  fs.writeFileSync(path.join(dir, "yarn.lock"), "");
+  fs.writeFileSync(
+    path.join(dir, "package.json"),
+    JSON.stringify({ name: "root", scripts: {}, workspaces: ["packages/*"] }),
+  );
+  fs.mkdirSync(path.join(dir, "packages", "ui"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, "packages", "ui", "package.json"),
+    JSON.stringify({ name: "ui", devDependencies: { prettier: "*", eslint: "*" } }),
+  );
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  assert.equal(hooks.na, false, "yarn classic member deps hoist to root -> formatters detected -> NOT N/A");
+});
+
+test("Agent hooks N/A for a Yarn Berry monorepo detected via packageManager version pin, no .yarnrc.yml (Codex P1)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-fmt-yarnberry-pm-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  // No `.yarnrc.yml`, but packageManager pins yarn@4 (Berry). The version pin
+  // alone must mark the project as Berry so member-only formatters are skipped.
+  fs.writeFileSync(
+    path.join(dir, "package.json"),
+    JSON.stringify({ name: "root", scripts: {}, packageManager: "yarn@4.0.0", workspaces: ["packages/*"] }),
+  );
+  fs.mkdirSync(path.join(dir, "packages", "ui"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, "packages", "ui", "package.json"),
+    JSON.stringify({ name: "ui", devDependencies: { prettier: "*", eslint: "*" } }),
+  );
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  assert.equal(hooks.na, true, "packageManager yarn@4 pin => Berry => member binaries don't resolve at root -> N/A");
 });
 
 test("init --write emits only the MISSING formatter purpose when the other is already in settings.local.json (Codex P2)", async () => {

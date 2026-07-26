@@ -966,28 +966,60 @@ function readWorkspaceMemberPackages(root, pkg) {
   return members;
 }
 
+/** True when `cwd` is governed by Yarn Berry (v2+). Berry's default Plug'n'Play
+ *  linker resolves binaries through the root workspace's own dependency store:
+ *  `yarn exec <tool>` run from the repository root finds only deps the root
+ *  workspace declares, NOT deps that live in a member package, so a member-only
+ *  prettier/eslint exits 127 there (it only resolves inside its owning
+ *  workspace). We detect Berry two ways: a `.yarnrc.yml` file anywhere up the
+ *  tree (Berry's config file, absent in Classic), or an explicit `packageManager`
+ *  field pinning yarn >= 2. Yarn Classic (v1) has neither — it hoists member deps
+ *  into the root node_modules, so `yarn exec` at the root DOES resolve them and
+ *  members are still counted. */
+function isYarnBerry(cwd, packageJson) {
+  if (packageJson?.packageManager) {
+    const m = String(packageJson.packageManager).match(/^yarn@(\d+)/);
+    if (m && Number(m[1]) >= 2) return true;
+  }
+  let dir = cwd;
+  while (true) {
+    try {
+      if (fs.existsSync(path.join(dir, ".yarnrc.yml"))) return true;
+    } catch {
+      /* ignore fs errors */
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return false;
+}
+
 /** Hooks are scaffolded at the PRIMARY root (roots[0], where settings.json is
  *  written) and run the package-manager executor from there, so only formatters
  *  RESOLVABLE from that root count: its own manifest plus its npm workspace
- *  members (npm hoists member deps into the primary node_modules, so `npx` at the
- *  primary resolves them; yarn PnP resolves member binaries at the root too).
- *  pnpm does NOT hoist by default — a member keeps its own node_modules, and
- *  `pnpm exec <tool>` run at the root cannot find a member-only binary — so for
- *  pnpm, member-only formatters are not resolvable from the root, exactly like a
- *  git submodule. Counting them would scaffold hooks at the primary that fail
- *  with "Command not found" on every edit. Run vca from inside the member
- *  instead. */
+ *  members. npm hoists member deps into the primary node_modules, so `npx` at the
+ *  primary resolves them. pnpm does NOT hoist by default (a member keeps its own
+ *  node_modules), and Yarn Berry (Plug'n'Play) resolves only deps the root
+ *  workspace declares — in both, a member-only prettier/eslint is invisible to
+ *  `pnpm exec` / `yarn exec` run from the primary, and the scaffolded hook would
+ *  fail with "command not found" on every edit. For pnpm and Yarn Berry we
+ *  therefore skip workspace members exactly like a git submodule; run vca from
+ *  inside the member instead. Yarn Classic (v1) hoists member deps into the root
+ *  node_modules, so its members remain root-resolvable and are still counted. */
 function hasNodeFormattersAnywhere(roots) {
   const primary = roots?.[0];
   if (!primary) return false;
   const pkg = readJson(path.join(primary, "package.json"));
   if (hasNodeFormatters(pkg)) return true;
-  // pnpm member deps don't hoist to the primary root, so a member-only
-  // prettier/eslint is invisible to `pnpm exec` run from the primary — the
-  // scaffolded hook would fail on every edit. npm/yarn do hoist/resolve, so
-  // only pnpm skips workspace members here.
+  // pnpm and Yarn Berry don't expose workspace-member binaries to the executor
+  // run from the primary root: pnpm keeps a per-member node_modules, and Yarn
+  // Berry Plug'n'Play resolves only root-declared deps at the root (a
+  // member-only prettier/eslint returns 127 from `yarn exec` there). Both skip
+  // workspace members here. Yarn Classic (v1) hoists, so it still counts.
   const pm = detectPackageManager(primary, pkg);
   if (pm === "pnpm") return false;
+  if (pm === "yarn" && isYarnBerry(primary, pkg)) return false;
   for (const memberPkg of readWorkspaceMemberPackages(primary, pkg)) {
     if (hasNodeFormatters(memberPkg)) return true;
   }
@@ -1013,6 +1045,12 @@ function defaultDenyList(report) {
     "Bash(rm -r /)",
     "Bash(git push --force:*)",
     "Bash(git push -f:*)",
+    // A lone star in a Claude Code Bash pattern spans multiple arguments, so
+    // these catch a force flag placed AFTER the refspec — e.g. `git push origin
+    // main --force` — which the prefix-only colon-star entries above miss (those
+    // only match when the flag comes first). Git accepts the trailing placement.
+    "Bash(git push * --force)",
+    "Bash(git push * -f)",
     "Bash(git reset --hard:*)",
     "Bash(git clean -fd:*)",
     "Bash(sudo rm:*)",
