@@ -747,8 +747,16 @@ function readJson(filePath) {
 
 /** A deny list only counts as a real guard if it actually blocks at least one
  *  irreversible command — a list of only `WebFetch` or harmless entries must not
- *  pass. Matches the same families that defaultDenyList scaffolds. */
+ *  pass, and a rule that merely MENTIONS a dangerous command as an argument must
+ *  not pass either: `Bash(echo rm -rf:*)` blocks `echo`, not `rm`. The blocked
+ *  command is the prefix right after `Bash(`, so the entry matcher anchors there
+ *  and only a rule whose denied command STARTS with an irreversible command
+ *  satisfies the guard. Matches the same families that defaultDenyList scaffolds. */
 const DANGEROUS_DENY_PATTERN = /rm\s+-r|git\s+push.*(-f|force)|git\s+reset.*--hard|git\s+clean|mkfs|dd\s+if|drop\s+(table|database)|truncate|>\s*\/dev\/sd|curl.*\|\s*(sh|bash)|wget.*\|\s*(sh|bash)/i;
+// Anchored at `Bash(`: the dangerous command must be the one the rule actually
+// blocks (the start of the denied command line), never a substring buried in an
+// argument. Derived from DANGEROUS_DENY_PATTERN so the two cannot drift apart.
+const DANGEROUS_DENY_ENTRY_RE = new RegExp("^Bash\\((?:" + DANGEROUS_DENY_PATTERN.source + ")", "i");
 
 /** Classify a Claude Code PostToolUse matcher by whether it fires on the Edit
  *  and Write tools. Claude Code interprets the matcher field as a REGEX tested
@@ -856,7 +864,7 @@ function detectHooksConfig(roots) {
     }
   }
   for (const denyList of [settings?.permissions?.deny, local?.permissions?.deny]) {
-    if (Array.isArray(denyList) && denyList.some((d) => DANGEROUS_DENY_PATTERN.test(String(d)))) {
+    if (Array.isArray(denyList) && denyList.some((d) => DANGEROUS_DENY_ENTRY_RE.test(String(d)))) {
       permissionsDeny = true;
     }
   }

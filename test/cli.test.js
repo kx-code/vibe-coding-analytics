@@ -2197,3 +2197,23 @@ test("detects Claude config in a workspace member and scaffolds the deny guard (
   await runCli(["init", "--cwd", dir, "--write"]);
   assert.equal(fs.existsSync(path.join(dir, ".claude", "settings.local.json")), true, "deny list scaffolded for member-only Claude project");
 });
+
+test("Dangerous-command guard MISS when a deny entry only mentions a dangerous command as an argument (Codex P2)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-deny-arg-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  // `Bash(echo rm -rf:*)` blocks the `echo` command, NOT `rm` — rm -rf is merely
+  // an argument. An unanchored regex matched the "rm -rf" substring anywhere in
+  // the entry and false-PASSed the guard, skipping scaffolding of the real list.
+  fs.writeFileSync(
+    path.join(dir, ".claude", "settings.json"),
+    JSON.stringify({ permissions: { deny: ["Bash(echo rm -rf:*)"] } }),
+  );
+  const r = analyzeForTest(dir);
+  const guard = r.checks.find((c) => c.area === "Dangerous-command guard");
+  assert.ok(guard && !guard.ok, "deny entry that mentions rm as an echo argument must NOT satisfy the guard");
+  // Because the guard correctly MISSes, init scaffolds the real deny list.
+  await runCli(["init", "--cwd", dir, "--write"]);
+  const local = fs.readFileSync(path.join(dir, ".claude", "settings.local.json"), "utf8");
+  assert.ok(/Bash\(rm -rf:\*\)/.test(local), "real deny list scaffolded since the echo-argument rule did not satisfy the guard");
+});
