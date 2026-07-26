@@ -746,49 +746,99 @@ function readJson(filePath) {
 }
 
 /** A deny list only counts as a real guard if it actually blocks at least one
- *  irreversible command — a list of only `WebFetch` or harmless entries must not
- *  pass, and a rule that merely MENTIONS a dangerous command as an argument must
- *  not pass either: `Bash(echo rm -rf:*)` blocks `echo`, not `rm`. The blocked
- *  command is the prefix right after `Bash(`, so the entry matcher anchors there
- *  and only a rule whose denied command STARTS with an irreversible command
- *  satisfies the guard. Matches the same families that defaultDenyList scaffolds. */
-const DANGEROUS_DENY_PATTERN = /rm\s+-r|git\s+push.*(-f|force)|git\s+reset.*--hard|git\s+clean|mkfs|dd\s+if|drop\s+(table|database)|truncate|>\s*\/dev\/sd|curl.*\|\s*(sh|bash)|wget.*\|\s*(sh|bash)/i;
-// Anchored at `Bash(`: the dangerous command must be the one the rule actually
-// blocks (the start of the denied command line), never a substring buried in an
-// argument. Derived from DANGEROUS_DENY_PATTERN so the two cannot drift apart.
-const DANGEROUS_DENY_ENTRY_RE = new RegExp("^Bash\\((?:" + DANGEROUS_DENY_PATTERN.source + ")", "i");
+ *  irreversible command. Two substring traps must be avoided:
+ *   1. The dangerous verb buried in an argument — `Bash(echo rm -rf:*)` blocks
+ *      `echo`, not `rm`. Guarded by extracting the command prefix (the denied
+ *      line before the first `:`) and anchoring every alternative with `^`.
+ *   2. A flag that is merely a substring of a longer token — `git push origin
+ *      release-feature` is NOT a force push (the `-f` lives inside the branch
+ *      name), and `rm -readme` is NOT `rm -r` (the `-r` is the prefix of the
+ *      longer token `-readme`). Guarded by requiring token boundaries: long
+ *      flags must be whitespace-delimited, and short-flag clusters must be drawn
+ *      from the verb's real flag alphabet (`[frRivIdP]` for rm) and terminated
+ *      by whitespace or end-of-line.
+ *  Matches the same families that defaultDenyList scaffolds. */
+const DANGEROUS_CMD_RE = new RegExp(
+  "^(?:" +
+    [
+      "rm\\s+-[frRivIdP]*[rR][frRivIdP]*(?:\\s|$)",
+      "git\\s+push\\b.*?\\s(?:--force|-f)(?:\\s|$)",
+      "git\\s+reset\\b.*?\\s--hard(?:\\s|$)",
+      "git\\s+clean\\b",
+      "mkfs",
+      "dd\\s+if",
+      "drop\\s+(?:table|database)",
+      "truncate",
+      ">\\s*\\/dev\\/sd",
+      "curl.*\\|\\s*(?:sh|bash)",
+      "wget.*\\|\\s*(?:sh|bash)",
+    ].join("|") +
+    ")",
+  "i",
+);
 
-/** Classify a Claude Code PostToolUse matcher by whether it fires on the Edit
- *  and Write tools. Claude Code interprets the matcher field as a REGEX tested
- *  against the tool name, so we compile it and test it against "Edit" and
- *  "Write" rather than splitting on "|" and comparing bare fragments. That way
- *  anchored forms (`^(Edit|Write)$`) and delimited regexes (`/Edit|Write/i`)
- *  are honored exactly like the bare alternation (`Edit|Write`) the scaffold
- *  emits — previously `^(Edit|Write)$` was split into `^(Edit` and `Write)$`,
- *  neither a bare tool name, so detection falsely reported MISS and the merge
- *  appended a duplicate entry. Returns "catch-all" (empty matcher, fires on
- *  every tool), "both" (non-empty regex matching Edit AND Write), or "no".
- *
- *  NotebookEdit|Write still does NOT cover Edit: as a regex, `NotebookEdit`
- *  is not a substring of the tool name "Edit", so the test fails — the exact
- *  tool-name semantics from earlier rounds are preserved. An unparseable regex
- *  falls back to "no" so detection never falsely PASSES. */
-function matcherCoverage(matcher) {
+/** A Claude Code deny entry looks like `Bash(<command>:<qualifier>)` (or
+ *  `Bash(<command>)`). The blocked command is the `<command>` prefix before the
+ *  first `:`. Return true only when THAT prefix starts with an irreversible
+ *  command — never when the dangerous verb is merely mentioned later in the line
+ *  or hidden inside a longer token like a branch or file name. */
+function denyEntryBlocksDangerousCommand(entry) {
+  const m = String(entry).trim().match(/^Bash\(([^)]*)\)$/);
+  if (!m) return false;
+  let cmd = m[1];
+  const colon = cmd.indexOf(":");
+  if (colon !== -1) cmd = cmd.slice(0, colon);
+  return DANGEROUS_CMD_RE.test(cmd);
+}
+
+/** Compile a Claude Code PostToolUse matcher into { catchAll, re }. Claude Code
+ *  interprets the matcher field as a REGEX tested against the tool name. An
+ *  empty matcher is a catch-all (fires on every tool); a /pattern/flags literal
+ *  is unwrapped; an unparseable pattern returns null so callers fall back
+ *  safely. Extracted so detection, merge, and the broad-matcher check share one
+ *  compilation path instead of each reopening the regex. */
+function compileMatcher(matcher) {
   let m = String(matcher ?? "").trim();
-  if (m === "") return "catch-all";
+  if (m === "") return { catchAll: true, re: null };
   let flags = "";
   const delimited = m.match(/^\/(.+)\/([a-z]*)$/);
   if (delimited) {
     m = delimited[1];
     flags = delimited[2];
   }
-  let re;
   try {
-    re = new RegExp(m, flags);
+    return { catchAll: false, re: new RegExp(m, flags) };
   } catch {
-    return "no";
+    return null;
   }
-  return re.test("Edit") && re.test("Write") ? "both" : "no";
+}
+
+/** Classify a matcher by whether it fires on the Edit and Write tools. Compiled
+ *  and tested against "Edit" and "Write" rather than split on "|" and compared
+ *  as bare fragments, so anchored (`^(Edit|Write)$`) and delimited
+ *  (`/Edit|Write/i`) forms are honored exactly like the bare alternation
+ *  (`Edit|Write`) the scaffold emits. Returns "catch-all" (empty matcher, fires
+ *  on every tool), "both" (non-empty regex matching Edit AND Write), or "no".
+ *
+ *  NotebookEdit|Write still does NOT cover Edit: as a regex, `NotebookEdit` is
+ *  not a substring of the tool name "Edit", so the test fails — exact tool-name
+ *  semantics are preserved. An unparseable regex falls back to "no" so detection
+ *  never falsely PASSES. */
+function matcherCoverage(matcher) {
+  const compiled = compileMatcher(matcher);
+  if (!compiled) return "no";
+  if (compiled.catchAll) return "catch-all";
+  return compiled.re.test("Edit") && compiled.re.test("Write") ? "both" : "no";
+}
+
+/** True when a compiled matcher fires on a given tool name (a catch-all fires
+ *  on every tool). Used to tell whether a matcher that covers Edit+Write is
+ *  BROADER than edits — e.g. `.*` or `Edit|Write|Read` also fire on Read. */
+function matcherFiresOn(matcher, toolName) {
+  const compiled = compileMatcher(matcher);
+  if (!compiled) return false;
+  if (compiled.catchAll) return true;
+  return compiled.re.test(toolName);
 }
 
 /** True when a PostToolUse matcher fires on BOTH Edit and Write. Used by
@@ -799,14 +849,17 @@ function matcherCoversEditWrite(matcher) {
   return c === "catch-all" || c === "both";
 }
 
-/** True only for a NON-catch-all matcher that fires on both Edit and Write.
- *  Used by MERGE: we append formatter hooks to an existing entry only when it
- *  is scoped to edits. Appending to a catch-all would make prettier/eslint run
+/** True only for a NON-catch-all matcher scoped to edits — fires on both Edit
+ *  and Write AND on nothing else. Used by MERGE: we append formatter hooks to
+ *  an existing entry only when it is scoped to edits. Appending to a catch-all
+ *  OR a broader matcher (`.*`, `Edit|Write|Read`) would make prettier/eslint run
  *  after Read (whose payload also carries file_path), mutating the working tree
- *  on every file read. A catch-all is preserved untouched and a separate
- *  Edit|Write entry is added instead. */
+ *  on every file read. Such entries are preserved untouched and a separate
+ *  Edit|Write entry is added instead. Detection (matcherCoversEditWrite) stays
+ *  lenient — a broad matcher still COVERS edits — only the MERGE needs the
+ *  stricter scope. */
 function matcherIsEditWriteEntry(matcher) {
-  return matcherCoverage(matcher) === "both";
+  return matcherCoverage(matcher) === "both" && !matcherFiresOn(matcher, "Read");
 }
 
 /** Shared classification of a PostToolUse command's formatter purpose. Detection
@@ -864,7 +917,7 @@ function detectHooksConfig(roots) {
     }
   }
   for (const denyList of [settings?.permissions?.deny, local?.permissions?.deny]) {
-    if (Array.isArray(denyList) && denyList.some((d) => DANGEROUS_DENY_ENTRY_RE.test(String(d)))) {
+    if (Array.isArray(denyList) && denyList.some((d) => denyEntryBlocksDangerousCommand(d))) {
       permissionsDeny = true;
     }
   }

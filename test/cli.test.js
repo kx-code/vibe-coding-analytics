@@ -2217,3 +2217,56 @@ test("Dangerous-command guard MISS when a deny entry only mentions a dangerous c
   const local = fs.readFileSync(path.join(dir, ".claude", "settings.local.json"), "utf8");
   assert.ok(/Bash\(rm -rf:\*\)/.test(local), "real deny list scaffolded since the echo-argument rule did not satisfy the guard");
 });
+
+test("Dangerous-command guard MISS when a flag is only a substring of a longer token (Codex P2)", async () => {
+  // `-f` inside the branch name `release-feature` is NOT a force flag, and `-r`
+  // as the prefix of the token `-readme` is NOT the recursive flag. An unbounded
+  // regex matched these substrings and false-PASSed the guard, skipping the
+  // scaffold of the real deny list.
+  for (const badEntry of ["Bash(git push origin release-feature:*)", "Bash(rm -readme:*)"]) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-deny-token-"));
+    fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+    fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, ".claude", "settings.json"),
+      JSON.stringify({ permissions: { deny: [badEntry] } }),
+    );
+    const r = analyzeForTest(dir);
+    const guard = r.checks.find((c) => c.area === "Dangerous-command guard");
+    assert.ok(guard && !guard.ok, `deny entry ${badEntry} must NOT satisfy the guard (flag is a substring of a longer token)`);
+    await runCli(["init", "--cwd", dir, "--write"]);
+    const local = fs.readFileSync(path.join(dir, ".claude", "settings.local.json"), "utf8");
+    assert.ok(/Bash\(rm -rf:\*\)/.test(local), `real deny list scaffolded since ${badEntry} did not satisfy the guard`);
+  }
+});
+
+test("evolve --write keeps a BROADER-than-edit PostToolUse matcher scoped away from formatter hooks and adds a separate Edit|Write entry (Codex P2)", async () => {
+  // A non-empty matcher that covers Edit+Write BUT ALSO Read (`.*` or
+  // `Edit|Write|Read`) is not a safe merge target: appending prettier/eslint to
+  // it would fire after Read too (whose payload carries file_path), rewriting
+  // the tree on every file read. It must be preserved untouched, with a separate
+  // Edit|Write entry added — exactly like an empty catch-all.
+  for (const broadMatcher of [".*", "Edit|Write|Read"]) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-merge-broad-"));
+    fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {}, devDependencies: { prettier: "*", eslint: "*" } }));
+    fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
+    fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, ".claude", "settings.json"),
+      JSON.stringify({
+        hooks: { PostToolUse: [{ matcher: broadMatcher, hooks: [{ type: "command", command: "echo read-side-effect" }] }] },
+      }),
+    );
+    await runCli(["evolve", "--cwd", dir, "--write"]);
+    const merged = JSON.parse(fs.readFileSync(path.join(dir, ".claude", "settings.json"), "utf8"));
+    const entries = merged.hooks?.PostToolUse || [];
+    const broad = entries.find((e) => String(e.matcher ?? "").trim() === broadMatcher);
+    const editWrite = entries.find((e) => String(e.matcher ?? "").trim() === "Edit|Write");
+    assert.ok(broad, `${broadMatcher} entry preserved`);
+    const broadCmds = (broad?.hooks || []).map((h) => h.command);
+    assert.deepEqual(broadCmds, ["echo read-side-effect"], `${broadMatcher} entry hooks untouched (no prettier/eslint appended)`);
+    assert.ok(editWrite, "a separate Edit|Write entry is added");
+    const editWriteCmds = (editWrite?.hooks || []).map((h) => h.command).join("\n");
+    assert.ok(/prettier/.test(editWriteCmds) && /eslint/.test(editWriteCmds), "Edit|Write entry carries the formatter hooks");
+  }
+});
