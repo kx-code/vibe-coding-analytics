@@ -1140,6 +1140,10 @@ test("Agent hooks PASS when PostToolUse(Edit|Write) runs eslint + prettier", () 
 test("Agent hooks MISS when only prettier is wired (no lint)", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-hooks-fmt-"));
   fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.writeFileSync(
+    path.join(dir, "package.json"),
+    JSON.stringify({ name: "x", devDependencies: { prettier: "*", eslint: "*" } }),
+  );
   fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
   fs.writeFileSync(
     path.join(dir, ".claude", "settings.json"),
@@ -1167,7 +1171,10 @@ test("Dangerous-command guard PASS when settings.local.json has a deny list", ()
 
 test("Agent hooks + guard both MISS on a bare project", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-hooks-bare-"));
-  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "x" }));
+  fs.writeFileSync(
+    path.join(dir, "package.json"),
+    JSON.stringify({ name: "x", devDependencies: { prettier: "*", eslint: "*" } }),
+  );
   fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
   const r = analyzeForTest(dir);
   assert.ok(r.checks.find((c) => c.area === "Agent hooks" && !c.ok), "no hooks -> MISS");
@@ -1176,7 +1183,7 @@ test("Agent hooks + guard both MISS on a bare project", () => {
 
 test("init --write scaffolds hooks + deny list for Claude Code projects", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-init-hooks-"));
-  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {} }));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {}, devDependencies: { prettier: "*", eslint: "*" } }));
   fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
   await runCli(["init", "--cwd", dir, "--write"]);
   const settings = fs.readFileSync(path.join(dir, ".claude", "settings.json"), "utf8");
@@ -1213,7 +1220,7 @@ test("init --write adds DROP TABLE deny for DB projects", async () => {
 
 test("evolve --write backfills hooks + deny list on a Claude Code project", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-evolve-hooks-"));
-  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {} }));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {}, devDependencies: { prettier: "*", eslint: "*" } }));
   fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
   await runCli(["evolve", "--cwd", dir, "--write"]);
   assert.equal(fs.existsSync(path.join(dir, ".claude", "settings.json")), true, "evolve backfills settings.json");
@@ -1368,11 +1375,104 @@ test("Agent hooks + guard are N/A (pass) for non-Claude-Code projects", () => {
 
 test("scaffolded hooks read file_path from stdin JSON, not an undefined \$FILE_PATH var", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-hooks-jq-"));
-  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {} }));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {}, devDependencies: { prettier: "*", eslint: "*" } }));
   fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
   await runCli(["init", "--cwd", dir, "--write"]);
   const settings = fs.readFileSync(path.join(dir, ".claude", "settings.json"), "utf8");
   assert.ok(/tool_input\.file_path/.test(settings), "hook reads .tool_input.file_path from stdin");
   assert.ok(!/\$FILE_PATH/.test(settings), "hook must NOT use undefined \$FILE_PATH variable");
   assert.ok(/jq/.test(settings), "hook uses jq to parse the stdin payload");
+});
+
+// ---- Codex round 2: hooks/settings correctness ----
+
+test("evolve --write MERGES hooks into an existing settings.json instead of skipping (Codex P1)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-merge-hooks-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {}, devDependencies: { prettier: "*", eslint: "*" } }));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  // Existing user settings with unrelated content but NO PostToolUse hooks.
+  fs.writeFileSync(
+    path.join(dir, ".claude", "settings.json"),
+    JSON.stringify({ permissions: { ask: ["WebFetch(*)"] } }),
+  );
+  const before = analyzeForTest(dir);
+  assert.ok(before.checks.find((c) => c.area === "Agent hooks" && !c.ok), "hooks MISS before evolve");
+  await runCli(["evolve", "--cwd", dir, "--write"]);
+  const merged = JSON.parse(fs.readFileSync(path.join(dir, ".claude", "settings.json"), "utf8"));
+  // User's unrelated setting is preserved...
+  assert.ok(merged.permissions.ask.includes("WebFetch(*)"), "existing user permissions.ask preserved on merge");
+  // ...and the hook is backfilled.
+  const cmds = (merged.hooks?.PostToolUse || []).flatMap((e) => (e.hooks || []).map((h) => h.command)).join("\n");
+  assert.ok(/prettier/.test(cmds) && /eslint/.test(cmds), "PostToolUse prettier+eslint merged in");
+  const after = analyzeForTest(dir);
+  assert.ok(after.checks.find((c) => c.area === "Agent hooks" && c.ok), "hooks PASS after evolve merge");
+});
+
+test("evolve --write MERGES deny entries into an existing settings.local.json (Codex P1)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-merge-deny-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {}, devDependencies: { prettier: "*", eslint: "*" } }));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  // Existing local settings with a user-defined deny entry but no irreversible guard.
+  fs.writeFileSync(
+    path.join(dir, ".claude", "settings.local.json"),
+    JSON.stringify({ permissions: { allow: [], deny: ["Bash(echo:*)"] } }),
+  );
+  await runCli(["evolve", "--cwd", dir, "--write"]);
+  const merged = JSON.parse(fs.readFileSync(path.join(dir, ".claude", "settings.local.json"), "utf8"));
+  assert.ok(merged.permissions.deny.includes("Bash(echo:*)"), "existing user deny entry preserved");
+  assert.ok(merged.permissions.deny.includes("Bash(rm -rf:*)"), "irreversible-command deny backfilled");
+});
+
+test("init --write omits prettier/eslint hooks when the stack lacks them (Codex P2)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-init-noformatters-"));
+  // Claude project (CLAUDE.md) but NO prettier/eslint deps — e.g. a Python/Go repo.
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "py-demo", scripts: {} }));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# py-demo\n");
+  await runCli(["init", "--cwd", dir, "--write"]);
+  assert.equal(fs.existsSync(path.join(dir, ".claude", "settings.json")), false, "no settings.json when formatters absent");
+  // The deny list is tool-agnostic and still scaffolded for any Claude project.
+  assert.equal(fs.existsSync(path.join(dir, ".claude", "settings.local.json")), true, "deny list still scaffolded");
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  assert.ok(hooks && hooks.ok, "Agent hooks N/A (pass) when formatters absent — non-Node stacks are not penalized");
+});
+
+test("scaffolded hooks use xargs -I{} so paths with spaces survive (Codex P2)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-hooks-xargs-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {}, devDependencies: { prettier: "*", eslint: "*" } }));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
+  await runCli(["init", "--cwd", dir, "--write"]);
+  const settings = fs.readFileSync(path.join(dir, ".claude", "settings.json"), "utf8");
+  assert.ok(/xargs -I\{\}/.test(settings), "hooks use xargs -I{} (argument-safe; no word-splitting)");
+  assert.ok(!/xargs npx/.test(settings), "hooks must NOT use bare `xargs npx` which splits paths on whitespace");
+});
+
+test("init on a non-Claude project does not flip Claude detection on the next scan (Codex P2)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-bootstrap-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {} }));
+  // No CLAUDE.md and no .claude/ -> not a Claude Code project.
+  await runCli(["init", "--cwd", dir, "--write"]);
+  // init scaffolds .claude/commands/* unconditionally; a commands-only dir must
+  // NOT count as Claude Code configuration, or a fresh baseline fails its own
+  // newly-added hook checks on the next scan.
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  const guard = r.checks.find((c) => c.area === "Dangerous-command guard");
+  assert.ok(hooks && hooks.ok, "Agent hooks N/A — commands-only .claude/ is not a Claude project");
+  assert.ok(guard && guard.ok, "Dangerous-command guard N/A — commands-only .claude/ is not a Claude project");
+});
+
+test("Project facts MISS recommends docs, not a manifest (Codex P2 duplicate-key fix)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-promo-facts-"));
+  // Has a manifest but NO README/CLAUDE.md/AGENTS.md -> Project facts check fails (needs docs).
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {} }));
+  const report = analyzeForTest(dir);
+  const facts = report.checks.find((c) => c.area === "Project facts");
+  assert.ok(facts && !facts.ok, "Project facts MISS when no README/CLAUDE.md/AGENTS.md");
+  const rec = buildEvolutionPlan(report).recommendations.find((r) => r.area === "Project facts");
+  assert.ok(rec, "Project facts gap produces a recommendation");
+  assert.ok(/README|CLAUDE\.md/i.test(rec.action), `recommendation targets docs, got: ${rec.action}`);
+  assert.ok(!/manifest|package\.json|go\.mod|Cargo/i.test(rec.action), `must NOT recommend a manifest that already exists, got: ${rec.action}`);
 });

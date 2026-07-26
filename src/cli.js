@@ -102,6 +102,7 @@ function analyzeProject(cwd) {
   const ruleTrace = analyzeRuleTraceability(roots, allFiles, cwd);
   const hooks = detectHooksConfig(roots);
   const isClaude = isClaudeCodeProject(roots);
+  const hasFormatters = hasNodeFormatters(packageJson);
   const checks = [
     check(
       "Project facts",
@@ -178,16 +179,18 @@ function analyzeProject(cwd) {
     ),
     check(
       "Agent hooks",
-      !isClaude || (hooks.postToolUseLint && hooks.postToolUseFormat),
+      !isClaude || (hooks.postToolUseLint && hooks.postToolUseFormat) || !hasFormatters,
       !isClaude
-        ? "N/A — not a Claude Code project (no CLAUDE.md / .claude/). PostToolUse hooks apply to Claude Code; skip for Codex/Cursor/Copilot stacks."
-        : "Add .claude/settings.json hooks.PostToolUse on Edit|Write to run eslint + prettier -- format-on-save stops style drift and catches errors at edit time. (vca init --write scaffolds this.)",
+        ? "N/A — not a Claude Code project (no CLAUDE.md / .claude/settings*.json). PostToolUse hooks apply to Claude Code; skip for Codex/Cursor/Copilot stacks."
+        : !hasFormatters
+          ? "N/A — prettier + eslint not found in dependencies. Install them (npm i -D prettier eslint) then run `vca init --write` to scaffold edit-time lint+format hooks; omitted so non-Node stacks don't fail on every edit."
+          : "Add .claude/settings.json hooks.PostToolUse on Edit|Write to run eslint + prettier -- format-on-save stops style drift and catches errors at edit time. (vca init --write scaffolds this.)",
     ),
     check(
       "Dangerous-command guard",
       !isClaude || hooks.permissionsDeny,
       !isClaude
-        ? "N/A — not a Claude Code project (no CLAUDE.md / .claude/). permissions.deny is a Claude Code settings mechanism."
+        ? "N/A — not a Claude Code project (no CLAUDE.md / .claude/settings*.json). permissions.deny is a Claude Code settings mechanism."
         : "Add .claude/settings.local.json permissions.deny for irreversible commands (rm -rf, git push -f, git reset --hard, mkfs, dd, DROP TABLE) so agents cannot run them. (vca init --write scaffolds a default list.)",
     ),
     check(
@@ -760,12 +763,24 @@ function detectHooksConfig(roots) {
   return { postToolUseLint, postToolUseFormat, permissionsDeny };
 }
 
-/** A project is "Claude Code" when it ships CLAUDE.md or a .claude/ dir --
- * only then do we scaffold Claude-specific hooks/settings. */
+/** A project is "Claude Code" when it ships CLAUDE.md or a .claude/settings*.json
+ *  file. A bare `.claude/commands/` dir is NOT enough — `vca init` scaffolds those
+ *  slash commands for any stack, so counting them would make a fresh non-Claude
+ *  baseline fail its own newly-added hook checks on the next scan. */
 function isClaudeCodeProject(roots) {
   return roots.some((root) =>
     fs.existsSync(path.join(root, "CLAUDE.md")) ||
-    fs.existsSync(path.join(root, ".claude")));
+    fs.existsSync(path.join(root, ".claude", "settings.json")) ||
+    fs.existsSync(path.join(root, ".claude", "settings.local.json")));
+}
+
+/** Detect whether the project declares prettier + eslint as dependencies, so we
+ *  only scaffold Node edit-time hooks where they can actually run. Without this
+ *  gate, a Python/Go/Rust Claude project would invoke undeclared prettier/eslint
+ *  (via npx) on every Edit/Write. */
+function hasNodeFormatters(packageJson) {
+  const deps = { ...packageJson?.dependencies, ...packageJson?.devDependencies };
+  return Boolean(deps?.prettier) && Boolean(deps?.eslint);
 }
 
 /** DB projects get extra deny guards (DROP/TRUNCATE) since those are
@@ -806,16 +821,21 @@ function defaultDenyList(report) {
 }
 
 /** Claude Code settings.json with PostToolUse(Edit|Write) -> prettier + eslint.
- *  Format-on-save + lint-on-edit are the cheapest computational sensors. */
-function claudeHooksSettings() {
+ *  Format-on-save + lint-on-edit are the cheapest computational sensors.
+ *  Returns null when prettier/eslint aren't declared deps, so we never scaffold
+ *  Node hooks that would fail on every edit in a non-Node stack. Paths flow
+ *  through `xargs -I{}` so spaces/quotes in an edited file path survive intact
+ *  (bare `xargs` word-splits `docs/my file.md` into two targets). */
+function claudeHooksSettings(packageJson) {
+  if (!hasNodeFormatters(packageJson)) return null;
   const config = {
     hooks: {
       PostToolUse: [
         {
           matcher: "Edit|Write",
           hooks: [
-            { type: "command", command: "jq -r '.tool_input.file_path' | xargs npx prettier --write" },
-            { type: "command", command: "jq -r '.tool_input.file_path' | xargs npx eslint --no-warn-ignored" },
+            { type: "command", command: "jq -r '.tool_input.file_path' | xargs -I{} npx prettier --write {}" },
+            { type: "command", command: "jq -r '.tool_input.file_path' | xargs -I{} npx eslint --no-warn-ignored {}" },
           ],
         },
       ],
@@ -948,9 +968,13 @@ function buildInitFiles(report) {
   ];
   // Claude Code projects: scaffold PostToolUse lint+format hooks + a deny list
   // of irreversible commands. Skipped for non-Claude stacks (Codex/Cursor).
+  // Hooks (settings.json) are also gated on prettier+eslint being present so we
+  // don't break every edit in a non-Node stack. The deny list (settings.local.json)
+  // is tool-agnostic and valuable for any Claude project, so it is always emitted.
   if (isClaudeCodeProject(report.roots)) {
-    files.push(file(".claude/settings.json", claudeHooksSettings()));
-    files.push(file(".claude/settings.local.json", claudePermissionsLocal(report)));
+    files.push(file(".claude/settings.local.json", claudePermissionsLocal(report), mergePermissionsLocal));
+    const hooksContent = claudeHooksSettings(report.packageJson);
+    if (hooksContent) files.push(file(".claude/settings.json", hooksContent, mergeHooksSettings));
   }
   return files;
 }
@@ -958,7 +982,7 @@ function buildInitFiles(report) {
 const EVOLVE_PROMOTIONS = {
   "Project facts": { promoteTo: "README / CLAUDE.md", action: "Add a README or CLAUDE.md with architecture, setup, and validation commands." },
   "Agent instructions": { promoteTo: "AGENTS.md / CLAUDE.md rule", action: "Add AGENTS.md or CLAUDE.md so agents inherit stable project rules." },
-  "Single validation command": { promoteTo: "package script (ci/validate)", action: "Add an npm run ci/validate script that agents run before completion." },
+  "Single validation command": { promoteTo: "package script / Makefile target", action: "Add an npm run ci/validate script (or a Makefile ci/validate target) that agents run before completion." },
   "Typecheck": { promoteTo: "typecheck script", action: "Add a typecheck/lint script appropriate to the stack." },
   "Tests": { promoteTo: "regression test", action: "Add a failing test for the most recent bug, then make it pass." },
   "CI": { promoteTo: "CI workflow", action: "Add CI that runs the same local validation command on every push." },
@@ -968,9 +992,6 @@ const EVOLVE_PROMOTIONS = {
   "Architecture sensors": { promoteTo: "architecture validator", action: "Add a scripts/validate validator for rules that should not rely on memory." },
   "Agent hooks": { promoteTo: ".claude/settings.json PostToolUse hooks", action: "Add PostToolUse(Edit|Write) hooks running eslint + prettier so every edit is lint+format checked at edit time." },
   "Dangerous-command guard": { promoteTo: ".claude/settings.local.json deny list", action: "Add permissions.deny for irreversible commands (rm -rf, git push -f, git reset --hard, mkfs, dd, DROP TABLE)." },
-  "Project facts": { promoteTo: "package.json / go.mod / Cargo.toml", action: "Add a manifest declaring the project name, scripts, and dependencies so agents can reason about the stack." },
-  "Agent instructions": { promoteTo: "AGENTS.md / CLAUDE.md", action: "Add an AGENTS.md or CLAUDE.md with the stack, commands, and hard rules agents must follow." },
-  "Single validation command": { promoteTo: "scripts.ci / Makefile validate", action: "Add a single ci/validate script (or Makefile target) running typecheck + lint + test so agents and CI run the same check." },
   "Deploy hooks": { promoteTo: "deploy script / CI workflow", action: "Add a deploy/release script or .github/workflows/*.yml so deployments are repeatable and auditable." },
   "Rule sensors": { promoteTo: "test / validator / lint rule", action: "Back prose rules with a computational sensor (test, lint rule, or scripts/validator) so violations are caught, not just documented." },
   "Rules traceability": { promoteTo: "named test / validator per rule", action: "For each numbered rule no sensor references, add a test or validator whose name/path mentions the rule keyword." },
@@ -1068,35 +1089,111 @@ function buildEvolutionFiles(report, plan) {
     file(".claude/skills/project-evolution/SKILL.md", projectEvolutionSkill(name)),
   ];
   // evolve also backfills hooks + deny list when missing on Claude Code projects.
+  // When settings already exist (but lack the hook/deny entry), writeOrPreview
+  // MERGES the missing keys instead of skipping — otherwise the backfill this
+  // command advertises would be a no-op and the next scan would still MISS.
   if (isClaudeCodeProject(report.roots)) {
-    files.push(file(".claude/settings.json", claudeHooksSettings()));
-    files.push(file(".claude/settings.local.json", claudePermissionsLocal(report)));
+    files.push(file(".claude/settings.local.json", claudePermissionsLocal(report), mergePermissionsLocal));
+    const hooksContent = claudeHooksSettings(report.packageJson);
+    if (hooksContent) files.push(file(".claude/settings.json", hooksContent, mergeHooksSettings));
   }
   return files;
 }
 
-function file(relativePath, content) {
-  return { relativePath, content };
+function file(relativePath, content, merge) {
+  return { relativePath, content, merge };
+}
+
+/** Merge PostToolUse hooks into an existing settings.json without clobbering
+ *  unrelated user settings. Dedupes commands within the Edit|Write matcher.
+ *  Used as the `merge` strategy so `evolve --write` backfills hooks even when
+ *  settings.json already exists with user content. */
+function mergeHooksSettings(existingContent, incomingContent) {
+  const existing = JSON.parse(existingContent);
+  const incoming = JSON.parse(incomingContent);
+  existing.hooks ??= {};
+  existing.hooks.PostToolUse ??= [];
+  for (const entry of incoming.hooks?.PostToolUse || []) {
+    const matcher = entry.matcher || "";
+    const idx = existing.hooks.PostToolUse.findIndex((e) => (e.matcher || "") === matcher);
+    if (idx === -1) {
+      existing.hooks.PostToolUse.push(entry);
+    } else {
+      const cmds = new Set((existing.hooks.PostToolUse[idx].hooks || []).map((h) => h.command));
+      for (const h of entry.hooks || []) cmds.add(h.command);
+      existing.hooks.PostToolUse[idx].hooks = [...cmds].map((command) => ({ type: "command", command }));
+    }
+  }
+  return `${JSON.stringify(existing, null, 2)}\n`;
+}
+
+/** Merge the deny list into an existing settings.local.json without clobbering
+ *  existing allow/ask entries. Unions deny arrays, dedupes entries. */
+function mergePermissionsLocal(existingContent, incomingContent) {
+  const existing = JSON.parse(existingContent);
+  const incoming = JSON.parse(incomingContent);
+  existing.permissions ??= {};
+  existing.permissions.deny ??= [];
+  const set = new Set(existing.permissions.deny);
+  for (const d of incoming.permissions?.deny || []) set.add(d);
+  existing.permissions.deny = [...set];
+  return `${JSON.stringify(existing, null, 2)}\n`;
+}
+
+/** Wrap a merge strategy so an unparseable/partially-existing target file never
+ *  crashes the run; skip with a warning instead and let the user merge manually. */
+function safeMerge(mergeFn, existing, incoming, relativePath) {
+  try {
+    return mergeFn(existing, incoming);
+  } catch (err) {
+    console.warn(`  ! Skipped merge for ${relativePath}: existing file is not valid JSON or merge failed (${err.message}). Edit manually.`);
+    return null;
+  }
 }
 
 function writeOrPreview(cwd, files, write) {
-  const missing = files.filter(({ relativePath }) => !fs.existsSync(path.join(cwd, relativePath)));
-  if (!missing.length) {
+  const create = [];
+  const merge = [];
+  for (const item of files) {
+    const target = path.join(cwd, item.relativePath);
+    if (!fs.existsSync(target)) {
+      create.push(item);
+    } else if (typeof item.merge === "function") {
+      // File exists but may be missing the keys we backfill; merge instead of skip.
+      merge.push(item);
+    }
+    // else: exists and not mergeable -> intentionally leave the user's file alone.
+  }
+  if (!create.length && !merge.length) {
     console.log("\nNo missing harness files from this template set.");
     return;
   }
 
-  console.log(`\n${write ? "Writing" : "Would write"} ${missing.length} file(s):`);
-  for (const item of missing) {
-    console.log(`- ${item.relativePath}`);
-    if (write) {
-      const target = path.join(cwd, item.relativePath);
-      fs.mkdirSync(path.dirname(target), { recursive: true });
-      fs.writeFileSync(target, item.content);
+  if (create.length) {
+    console.log(`\n${write ? "Writing" : "Would write"} ${create.length} file(s):`);
+    for (const item of create) {
+      console.log(`- ${item.relativePath}`);
+      if (write) {
+        const target = path.join(cwd, item.relativePath);
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        fs.writeFileSync(target, item.content);
+      }
+    }
+  }
+  if (merge.length) {
+    console.log(`\n${write ? "Merging" : "Would merge"} into ${merge.length} existing file(s):`);
+    for (const item of merge) {
+      console.log(`- ${item.relativePath}`);
+      if (write) {
+        const target = path.join(cwd, item.relativePath);
+        const existing = fs.readFileSync(target, "utf8");
+        const merged = safeMerge(item.merge, existing, item.content, item.relativePath);
+        if (merged !== null) fs.writeFileSync(target, merged);
+      }
     }
   }
 
-  if (!write) console.log("\nRun again with --write to create these files.");
+  if (!write) console.log("\nRun again with --write to apply these changes.");
 }
 
 function agentInstructions(name, scripts, hasPackageJson = false, pm = "npm") {
