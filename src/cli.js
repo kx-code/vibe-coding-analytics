@@ -750,18 +750,44 @@ function readJson(filePath) {
  *  pass. Matches the same families that defaultDenyList scaffolds. */
 const DANGEROUS_DENY_PATTERN = /rm\s+-r|git\s+push.*(-f|force)|git\s+reset.*--hard|git\s+clean|mkfs|dd\s+if|drop\s+(table|database)|truncate|>\s*\/dev\/sd|curl.*\|\s*(sh|bash)|wget.*\|\s*(sh|bash)/i;
 
-/** A PostToolUse matcher "covers" Edit+Write when Claude Code would fire the
- *  hook on both tools. An empty/omitted matcher is a catch-all (matches every
- *  tool, including Edit and Write), so it covers both. A non-empty matcher must
- *  name both Edit and Write — in any order, possibly among other tools (e.g.
- *  `Write|Edit`, `Edit|Write|MultiEdit`). Used both to detect existing hooks
- *  (a catch-all entry is a valid lint+format setup, not a skip) and to dedupe
- *  semantically-equivalent matchers when merging (literal equality would miss
- *  `Write|Edit` and append a duplicate entry, running the formatter twice). */
+/** Split a Claude Code PostToolUse matcher into its individual tool-name
+ *  alternatives. A matcher is a literal tool name, an `|`-separated list
+ *  (`Edit|Write|MultiEdit`), or a regex (`/Edit|Write/i`). Empty/whitespace
+ *  means a catch-all (matches every tool). Returns [] for a catch-all so both
+ *  predicates below branch on it identically. */
+function matcherAlternatives(matcher) {
+  let m = String(matcher ?? "").trim();
+  if (m === "") return [];
+  if (m.startsWith("/") && m.length > 1) {
+    m = m.replace(/^\/(.+)\/[a-z]*$/, "$1");
+  }
+  return m.split("|").map((s) => s.trim()).filter(Boolean);
+}
+
+/** True when a PostToolUse matcher fires on BOTH the Edit and Write tools.
+ *  Used by DETECTION: a catch-all (empty) matcher covers everything, so it
+ *  honors a no-explicit-matcher lint+format setup rather than skipping it.
+ *  Alternatives are matched against the EXACT tool names — `NotebookEdit|Write`
+ *  has a `Write` exact alternative but no `Edit` exact alternative, so it does
+ *  NOT cover Edit. Substring matching would wrongly PASS (the "Edit" inside
+ *  "NotebookEdit" is not the Edit tool) and let the merge append formatter hooks
+ *  to an entry that never fires on Edit. */
 function matcherCoversEditWrite(matcher) {
-  const m = String(matcher || "").trim();
-  if (m === "") return true; // catch-all
-  return /Edit/i.test(m) && /Write/i.test(m);
+  const alts = matcherAlternatives(matcher);
+  if (alts.length === 0) return true; // catch-all
+  return alts.some((a) => /^edit$/i.test(a)) && alts.some((a) => /^write$/i.test(a));
+}
+
+/** True only for a NON-catch-all matcher that fires on both Edit and Write.
+ *  Used by MERGE: we append formatter hooks to an existing entry only when it
+ *  is scoped to edits. Appending to a catch-all would make prettier/eslint run
+ *  after Read (whose payload also carries file_path), mutating the working tree
+ *  on every file read. A catch-all is preserved untouched and a separate
+ *  Edit|Write entry is added instead. */
+function matcherIsEditWriteEntry(matcher) {
+  const alts = matcherAlternatives(matcher);
+  if (alts.length === 0) return false; // catch-all is never a merge target
+  return alts.some((a) => /^edit$/i.test(a)) && alts.some((a) => /^write$/i.test(a));
 }
 
 /** Detect Claude Code hooks + permission-guard config across project roots.
@@ -823,13 +849,57 @@ function hasNodeFormatters(packageJson) {
   return Boolean(deps?.prettier) && Boolean(deps?.eslint);
 }
 
-/** prettier/eslint may be declared in a nested package (workspace member or
- *  git submodule) rather than the root package.json. The analyzer otherwise
- *  scans nested roots, so the formatter check must too — otherwise a Claude
- *  Code subproject that has the deps but no hooks is classified N/A instead of
- *  MISS, and init/evolve never scaffold the advertised hooks for it. */
+/** Resolve the npm workspace `packages` globs (array form or
+ *  `{ packages: [...] }`) from a root manifest. Returns [] when the root is not
+ *  a workspace root. */
+function workspacePatterns(pkg) {
+  const w = pkg?.workspaces;
+  if (Array.isArray(w)) return w;
+  if (w && Array.isArray(w.packages)) return w.packages;
+  return [];
+}
+
+/** Read the manifests of npm workspace members under `root`. Supports the
+ *  common `dir/*` and `dir/**` patterns by listing each pattern's base
+ *  directory; a full glob engine is intentionally avoided to stay
+ *  dependency-free. Members are directories (skipping node_modules) that ship
+ *  their own package.json. */
+function readWorkspaceMemberPackages(root, pkg) {
+  const members = [];
+  for (const pat of workspacePatterns(pkg)) {
+    const base = String(pat ?? "").replace(/\/+\*+.*$/, "").trim();
+    if (!base) continue;
+    const dir = path.join(root, base);
+    let entries = [];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const e of entries) {
+      if (!e.isDirectory() || ["node_modules", ".git"].includes(e.name)) continue;
+      const memberPkg = readJson(path.join(dir, e.name, "package.json"));
+      if (memberPkg) members.push(memberPkg);
+    }
+  }
+  return members;
+}
+
+/** prettier/eslint may be declared in a nested package (npm workspace member
+ *  or git submodule) rather than the root package.json. The analyzer scans
+ *  nested roots (git submodules) and npm workspace members, so the formatter
+ *  check must too — otherwise a Claude Code subproject that has the deps but no
+ *  hooks is classified N/A instead of MISS, and init/evolve never scaffold the
+ *  advertised hooks for it. */
 function hasNodeFormattersAnywhere(roots) {
-  return roots.some((root) => hasNodeFormatters(readJson(path.join(root, "package.json"))));
+  for (const root of roots) {
+    const pkg = readJson(path.join(root, "package.json"));
+    if (hasNodeFormatters(pkg)) return true;
+    for (const memberPkg of readWorkspaceMemberPackages(root, pkg)) {
+      if (hasNodeFormatters(memberPkg)) return true;
+    }
+  }
+  return false;
 }
 
 /** DB projects get extra deny guards (DROP/TRUNCATE) since those are
@@ -1181,12 +1251,16 @@ function mergeHooksSettings(existingContent, incomingContent) {
   existing.hooks ??= {};
   existing.hooks.PostToolUse ??= [];
   for (const entry of incoming.hooks?.PostToolUse || []) {
-    // Identify an existing entry whose matcher already covers Edit+Write (incl.
-    // catch-all, `Write|Edit`, `Edit|Write|MultiEdit`) rather than by literal
-    // string equality. The scaffold always emits `Edit|Write`; exact comparison
-    // would miss a semantically-equivalent existing matcher and append a
-    // duplicate entry, so every edit would run the formatter and linter twice.
-    const idx = existing.hooks.PostToolUse.findIndex((e) => matcherCoversEditWrite(e.matcher));
+    // Identify an existing entry whose matcher is scoped to Edit+Write
+    // (`Write|Edit`, `Edit|Write|MultiEdit`) — NOT a catch-all — and merge into
+    // it rather than appending a duplicate. The scaffold always emits
+    // `Edit|Write`; exact comparison would miss a semantically-equivalent
+    // matcher and append a duplicate (running the formatter twice). A catch-all
+    // entry is deliberately excluded here: appending prettier/eslint to it would
+    // also fire after Read and rewrite the working tree on every file read, so
+    // a catch-all is preserved untouched and a separate Edit|Write entry is
+    // pushed below instead.
+    const idx = existing.hooks.PostToolUse.findIndex((e) => matcherIsEditWriteEntry(e.matcher));
     if (idx === -1) {
       existing.hooks.PostToolUse.push(entry);
     } else {

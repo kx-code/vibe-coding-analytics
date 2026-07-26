@@ -1695,3 +1695,84 @@ test("Project facts MISS recommends docs, not a manifest (Codex P2 duplicate-key
   assert.ok(/README|CLAUDE\.md/i.test(rec.action), `recommendation targets docs, got: ${rec.action}`);
   assert.ok(!/manifest|package\.json|go\.mod|Cargo/i.test(rec.action), `must NOT recommend a manifest that already exists, got: ${rec.action}`);
 });
+
+// ---- Codex round 7: catch-all merge isolation, exact tool-name matching, workspace formatters ----
+
+test("evolve --write keeps a catch-all PostToolUse entry scoped away from formatter hooks and adds a separate Edit|Write entry (Codex P1)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-merge-catchall-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {}, devDependencies: { prettier: "*", eslint: "*" } }));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  // Existing entry has NO matcher (catch-all) running an unrelated command.
+  // Appending prettier/eslint to it would fire after Read too (whose payload
+  // carries file_path), rewriting the working tree on every file read.
+  fs.writeFileSync(
+    path.join(dir, ".claude", "settings.json"),
+    JSON.stringify({
+      hooks: { PostToolUse: [{ hooks: [{ type: "command", command: "echo read-side-effect" }] }] },
+    }),
+  );
+  await runCli(["evolve", "--cwd", dir, "--write"]);
+  const merged = JSON.parse(fs.readFileSync(path.join(dir, ".claude", "settings.json"), "utf8"));
+  const entries = merged.hooks?.PostToolUse || [];
+  const catchAll = entries.find((e) => String(e.matcher ?? "").trim() === "");
+  const editWrite = entries.find((e) => String(e.matcher ?? "").trim() === "Edit|Write");
+  assert.ok(catchAll, "catch-all entry preserved");
+  const catchAllCmds = (catchAll.hooks || []).map((h) => h.command);
+  assert.deepEqual(catchAllCmds, ["echo read-side-effect"], "catch-all entry hooks untouched (no prettier/eslint appended)");
+  assert.ok(editWrite, "a separate Edit|Write entry is added");
+  const editWriteCmds = (editWrite.hooks || []).map((h) => h.command).join("\n");
+  assert.ok(/prettier/.test(editWriteCmds) && /eslint/.test(editWriteCmds), "Edit|Write entry carries the formatter hooks");
+});
+
+test("Agent hooks MISS for NotebookEdit|Write (exact tool-name match, not substring) and the entry is not a merge target (Codex P2)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-exact-tools-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {}, devDependencies: { prettier: "*", eslint: "*" } }));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  // "NotebookEdit" contains the substring "Edit" but is NOT the Edit tool, so a
+  // matcher of NotebookEdit|Write must NOT count as Edit+Write coverage.
+  fs.writeFileSync(
+    path.join(dir, ".claude", "settings.json"),
+    JSON.stringify({
+      hooks: { PostToolUse: [{ matcher: "NotebookEdit|Write", hooks: [
+        { type: "command", command: "npx prettier --write" },
+        { type: "command", command: "npx eslint" },
+      ] }] },
+    }),
+  );
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  assert.equal(hooks.na, false, "formatters present -> Agent hooks is NOT N/A");
+  assert.equal(hooks.ok, false, "NotebookEdit|Write does not cover Edit -> Agent hooks MISS (was wrongly PASS under substring matching)");
+  // And the merge path must not append formatter hooks to the NotebookEdit|Write entry.
+  await runCli(["evolve", "--cwd", dir, "--write"]);
+  const merged = JSON.parse(fs.readFileSync(path.join(dir, ".claude", "settings.json"), "utf8"));
+  const nbEntry = (merged.hooks?.PostToolUse || []).find((e) => e.matcher === "NotebookEdit|Write");
+  assert.ok(nbEntry, "NotebookEdit|Write entry preserved");
+  const nbCmds = (nbEntry.hooks || []).map((h) => h.command);
+  assert.equal(nbCmds.length, 2, "NotebookEdit|Write entry hooks untouched (not treated as an Edit+Write merge target)");
+});
+
+test("Agent hooks MISS (not N/A) and init scaffolds hooks when formatters live only in an npm workspace member (Codex P2)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-fmt-workspace-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  // Root manifest declares workspaces but NO prettier/eslint itself.
+  fs.writeFileSync(
+    path.join(dir, "package.json"),
+    JSON.stringify({ name: "root", scripts: {}, workspaces: ["packages/*"] }),
+  );
+  // A workspace member (not a git submodule) declares them.
+  fs.mkdirSync(path.join(dir, "packages", "ui"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, "packages", "ui", "package.json"),
+    JSON.stringify({ name: "ui", devDependencies: { prettier: "*", eslint: "*" } }),
+  );
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  assert.ok(hooks, "Agent hooks check present");
+  assert.equal(hooks.na, false, "formatters present in a workspace member -> Agent hooks is NOT N/A");
+  assert.equal(hooks.ok, false, "no hooks wired -> Agent hooks MISS (was wrongly N/A when only root package.json was inspected)");
+  await runCli(["init", "--cwd", dir, "--write"]);
+  assert.equal(fs.existsSync(path.join(dir, ".claude", "settings.json")), true, "init scaffolds settings.json when formatters are in a workspace member");
+});
