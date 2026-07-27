@@ -1338,14 +1338,126 @@ test("evolve --write backfills the /steer command", async () => {
 
 // ---- 3 polish: curl|sh deny + scan one-click fix hint ----
 
-test("deny list blocks remote-execution pipes (curl|sh / wget|bash)", async () => {
+test("deny list blocks remote-execution pipes incl. compact curl|sh (Codex P1 #3657507768)", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-deny-rce-"));
   fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {} }));
   fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
   await runCli(["init", "--cwd", dir, "--write"]);
   const local = fs.readFileSync(path.join(dir, ".claude", "settings.local.json"), "utf8");
-  assert.ok(/curl \* \| sh/.test(local), "deny list includes curl|sh");
-  assert.ok(/wget \* \| bash/.test(local), "deny list includes wget|bash");
+  // Claude Code treats the space in a Bash pattern as LITERAL, so the old
+  // `curl * | sh` (space on both sides of `|`) is bypassed by the compact
+  // `curl http://x|sh` (no spaces). The deny list must emit the compact
+  // `*|sh` / `*| sh` forms to actually close the bypass.
+  assert.ok(/Bash\(curl \*\|sh\)/.test(local), "compact curl|sh (no space before pipe)");
+  assert.ok(/Bash\(curl \*\| sh\)/.test(local), "curl| sh (space after pipe)");
+  assert.ok(/Bash\(wget \*\|bash\)/.test(local), "compact wget|bash");
+  assert.ok(/Bash\(wget \*\| bash\)/.test(local), "wget| bash");
+  // The spacing-fragile old form is replaced; it must no longer be the only
+  // representation, otherwise the compact one-token `URL|sh` slips through.
+  assert.ok(!/curl \* \| sh/.test(local), "spacing-fragile `curl * | sh` replaced by compact forms");
+});
+
+// ---- Codex review round: brace workspaces, prefix-exec format, merge scope ----
+
+test("brace-expanded workspace members contribute formatters (Codex P2 #3657507789)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-brace-ws-"));
+  fs.writeFileSync(
+    path.join(dir, "package.json"),
+    JSON.stringify({
+      name: "root",
+      // `{packages,apps}/*` must expand to BOTH alternatives; treating it as a
+      // literal dir named `{packages,apps}` hides every member, so a member-only
+      // prettier/eslint is missed and Agent hooks is wrongly reported N/A.
+      workspaces: ["{packages,apps}/*"],
+      devDependencies: {},
+    }),
+  );
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# root\n");
+  fs.mkdirSync(path.join(dir, "packages", "lib"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, "packages", "lib", "package.json"),
+    JSON.stringify({ name: "lib", devDependencies: { prettier: "*" } }),
+  );
+  fs.mkdirSync(path.join(dir, "apps", "web"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, "apps", "web", "package.json"),
+    JSON.stringify({ name: "web", devDependencies: { eslint: "*" } }),
+  );
+  const report = analyzeForTest(dir);
+  const hooks = report.checks.find((c) => c.area === "Agent hooks");
+  assert.ok(hooks, "Agent hooks check present");
+  assert.ok(!hooks.na, "brace-expanded members {packages,apps}/* are detected -> not N/A");
+});
+
+test("format-on-save not credited for `npm --prefix <dir> exec prettier` w/o --write (Codex P2 #3657507803)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-pm-prefix-exec-"));
+  fs.writeFileSync(
+    path.join(dir, "package.json"),
+    JSON.stringify({ name: "demo", scripts: {}, devDependencies: { prettier: "*", eslint: "*" } }),
+  );
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, ".claude", "settings.json"),
+    JSON.stringify({
+      hooks: {
+        PostToolUse: [
+          {
+            matcher: "Edit|Write",
+            hooks: [
+              { type: "command", command: "eslint --fix ." },
+              // prettier reached via `npm --prefix <dir> exec` with NO --write.
+              // The old option-skipper stopped at the --prefix VALUE, so the
+              // `(?!exec)` lookahead never saw `exec`, the regex matched, the
+              // body resolved opaque, and the name heuristic trusted `prettier`
+              // -> format-on-save false-PASSed. prettier prints to stdout without
+              // --write, so it must NOT satisfy the format promise.
+              { type: "command", command: "npm --prefix packages/a exec prettier ." },
+            ],
+          },
+        ],
+      },
+    }, null, 2),
+  );
+  const report = analyzeForTest(dir);
+  const hooks = report.checks.find((c) => c.area === "Agent hooks");
+  assert.ok(hooks, "Agent hooks check present");
+  assert.ok(!hooks.na, "project has formatters -> not N/A");
+  assert.ok(!hooks.ok, "`npm --prefix ... exec prettier` without --write must NOT satisfy format-on-save");
+});
+
+test("evolve --write does not broaden a Write-only scaffold into an Edit|Write entry (Codex P2 #3657507781)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-merge-scope-"));
+  fs.writeFileSync(
+    path.join(dir, "package.json"),
+    JSON.stringify({ name: "demo", scripts: {}, devDependencies: { prettier: "*", eslint: "*" } }),
+  );
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  // Existing: Edit runs prettier (format), Edit|Write runs eslint (lint). Write
+  // lacks a formatter, so the scaffold backfills a Write-only prettier entry.
+  // Merging that into the Edit|Write entry would make Edit run TWO writers.
+  fs.writeFileSync(
+    path.join(dir, ".claude", "settings.json"),
+    JSON.stringify({
+      hooks: {
+        PostToolUse: [
+          { matcher: "Edit", hooks: [{ type: "command", command: "prettier --write ." }] },
+          { matcher: "Edit|Write", hooks: [{ type: "command", command: "eslint --fix ." }] },
+        ],
+      },
+    }, null, 2),
+  );
+  await runCli(["evolve", "--cwd", dir, "--write"]);
+  const merged = JSON.parse(fs.readFileSync(path.join(dir, ".claude", "settings.json"), "utf8"));
+  const entries = merged.hooks.PostToolUse;
+  const editWriteEntry = entries.find((e) => e.matcher === "Edit|Write");
+  assert.ok(editWriteEntry, "Edit|Write entry preserved");
+  const editWriteHasFormat = editWriteEntry.hooks.some((h) => /prettier/.test(h?.command || ""));
+  assert.ok(!editWriteHasFormat, "Edit|Write entry must NOT gain a formatter (Edit would run two writers)");
+  const writeEntry = entries.find((e) => e.matcher === "Write");
+  assert.ok(writeEntry, "a dedicated Write formatter entry is appended, not merged into Edit|Write");
+  assert.ok(writeEntry.hooks.some((h) => /prettier/.test(h?.command || "")), "Write entry carries the prettier writer");
 });
 
 test("printReport prints a one-click fix hint when checks MISS", () => {
@@ -1891,14 +2003,20 @@ test("evolve --write splits a partially-covered tool by purpose, not an Edit|Wri
   for (const e of combinedEntries) {
     assert.notEqual(e.matcher, "Edit|Write", "combined prettier&&eslint must not fire on Edit|Write (would double-run prettier on Edit)");
   }
-  // Edit's gap is lint ONLY, so its scaffolded command must be eslint WITHOUT
-  // prettier (Edit already has a formatter).
-  const editScaffold = entries.find((e) =>
-    (e.matcher || "") === "Edit" && (e.hooks || []).some((h) => /eslint/.test(h?.command || "")),
+  // Edit's gap is lint ONLY. The scaffold backfills eslint on Edit and must NOT
+  // add a SECOND prettier (Edit already has a writer — two would race). Whether
+  // the eslint command is merged into the existing Edit entry (same scope) or
+  // appended as its own Edit entry, the invariant is the same: Edit ends up with
+  // exactly ONE writer plus an eslint command, and never the combined
+  // prettier&&eslint form (which would double-run the writer on Edit).
+  const editHooks = entries.filter((e) => (e.matcher || "") === "Edit").flatMap((e) => e.hooks || []);
+  assert.ok(editHooks.some((h) => /eslint/.test(h?.command || "")), "Edit gap (lint) scaffolded as eslint");
+  const prettierWriters = editHooks.filter((h) => /prettier/.test(h?.command || ""));
+  assert.equal(prettierWriters.length, 1, "Edit has exactly one writer (no redundant scaffolded prettier)");
+  assert.ok(
+    !editHooks.some((h) => /prettier/.test(h?.command || "") && /eslint/.test(h?.command || "")),
+    "no combined prettier&&eslint on Edit (would double-run the writer)",
   );
-  assert.ok(editScaffold, "Edit gap (lint) scaffolded as eslint-only");
-  const editCmds = (editScaffold.hooks || []).map((h) => h?.command || "").join(" ");
-  assert.ok(!/prettier/.test(editCmds), "Edit scaffold carries eslint only — no redundant prettier");
   // Write needs BOTH purposes: it gets the combined command on its own matcher.
   const writeEntry = entries.find((e) => (e.matcher || "") === "Write");
   assert.ok(writeEntry, "Write scaffolded (needs both purposes)");

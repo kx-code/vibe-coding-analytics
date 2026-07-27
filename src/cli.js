@@ -1031,13 +1031,35 @@ const FORMAT_WRITE_RE = /(?:--write|--fix)\b/;
 // check-only formatter. `(?:--?\S+\s+)*` consumes leading option flags so the
 // lookahead still reaches `exec`/`dlx`, excludes the command, and routes it to
 // the direct-binary classifier (segmentExecutes), which requires `--write`
-// (Codex P2 #3656758667). `([^\s-]\S*)` captures the first token as the script
-// name; it must NOT begin with `-` (a script name never does), otherwise the
-// `*` group backtracks to ZERO iterations and the capture grabs the option flag
-// itself (`--silent`), re-enabling the opaque false-PASS the skip was meant to
-// prevent. JavaScript lacks possessive quantifiers, so the non-dash first char
-// is what makes the skip non-backtracking in practice.
-const PM_SCRIPT_RE = /\b(?:npm|pnpm|yarn|bun)\s+(?:--?\S+\s+)*(?:run\s+)?(?!exec\b|dlx\b)([^\s-]\S*)/;
+// (Codex P2 #3656758667). Value-consuming options (`--workspace`/`-w`/`--filter`/
+// `--prefix`/`-C`/`--dir`) take a following VALUE token, so the skipper must
+// consume BOTH the flag and its value — otherwise `npm --prefix packages/a exec
+// prettier .` stops the skip at the value `packages/a`, the lookahead sees the
+// value (not `exec`), the regex matches, and the command is routed into script
+// resolution: "exec" is absent from the scripts map → opaque → the name heuristic
+// trusts a bare `prettier` and false-PASSes format-on-save (#3657507803). The
+// skipper tries the (flag+value) pair for the known value options first, then the
+// generic single-flag fallback for boolean options like `--silent`.
+// ANTI-BACKTRACKING (two parts):
+//  1) The trailing `\s+` sits OUTSIDE the alternation so EACH skipped option must
+//     be a COMPLETE whitespace-terminated token. A value like `packages/a` is
+//     consumed whole because `\S+`'s partial backtracks (`packages/`, leaving `a`)
+//     are rejected — none is followed by the `\s+` this iteration requires.
+//  2) The boolean fallback must NOT swallow a value-option FLAG alone (leaving
+//     its value dangling as the captured "script"). It carries a negative
+//     lookahead for the value-option names AND starts its name with `[^\s-]`, so
+//     `--prefix` is rejected by the lookahead and `--?` cannot backtrack to a
+//     single dash to match a double-dash flag (the char after one dash is `-`,
+//     which `[^\s-]` forbids). Together these force `--prefix <val>` to be skipped
+//     as a unit or not at all.
+// (Emulating possessive matching; JS has no atomic groups.)
+// `([^\s-]\S*)` captures the first token as the script name; it must NOT begin
+// with `-` (a script name never does), otherwise the `*` group backtracks to ZERO
+// iterations and the capture grabs the option flag itself (`--silent`),
+// re-enabling the opaque false-PASS the skip was meant to prevent. JavaScript
+// lacks possessive quantifiers, so the non-dash first char is what makes the skip
+// non-backtracking in practice.
+const PM_SCRIPT_RE = /\b(?:npm|pnpm|yarn|bun)\s+(?:(?:--?(?:workspace|w|filter|prefix|C|dir)(?:=\S+|\s+\S+)|--?(?!workspace\b|w\b|filter\b|prefix\b|C\b|dir\b)[^\s-]\S*)\s+)*(?:run\s+)?(?!exec\b|dlx\b)([^\s-]\S*)/;
 // Global-flagged regex matching a FULL PM invocation span — the keyword plus
 // every non-operator token up to the next shell operator (&& || ; |) or end of
 // string — for inline substitution in a script body (resolveScriptBody).
@@ -1481,6 +1503,31 @@ function workspacePatterns(pkg) {
   return [];
 }
 
+/** Expand brace alternatives in a workspace glob so `{packages,apps}/*` resolves
+ *  to BOTH `packages/*` and `apps/*` instead of being treated as a literal
+ *  directory named `{packages,apps}`. npm (via its glob library) performs brace
+ *  expansion on workspace patterns; without it, members under each alternative
+ *  are invisible to readWorkspaceMemberPackages, a member-only
+ *  prettier/eslint dependency is missed, and Agent hooks are wrongly reported
+ *  N/A. Handles nested/multiple braces via recursion (cartesian product). Only
+ *  the common comma-list form is expanded — ranges (`{1..5}`) and escaping are
+ *  not used in real workspace declarations. (Codex P2 #3657507789) */
+function expandBraces(pattern) {
+  const s = String(pattern ?? "");
+  const start = s.indexOf("{");
+  if (start === -1) return [s];
+  const end = s.indexOf("}", start);
+  if (end === -1) return [s]; // unmatched brace: leave literal, do not drop it
+  const prefix = s.slice(0, start);
+  const body = s.slice(start + 1, end);
+  const suffix = s.slice(end + 1);
+  const out = [];
+  for (const opt of body.split(",")) {
+    for (const expanded of expandBraces(`${prefix}${opt}${suffix}`)) out.push(expanded);
+  }
+  return out;
+}
+
 /** Immediate subdirectories of `dir`, skipping node_modules/.git. */
 function listChildDirs(dir) {
   try {
@@ -1598,11 +1645,13 @@ function readWorkspaceMemberPackages(root, pkg) {
   const members = [];
   const patterns = [...workspacePatterns(pkg), ...pnpmWorkspacePatterns(root)];
   for (const pat of patterns) {
-    const p = String(pat ?? "").trim();
-    if (!p) continue;
-    for (const dir of resolveWorkspacePattern(root, p)) {
-      const memberPkg = readJson(path.join(dir, "package.json"));
-      if (memberPkg) members.push(memberPkg);
+    for (const p of expandBraces(pat)) {
+      const t = p.trim();
+      if (!t) continue;
+      for (const dir of resolveWorkspacePattern(root, t)) {
+        const memberPkg = readJson(path.join(dir, "package.json"));
+        if (memberPkg) members.push(memberPkg);
+      }
     }
   }
   return members;
@@ -1803,10 +1852,23 @@ function defaultDenyList(report) {
     "Bash(dd * of=/dev/:*)",
     "Bash(> /dev/sd:*)",
     "Bash(:> *)",
-    "Bash(curl * | sh)",
-    "Bash(curl * | bash)",
-    "Bash(wget * | sh)",
-    "Bash(wget * | bash)",
+    // Pipe-to-shell download-and-execute. Claude Code treats the space in a Bash
+    // pattern as LITERAL, and `*` as the only wildcard — so `curl * | sh` requires
+    // a space on BOTH sides of `|`. The compact `curl http://x|sh` (no spaces) and
+    // `curl http://x |sh` (one space) bypass it, defeating the deny entry. The
+    // detector regex (DANGEROUS_CMD_RE) is spacing-insensitive via `\s*`, but the
+    // SCAFFOLDED deny list is what actually protects the user. Emit both forms per
+    // source×shell: `*|sh` also covers `X |sh` (`*` eats the trailing space) and
+    // `*| sh` also covers `X | sh` (same), so 8 entries close all four spacings.
+    // (Codex P1 #3657507768)
+    "Bash(curl *|sh)",
+    "Bash(curl *| sh)",
+    "Bash(curl *|bash)",
+    "Bash(curl *| bash)",
+    "Bash(wget *|sh)",
+    "Bash(wget *| sh)",
+    "Bash(wget *|bash)",
+    "Bash(wget *| bash)",
   ];
   if (isDbProject(report)) {
     deny.push(
@@ -2256,16 +2318,20 @@ function mergeHooksSettings(existingContent, incomingContent, scripts, workspace
   existing.hooks ??= {};
   existing.hooks.PostToolUse ??= [];
   for (const entry of incoming.hooks?.PostToolUse || []) {
-    // Identify an existing entry whose matcher is scoped to Edit+Write
-    // (`Write|Edit`, `Edit|Write|MultiEdit`) — NOT a catch-all — and merge into
-    // it rather than appending a duplicate. The scaffold always emits
-    // `Edit|Write`; exact comparison would miss a semantically-equivalent
-    // matcher and append a duplicate (running the formatter twice). A catch-all
-    // entry is deliberately excluded here: appending prettier/eslint to it would
-    // also fire after Read and rewrite the working tree on every file read, so
-    // a catch-all is preserved untouched and a separate Edit|Write entry is
-    // pushed below instead.
-    const idx = existing.hooks.PostToolUse.findIndex((e) => matcherIsEditWriteEntry(e.matcher));
+    // Merge into an existing entry only when the scopes are COMPATIBLE. The
+    // scaffold can emit a NARROWER matcher (e.g. "Write" alone) when one tool
+    // already has a purpose; merging that into a broader Edit|Write entry would
+    // broaden the scope so the OTHER tool (Edit) runs the new hook too — e.g. an
+    // existing Edit-only formatter + an Edit|Write linter, with the scaffold
+    // backfilling a Write formatter, would have it merged into Edit|Write and
+    // Edit would then run two formatters in parallel. A broad Edit|Write incoming
+    // entry still merges into a matching Edit|Write existing entry (dedup); a
+    // narrower incoming entry merges only into an existing entry of the SAME
+    // scope, else is appended untouched. (Codex P2 #3657507781)
+    const incomingEditWrite = matcherIsEditWriteEntry(entry.matcher);
+    const idx = existing.hooks.PostToolUse.findIndex((e) =>
+      incomingEditWrite ? matcherIsEditWriteEntry(e.matcher) : (e.matcher || "") === (entry.matcher || ""),
+    );
     if (idx === -1) {
       existing.hooks.PostToolUse.push(entry);
     } else {
