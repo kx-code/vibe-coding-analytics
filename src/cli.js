@@ -1336,8 +1336,13 @@ function detectHooksConfig(roots, scripts, workspaceScripts) {
   const primary = roots?.[0];
   const settings = primary ? readJson(path.join(primary, ".claude", "settings.json")) : null;
   const local = primary ? readJson(path.join(primary, ".claude", "settings.local.json")) : null;
-  let postToolUseLint = false;
-  let postToolUseFormat = false;
+  // Track per-tool purpose coverage so SEPARATE PostToolUse entries — one
+  // matcher=Edit, another matcher=Write, each running lint+format — aggregate
+  // correctly: both tools end up covered, instead of each entry being discarded
+  // because its matcher covers only one tool (Codex P2 #3656618931). A purpose
+  // is satisfied only when BOTH Edit and Write carry it, preserving the old
+  // single-entry "matcher covers Edit|Write" semantics for the combined case.
+  let editLint = false, writeLint = false, editFormat = false, writeFormat = false;
   let permissionsDeny = false;
   // PostToolUse hooks and permissions.deny may each live in the shared
   // settings.json OR the gitignored settings.local.json — both are supported
@@ -1348,22 +1353,33 @@ function detectHooksConfig(roots, scripts, workspaceScripts) {
     const postTool = file?.hooks?.PostToolUse;
     const entries = Array.isArray(postTool) ? postTool : postTool ? [postTool] : [];
     for (const entry of entries) {
-      // The matcher must cover BOTH Edit and Write. matcherCoversEditWrite
-      // treats an empty matcher as a catch-all (it fires on every tool), so a
-      // valid lint+format setup with no explicit matcher is honored rather
-      // than skipped — which would falsely report Agent hooks as MISS.
-      if (!matcherCoversEditWrite(entry?.matcher)) continue;
+      const firesEdit = matcherFiresOn(entry?.matcher, "Edit");
+      const firesWrite = matcherFiresOn(entry?.matcher, "Write");
+      // Skip a matcher that fires on NEITHER edit tool (e.g. WebFetch) — it
+      // carries no edit-time coverage. An empty matcher is a catch-all (fires on
+      // every tool), honoring a no-explicit-matcher lint+format setup.
+      if (!firesEdit && !firesWrite) continue;
       // Classify each hook command individually (not the joined blob): a single
       // wide matcher entry may carry a lint hook AND a format hook, and a
       // quoted status echo inside one command must not flip the other purpose.
+      const purposes = new Set();
       for (const h of entry.hooks || []) {
         for (const purpose of commandPurposes(h?.command, scripts, workspaceScripts)) {
-          if (purpose === "lint") postToolUseLint = true;
-          else if (purpose === "format") postToolUseFormat = true;
+          purposes.add(purpose);
         }
+      }
+      if (firesEdit) {
+        if (purposes.has("lint")) editLint = true;
+        if (purposes.has("format")) editFormat = true;
+      }
+      if (firesWrite) {
+        if (purposes.has("lint")) writeLint = true;
+        if (purposes.has("format")) writeFormat = true;
       }
     }
   }
+  const postToolUseLint = editLint && writeLint;
+  const postToolUseFormat = editFormat && writeFormat;
   for (const denyList of [settings?.permissions?.deny, local?.permissions?.deny]) {
     if (Array.isArray(denyList) && denyList.some((d) => denyEntryBlocksDangerousCommand(d))) {
       permissionsDeny = true;
@@ -1999,9 +2015,21 @@ function detectPackageManager(cwd, packageJson) {
     if (pm === "npm" || pm === "pnpm" || pm === "yarn" || pm === "bun") return pm;
   }
   // Walk up the directory tree so a workspace subdirectory inherits the
-  // package manager declared by the workspace root lockfile.
+  // package manager declared by the workspace root. The cwd manifest was already
+  // checked via the packageJson argument above; for ANCESTOR directories also
+  // consult their package.json `packageManager` field — a Yarn Berry/PnP root may
+  // declare it without a lockfile at every level, and without this lookup the
+  // member falls back to npm and generates `npx` hooks that cannot resolve PnP
+  // dependencies. (Codex P2 #3656618937)
   let dir = cwd;
   while (true) {
+    if (dir !== cwd) {
+      const ancestorPkg = readJson(path.join(dir, "package.json"));
+      if (ancestorPkg && ancestorPkg.packageManager) {
+        const pm = String(ancestorPkg.packageManager).split("@")[0].trim();
+        if (pm === "npm" || pm === "pnpm" || pm === "yarn" || pm === "bun") return pm;
+      }
+    }
     try {
       if (fs.existsSync(path.join(dir, "package-lock.json"))) return "npm";
       if (fs.existsSync(path.join(dir, "pnpm-lock.yaml"))) return "pnpm";

@@ -814,6 +814,21 @@ test("init honors local package-lock.json over ancestor pnpm workspace", async (
   assert.ok(/- Install: npm install/.test(agents), "local package-lock.json (npm) wins over ancestor pnpm");
 });
 
+test("init detects ancestor packageManager field when no lockfile is present (Codex P2 #3656618937)", async () => {
+  // A Yarn Berry/PnP root declares `packageManager` in its manifest WITHOUT a
+  // lockfile at every level. A member package with no lockfile of its own must
+  // inherit yarn from the root package.json field (walking up), instead of
+  // falling back to npm and generating `npx` hooks that cannot resolve PnP deps.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "vca-pm-anc-"));
+  fs.writeFileSync(path.join(root, "package.json"), JSON.stringify({ name: "ws-root", private: true, packageManager: "yarn@3.0.0" }));
+  const sub = path.join(root, "packages", "foo");
+  fs.mkdirSync(sub, { recursive: true });
+  fs.writeFileSync(path.join(sub, "package.json"), JSON.stringify({ name: "foo", scripts: { dev: "vite" } }));
+  await runCli(["init", "--cwd", sub, "--write"]);
+  const agents = fs.readFileSync(path.join(sub, "AGENTS.md"), "utf8");
+  assert.ok(/- Install: yarn install/.test(agents), "ancestor packageManager=yarn detected without any lockfile");
+});
+
 test("analytics PASS Steering loop with 5+ numbered rules", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-sl1-"));
   fs.writeFileSync(path.join(dir, "CLAUDE.md"), "规则 1 a\n规则 2 b\n规则 3 c\n规则 4 d\n规则 5 e\n");
@@ -1685,6 +1700,39 @@ test("Agent hooks PASS when PostToolUse matcher is a catch-all (omitted/empty) (
   const r = analyzeForTest(dir);
   const hooks = r.checks.find((c) => c.area === "Agent hooks");
   assert.ok(hooks && hooks.ok, "catch-all (empty matcher) PostToolUse with eslint+prettier must PASS");
+});
+
+test("Agent hooks PASS when Edit and Write are covered by SEPARATE PostToolUse entries (Codex P2 #3656618931)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-hooks-split-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.writeFileSync(
+    path.join(dir, "package.json"),
+    JSON.stringify({ name: "x", devDependencies: { prettier: "*", eslint: "*" } }),
+  );
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  // Two separate PostToolUse entries — one matcher=Edit, another matcher=Write,
+  // each running both prettier and eslint. Per-tool aggregation must see BOTH
+  // tools covered (editLint&&writeLint, editFormat&&writeFormat); the old single-
+  // matcher-per-entry logic discarded each entry (its matcher covered only one
+  // tool) and falsely reported MISS.
+  fs.writeFileSync(
+    path.join(dir, ".claude", "settings.json"),
+    JSON.stringify({
+      hooks: { PostToolUse: [
+        { matcher: "Edit", hooks: [
+          { type: "command", command: "npx prettier --write" },
+          { type: "command", command: "npx eslint" },
+        ] },
+        { matcher: "Write", hooks: [
+          { type: "command", command: "npx prettier --write" },
+          { type: "command", command: "npx eslint" },
+        ] },
+      ] },
+    }),
+  );
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  assert.ok(hooks && hooks.ok, "split Edit/Write PostToolUse entries must aggregate to PASS");
 });
 
 test("evolve --write merges into a semantically-equivalent matcher (Write|Edit), no duplicate entry (Codex P2)", async () => {
