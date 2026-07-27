@@ -802,8 +802,12 @@ function denyEntryBlocksDangerousCommand(entry) {
   const m = String(entry).trim().match(/^Bash\(([^)]*)\)$/);
   if (!m) return false;
   let cmd = m[1];
-  const colon = cmd.indexOf(":");
-  if (colon !== -1) cmd = cmd.slice(0, colon);
+  // Claude Code's argument qualifier is a trailing `:*` (e.g. `Bash(rm -rf:*)`).
+  // Strip ONLY that suffix. Slicing at the first colon truncates commands that
+  // legitimately contain colons — a URL in `Bash(curl https://x/install.sh |
+  // sh)` became `curl https`, so the remote-exec pattern never matched and the
+  // guard was falsely reported missing.
+  if (cmd.endsWith(":*")) cmd = cmd.slice(0, -2);
   return DANGEROUS_CMD_RE.test(cmd);
 }
 
@@ -1166,8 +1170,17 @@ function isDbProject(report) {
   const paths = [...report.files].join("\n").toLowerCase();
   const dbFileSignals = ["prisma/schema", "drizzle", "knexfile", "migrations/", "schema.sql", "/supabase/"];
   if (dbFileSignals.some((sig) => paths.includes(sig))) return true;
+  // Match the STANDARD published package names. The old keys (`drizzle`,
+  // `prisma`) were nonstandard: `drizzle` is not a real package (the ORM is
+  // `drizzle-orm`), and a project depending on `@prisma/client` alone (no `prisma`
+  // CLI devDep) was misclassified as non-database and skipped the SQL guards.
   const deps = { ...report.packageJson?.dependencies, ...report.packageJson?.devDependencies };
-  return Boolean(deps?.prisma || deps?.drizzle || deps?.knex || deps?.typeorm || deps?.sequelize);
+  const DB_DEP_NAMES = [
+    "prisma", "@prisma/client", // Prisma: CLI devDep + runtime client
+    "drizzle-orm", "drizzle-kit", // Drizzle: ORM + migration toolkit
+    "knex", "typeorm", "sequelize", // SQL query builders / ORMs
+  ];
+  return Object.keys(deps).some((name) => DB_DEP_NAMES.includes(name));
 }
 
 /** Default irreversible-command deny list, generalized from production rules.
@@ -1193,6 +1206,20 @@ function defaultDenyList(report) {
     "Bash(rm --force --recursive *)",
     "Bash(rm --force -r *)",
     "Bash(rm -r /)",
+    // Recursive rm clustered with a NON-force flag — verbose (-v), interactive
+    // (-i/-I), or directory (-d) — is equally irreversible but slips past
+    // `Bash(rm -r *)` (which needs a space right after -r) and the force-only
+    // clusters above. `rm -rv target` / `rm -rI target` are ordinary spellings.
+    // Each common 2-flag cluster needs its own literal entry (both -r and -R,
+    // both flag orders) since Claude Code matches the exact cluster. The regex
+    // detector covers the full flag alphabet; this list covers the clusters
+    // people actually type (3+ flag clusters like -rfv are still missed — a
+    // Claude Code literal-matching limitation, not a detection gap).
+    "Bash(rm -rv:*)", "Bash(rm -vr:*)", "Bash(rm -Rv:*)", "Bash(rm -vR:*)",
+    "Bash(rm -ri:*)", "Bash(rm -ir:*)", "Bash(rm -rI:*)", "Bash(rm -Ir:*)",
+    "Bash(rm -rd:*)", "Bash(rm -dr:*)", "Bash(rm -Rd:*)", "Bash(rm -dR:*)",
+    // Force + capital-recursive reorder, completing the -rf/-fr/-Rf set above.
+    "Bash(rm -fR:*)",
     "Bash(git push --force:*)",
     "Bash(git push -f:*)",
     // A lone star in a Claude Code Bash pattern spans multiple arguments, so
