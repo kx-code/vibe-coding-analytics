@@ -861,7 +861,21 @@ function denyEntryBlocksDangerousCommand(entry) {
   // sh)` became `curl https`, so the remote-exec pattern never matched and the
   // guard was falsely reported missing.
   if (cmd.endsWith(":*")) cmd = cmd.slice(0, -2);
-  return DANGEROUS_CMD_RE.test(cmd);
+  // Recognize the dangerous command behind a leading `sudo` runner: sudo is a
+  // privilege escalator, not the command itself, so `sudo rm -rf` / `sudo git
+  // push --force` resolve to the dangerous verb after sudo (and its trailing
+  // space) are stripped. (Codex P2 #3659066974)
+  const stripped = cmd.replace(/^sudo\b\s*/, "");
+  if (DANGEROUS_CMD_RE.test(stripped)) return true;
+  // `Bash(sudo rm:*)` — which defaultDenyList() itself emits — is a BROAD sudo rm
+  // block with no explicit recursive flag, so the regex above (which needs a
+  // flag) misses it after stripping to bare `rm`. sudo rm as root is dangerous
+  // regardless of flags, so recognize a leading-sudo rm runner explicitly. The
+  // leading-sudo requirement keeps `Bash(rm -readme:*)` (no sudo, where -r is a
+  // prefix of the -readme token) MISSing, and `Bash(echo sudo rm:*)` (sudo not
+  // leading) MISSing.
+  if (/^(?:sudo\s+)+rm\b/.test(cmd)) return true;
+  return false;
 }
 
 /** Compile a Claude Code PostToolUse matcher into { catchAll, re }. An empty
@@ -1301,6 +1315,53 @@ function shellHasC(tokens, shellIdx) {
   return false;
 }
 
+/** Replace the CONTENT of quoted strings that are DATA (not commands) with a
+ *  placeholder token, so an operator (`&&`, `||`, `;`, `|`) that appears INSIDE
+ *  quoted data cannot be exposed by the subsequent quote-strip and split into a
+ *  phantom executable segment. Only a quoted region that is the SCRIPT ARGUMENT
+ *  of a shell invoked with `-c` (`sh -c '...'`, `bash -lc "..."`) is a real
+ *  command and keeps its quotes intact — the later quote-strip then exposes that
+ *  content for scanning, exactly as before.
+ *
+ *  Why the preceding token matters: `node -e "...npm run lint..."` passes the
+ *  quoted text as DATA to node (a terminal command), so any `&&` inside is
+ *  inert; but `sh -c '... && ...'` EXECUTES the quoted text, so the operators
+ *  are real. The two are distinguished by whether the token immediately before
+ *  the opening quote is a short `-c` flag of a shell. A short-flag cluster like
+ *  `-lc`/`-ic` carries -c; a long option (`--login`) or non-shell flag (`-e`)
+ *  does not, so those quoted regions are treated as data. (Codex P2 #3659066971) */
+function maskDataQuotes(cmd) {
+  let out = "";
+  let i = 0;
+  const n = cmd.length;
+  const isShortCFlag = (s) => /^-[^-\s]*c$/.test(s);
+  const lastToken = (s) => {
+    const t = String(s).trim().split(/\s+/);
+    return t[t.length - 1] || "";
+  };
+  while (i < n) {
+    const ch = cmd[i];
+    if (ch === "'" || ch === '"') {
+      let j = i + 1;
+      while (j < n) {
+        if (ch === '"' && cmd[j] === "\\") { j += 2; continue; }
+        if (cmd[j] === ch) break;
+        j += 1;
+      }
+      // A shell -c script: keep the quotes so the later quote-strip exposes the
+      // real commands inside. Everything else is DATA: drop the content (and the
+      // enclosing quotes) for a placeholder that holds no operators.
+      if (isShortCFlag(lastToken(out))) out += cmd.slice(i, j + 1);
+      else out += " quoteddata ";
+      i = j + 1;
+      continue;
+    }
+    out += ch;
+    i += 1;
+  }
+  return out;
+}
+
 function commandPurposes(cmd, scripts, workspaceScripts) {
   let c = String(cmd || "");
   // Drop the FULL argument list of echo/printf — status text such as
@@ -1314,6 +1375,13 @@ function commandPurposes(cmd, scripts, workspaceScripts) {
     /\b(?:echo|printf)\b(?:(?:\s+(?:'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"|[^;&|>\s]+))*)/g,
     " "
   );
+  // Mask the CONTENT of quoted DATA strings (anything that is NOT a shell -c
+  // script) so an operator hidden inside the data — `node -e "... && npm run
+  // lint"` — cannot be exposed by the quote-strip below and split into a phantom
+  // `npm run lint` segment. A shell -c script keeps its quotes (then gets
+  // quote-stripped to expose real commands). Must run BEFORE the quote-strip.
+  // (Codex P2 #3659066971)
+  c = maskDataQuotes(c);
   // For OTHER quoted strings — typically a script passed to a shell wrapper like
   // `bash -lc "npm run lint && npm run format"` — the quoted CONTENT is real
   // commands, so strip only the quote characters (keep the content) for scanning

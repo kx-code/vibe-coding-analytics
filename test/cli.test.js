@@ -2653,6 +2653,40 @@ test("Dangerous-command guard MISS when a flag is only a substring of a longer t
   }
 });
 
+test("Dangerous-command guard recognizes the sudo rm deny entry vca itself scaffolds (Codex P2 #3659066974)", async () => {
+  // defaultDenyList() emits `Bash(sudo rm:*)` (a broad sudo rm block, L1871), but
+  // DANGEROUS_CMD_RE is anchored at ^rm and treats `sudo ` as a literal prefix,
+  // so the analyzer did not recognize its OWN scaffolding output. A project whose
+  // only guard was `Bash(sudo rm:*)` (or `Bash(sudo rm -rf:*)`) false-MISSed and
+  // init re-expanded an already-valid guard. sudo is a privilege runner; the
+  // dangerous command is rm behind it, so a leading-sudo rm entry must satisfy
+  // the guard. Bounded to a LEADING sudo so `Bash(rm -readme:*)` (no sudo) STILL
+  // MISSes (the -r there is a prefix of the -readme token, not a recursive flag).
+  for (const entry of ["Bash(sudo rm:*)", "Bash(sudo rm -rf:*)"]) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-sudo-rm-"));
+    fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+    fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, ".claude", "settings.json"),
+      JSON.stringify({ permissions: { deny: [entry] } }),
+    );
+    const r = analyzeForTest(dir);
+    const guard = r.checks.find((c) => c.area === "Dangerous-command guard");
+    assert.ok(guard && guard.ok, `deny entry ${entry} must satisfy the dangerous-command guard`);
+  }
+  // No leading sudo -> unchanged MISS (the -r is a prefix of the -readme token).
+  const negDir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-sudo-rm-neg-"));
+  fs.writeFileSync(path.join(negDir, "CLAUDE.md"), "# x\n");
+  fs.mkdirSync(path.join(negDir, ".claude"), { recursive: true });
+  fs.writeFileSync(
+    path.join(negDir, ".claude", "settings.json"),
+    JSON.stringify({ permissions: { deny: ["Bash(rm -readme:*)"] } }),
+  );
+  const neg = analyzeForTest(negDir);
+  const negGuard = neg.checks.find((c) => c.area === "Dangerous-command guard");
+  assert.ok(negGuard && !negGuard.ok, "`Bash(rm -readme:*)` (no sudo) still MISSes after sudo normalization");
+});
+
 test("evolve --write keeps a BROADER-than-edit PostToolUse matcher scoped away from formatter hooks and adds a separate Edit|Write entry (Codex P2)", async () => {
   // A non-empty matcher that covers Edit+Write BUT ALSO a non-edit tool is not a
   // safe merge target. Read carries file_path but formatting on every read
@@ -3947,6 +3981,17 @@ test("Agent hooks do NOT credit lint when `lint` is a filename/argument, only wh
   // execute the script and credits lint.
   assert.equal(evalLint("bash eslint"), false, "`bash eslint` (no -c) -> eslint is a script-file arg -> MISS");
   assert.equal(evalLint("sh eslint"), false, "`sh eslint` (no -c) -> eslint is a script-file arg -> MISS");
+  // An operator (&&) INSIDE a quoted DATA string passed to a TERMINAL command
+  // (`node -e "..."`) must NOT split into a phantom executable segment — the
+  // quoted content is data, so `npm run lint` inside the string is never run.
+  // Stripping quote characters BEFORE splitting on operators exposed the inner
+  // `&&`, manufacturing a phantom `npm run lint)` segment that the opaque-body
+  // fallback (\blint\b) credited as lint (Codex P2 #3659066971).
+  assert.equal(
+    evalLint(`node -e "console.log('nothing && npm run lint')"`),
+    false,
+    "`node -e \"... && npm run lint\"` -> operator inside quoted DATA must not phantom-split -> MISS",
+  );
   // Real lint commands still credit (control): eslint is the executed command.
   assert.ok(evalLint("eslint ."), "`eslint .` -> eslint is the command -> PASS");
   assert.ok(evalLint("npx eslint ."), "`npx eslint .` -> eslint after runner -> PASS");
