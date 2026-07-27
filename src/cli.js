@@ -2092,6 +2092,30 @@ function packageManagerExecutor(pm) {
   }
 }
 
+/** Whether ESLint has a runnable config in this project. With NO config,
+ *  `eslint <file>` errors ("couldn't find an eslint.config.(js|mjs|cjs) file" /
+ *  "ESLint couldn't find a configuration file"), exits 2, and a scaffolded
+ *  PostToolUse hook would promote that config error to a BLOCKING exit 2 on every
+ *  edit until the user manually removes it. Detect the standard flat-config
+ *  (ESLint 9+: eslint.config.{js,mjs,cjs}) and legacy (ESLint <=8: .eslintrc*)
+ *  files anywhere in the tree, plus the package.json `eslintConfig` field, so the
+ *  eslint half of a scaffolded hook is emitted only when eslint can actually run.
+ *  Prettier needs no gate: it ships sane defaults and runs without a config.
+ *  (Codex P1 #3659665368) */
+function hasEslintConfig(report) {
+  const ESLINT_CONFIG_RE = /(?:^|\/)(?:eslint\.config\.(?:js|mjs|cjs)|\.eslintrc(?:\.js|\.cjs|\.mjs|\.json|\.ya?ml)?)$/i;
+  if (report.files) {
+    for (const f of report.files) { if (ESLINT_CONFIG_RE.test(f)) return true; }
+  }
+  const hasInline = (pkg) => Boolean(pkg?.eslintConfig);
+  if (hasInline(report.packageJson)) return true;
+  const primary = report.roots?.[0];
+  for (const memberPkg of readWorkspaceMemberPackages(primary, report.packageJson)) {
+    if (hasInline(memberPkg)) return true;
+  }
+  return false;
+}
+
 /** Claude Code settings.json with PostToolUse(Edit|Write) -> prettier + eslint.
  *  Format-on-save + lint-on-edit are the cheapest computational sensors.
  *  Returns null (no scaffold) when: (a) prettier/eslint aren't declared deps,
@@ -2166,8 +2190,13 @@ function claudeHooksSettings(report) {
     }
     return null;
   };
-  const editCmd = commandForGap(!editFormat, !editLint);
-  const writeCmd = commandForGap(!writeFormat, !writeLint);
+  // ESLint with no config errors (exit 2) and would block every edit, so the lint
+  // half is gated on a runnable config — `eslintReady`. Prettier is ungated (it
+  // runs on built-in defaults). When eslint is not ready, a combined gap degrades
+  // to prettier-only and a lint-only gap emits nothing. (Codex P1 #3659665368)
+  const eslintReady = hasEslintConfig(report);
+  const editCmd = commandForGap(!editFormat, !editLint && eslintReady);
+  const writeCmd = commandForGap(!writeFormat, !writeLint && eslintReady);
   const entries = [];
   if (editCmd && writeCmd && editCmd === writeCmd) {
     // Both tools share the IDENTICAL gap (common fresh setup, both missing both):

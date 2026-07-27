@@ -1223,6 +1223,7 @@ test("Agent hooks + guard both MISS on a bare project", () => {
 test("init --write scaffolds hooks + deny list for Claude Code projects", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-init-hooks-"));
   fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {}, devDependencies: { prettier: "*", eslint: "*" } }));
+  fs.writeFileSync(path.join(dir, "eslint.config.mjs"), "export default [];\n");
   fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
   await runCli(["init", "--cwd", dir, "--write"]);
   const settings = fs.readFileSync(path.join(dir, ".claude", "settings.json"), "utf8");
@@ -1546,6 +1547,7 @@ test("scaffolded hooks read file_path from stdin JSON via the Node runtime, not 
 test("evolve --write MERGES hooks into an existing settings.json instead of skipping (Codex P1)", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-merge-hooks-"));
   fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {}, devDependencies: { prettier: "*", eslint: "*" } }));
+  fs.writeFileSync(path.join(dir, "eslint.config.mjs"), "export default [];\n");
   fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
   fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
   // Existing user settings with unrelated content but NO PostToolUse hooks.
@@ -1594,6 +1596,38 @@ test("init --write omits prettier/eslint hooks when the stack lacks them (Codex 
   const r = analyzeForTest(dir);
   const hooks = r.checks.find((c) => c.area === "Agent hooks");
   assert.ok(hooks && hooks.ok, "Agent hooks N/A (pass) when formatters absent — non-Node stacks are not penalized");
+});
+
+test("init --write omits the eslint hook when ESLint has no config (Codex P1 #3659665368)", async () => {
+  // prettier+eslint are declared deps, but ESLint has NO config file. Scaffolding
+  // an `eslint` PostToolUse hook here would run eslint on every edit, hit the
+  // "couldn't find a configuration file" error, exit 2, and BLOCK edits until the
+  // user manually removes the hook. The scaffold must emit prettier-only (prettier
+  // runs on sane defaults) and omit eslint until a config exists.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-init-noeslintcfg-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({
+    name: "demo", scripts: {}, devDependencies: { prettier: "*", eslint: "*" },
+  }));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
+  await runCli(["init", "--cwd", dir, "--write"]);
+  assert.ok(fs.existsSync(path.join(dir, ".claude", "settings.json")), "prettier-only hook still scaffolded");
+  const settings = JSON.parse(fs.readFileSync(path.join(dir, ".claude", "settings.json"), "utf8"));
+  const cmds = (settings.hooks?.PostToolUse || []).flatMap((e) => (e.hooks || []).map((h) => h.command)).join("\n");
+  assert.ok(/prettier/.test(cmds), "prettier hook scaffolded (runs without a config)");
+  assert.ok(!/\beslint\b/.test(cmds), "eslint hook omitted when ESLint has no config (would block edits via exit 2)");
+});
+
+test("init --write scaffolds the eslint hook when an ESLint config exists (Codex P1 #3659665368)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-init-eslintcfg-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({
+    name: "demo", scripts: {}, devDependencies: { prettier: "*", eslint: "*" },
+  }));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
+  fs.writeFileSync(path.join(dir, "eslint.config.mjs"), "export default [];\n");
+  await runCli(["init", "--cwd", dir, "--write"]);
+  const settings = JSON.parse(fs.readFileSync(path.join(dir, ".claude", "settings.json"), "utf8"));
+  const cmds = (settings.hooks?.PostToolUse || []).flatMap((e) => (e.hooks || []).map((h) => h.command)).join("\n");
+  assert.ok(/prettier/.test(cmds) && /\beslint\b/.test(cmds), "both prettier+eslint scaffolded when an ESLint config exists");
 });
 
 test("scaffolded hooks pass paths NUL-delimited via xargs -0 and skip unknown parsers (Codex P2)", async () => {
@@ -1695,6 +1729,7 @@ test("init --write scaffolds the deny list when .claude/agents/ marks a Claude p
 test("evolve --write merge preserves existing hook objects (timeout/prompt), only appends new command hooks (Codex P1)", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-merge-preserve-"));
   fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {}, devDependencies: { prettier: "*", eslint: "*" } }));
+  fs.writeFileSync(path.join(dir, "eslint.config.mjs"), "export default [];\n");
   fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
   fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
   // Existing settings with a PostToolUse entry carrying a `timeout` and a
@@ -1971,6 +2006,7 @@ test("evolve --write scopes the backfilled formatter to only the tool missing it
 test("evolve --write splits a partially-covered tool by purpose, not an Edit|Write combined command (Codex P2 #3657032372)", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-hooks-split-"));
   fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "x", scripts: {}, devDependencies: { prettier: "*", eslint: "*" } }));
+  fs.writeFileSync(path.join(dir, "eslint.config.mjs"), "export default [];\n");
   fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
   fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
   // Edit runs prettier (format) but has NO eslint (lint); Write has neither.
@@ -2098,6 +2134,7 @@ test("Project facts MISS recommends docs, not a manifest (Codex P2 duplicate-key
 test("evolve --write keeps a catch-all PostToolUse entry scoped away from formatter hooks and adds a separate Edit|Write entry (Codex P1)", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-merge-catchall-"));
   fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {}, devDependencies: { prettier: "*", eslint: "*" } }));
+  fs.writeFileSync(path.join(dir, "eslint.config.mjs"), "export default [];\n");
   fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
   fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
   // Existing entry has NO matcher (catch-all) running an unrelated command.
@@ -2311,6 +2348,7 @@ test("Agent hooks detected via a RECURSIVE workspace glob (apps double-star) mem
 test("scaffolded hooks use the detected package manager executor (yarn, not npx) (Codex P2)", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-hooks-pm-"));
   fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {}, packageManager: "yarn@4.0.0", devDependencies: { prettier: "*", eslint: "*" } }));
+  fs.writeFileSync(path.join(dir, "eslint.config.mjs"), "export default [];\n");
   fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
   await runCli(["init", "--cwd", dir, "--write"]);
   const settings = JSON.parse(fs.readFileSync(path.join(dir, ".claude", "settings.json"), "utf8"));
@@ -2698,6 +2736,7 @@ test("evolve --write keeps a BROADER-than-edit PostToolUse matcher scoped away f
   for (const broadMatcher of [".*", "Edit|Write|Read", "Edit|Write|Bash", "Edit|Write|Glob", "Edit|Write|Grep"]) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-merge-broad-"));
     fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {}, devDependencies: { prettier: "*", eslint: "*" } }));
+    fs.writeFileSync(path.join(dir, "eslint.config.mjs"), "export default [];\n");
     fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
     fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
     fs.writeFileSync(
@@ -3401,6 +3440,7 @@ test("scaffolded hooks serialize prettier-before-eslint in ONE command and exit 
   // just introduced would silently fail to teach it anything.
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-hooks-serialize-"));
   fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {}, devDependencies: { prettier: "*", eslint: "*" } }));
+  fs.writeFileSync(path.join(dir, "eslint.config.mjs"), "export default [];\n");
   fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
   await runCli(["init", "--cwd", dir, "--write"]);
   const settings = JSON.parse(fs.readFileSync(path.join(dir, ".claude", "settings.json"), "utf8"));
@@ -3418,6 +3458,7 @@ test("scaffolded hooks serialize prettier-before-eslint in ONE command and exit 
 test("scaffolded eslint-only hook (format already wired) exits 2 and routes diagnostics to stderr (Codex P1)", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-hooks-eslint-exit2-"));
   fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {}, devDependencies: { prettier: "*", eslint: "*" } }));
+  fs.writeFileSync(path.join(dir, "eslint.config.mjs"), "export default [];\n");
   fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
   fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
   // Format purpose already covered in settings.local.json; only lint is missing.
@@ -3464,6 +3505,7 @@ test("scaffolded combined command satisfies its own Agent-hooks detector on re-s
   // otherwise init/evolve would loop, re-scaffolding on every run.
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-hooks-roundtrip-"));
   fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {}, devDependencies: { prettier: "*", eslint: "*" } }));
+  fs.writeFileSync(path.join(dir, "eslint.config.mjs"), "export default [];\n");
   fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
   await runCli(["init", "--cwd", dir, "--write"]);
   const r = analyzeForTest(dir);
@@ -3865,6 +3907,7 @@ test("evolve --write does NOT merge hooks into a matcher that also fires on a no
   for (const broadMatcher of ["Edit|Write|WebFetch", "Edit|Write|WebSearch", "Edit|Write|NotebookEdit"]) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-merge-broad-"));
     fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {}, devDependencies: { prettier: "*", eslint: "*" } }));
+    fs.writeFileSync(path.join(dir, "eslint.config.mjs"), "export default [];\n");
     fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
     fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
     fs.writeFileSync(
