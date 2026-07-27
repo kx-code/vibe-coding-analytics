@@ -1429,7 +1429,10 @@ function packageManagerExecutor(pm) {
  *  (yarn/pnpm/bun, not just npx). `--ignore-unknown` keeps prettier from erroring
  *  on edits to file types it has no parser for (custom config extensions,
  *  lockfiles, …); eslint already exits cleanly on unmatched files via
- *  `--no-warn-ignored`. */
+ *  `--no-warn-ignored`. When both purposes are missing they are emitted as a
+ *  SINGLE sequential command (prettier && eslint) because Claude Code runs
+ *  matching hooks in parallel; eslint is gated to exit 2 + stderr so the model
+ *  actually sees the violation (see the inline comment below). */
 function claudeHooksSettings(report) {
   const roots = report.roots;
   if (!hasNodeFormattersAnywhere(roots)) return null;
@@ -1440,12 +1443,38 @@ function claudeHooksSettings(report) {
   // file. Claude loads PostToolUse hooks from settings.json AND settings.local.json,
   // so a freshly-created settings.json that re-emits a purpose already covered in
   // settings.local.json would run that tool twice on every edit.
+  //
+  // Claude Code runs ALL matching PostToolUse hooks in PARALLEL, so when BOTH
+  // purposes are missing prettier and eslint must share ONE command — emitting
+  // two separate hooks lets eslint lint the file BEFORE prettier has rewritten it
+  // (a TOCTOU race: eslint flags exactly the style prettier would have just
+  // fixed). `sh -c '...prettier "$1" && eslint "$1"...' _ {}` runs prettier first
+  // and only lints the formatted result. `sh` is a system binary, never prefixed
+  // with the package-manager executor (npx/yarn exec resolve npm packages, which
+  // `sh` is not); only the inner prettier/eslint calls take `${exec}`.
+  //
+  // ESLint is the gate that should BLOCK: Claude Code only feeds a hook's output
+  // back to the model on exit code 2 (a non-2 non-zero code is shown to the user
+  // but never reaches the agent), so eslint exits 1 on violations yet the hook
+  // would silently fail to teach the agent about the lint error it just
+  // introduced. `|| exit 2` promotes any non-zero result (eslint violations, or a
+  // prettier failure on a file it genuinely cannot parse despite
+  // --ignore-unknown) to a blocking exit 2, and `1>&2` moves eslint's
+  // diagnostics onto stderr (eslint writes to stdout by default; Claude Code
+  // surfaces STDERR on exit 2). The prettier-ONLY branch (lint already wired
+  // elsewhere) deliberately omits exit 2: prettier --write rarely fails and
+  // blocking the agent on a benign formatter parse gap is worse than skipping it.
+  // `"$1"` carries the path as a positional param: xargs -0 -I{} replaces {} with
+  // the path as a SINGLE argv element (NUL-delimited, byte-for-byte), which
+  // becomes $1 — so paths with spaces/apostrophes/backslashes are never
+  // re-parsed by a shell.
   const hooks = [];
-  if (!postToolUseFormat) {
+  if (!postToolUseFormat && !postToolUseLint) {
+    hooks.push({ type: "command", command: `${HOOK_READ_PATH} | xargs -0 -I{} sh -c '${exec} prettier --write --ignore-unknown "$1" && ${exec} eslint --no-warn-ignored "$1" 1>&2' _ {} || exit 2` });
+  } else if (!postToolUseFormat) {
     hooks.push({ type: "command", command: `${HOOK_READ_PATH} | xargs -0 -I{} ${exec} prettier --write --ignore-unknown {}` });
-  }
-  if (!postToolUseLint) {
-    hooks.push({ type: "command", command: `${HOOK_READ_PATH} | xargs -0 -I{} ${exec} eslint --no-warn-ignored {}` });
+  } else if (!postToolUseLint) {
+    hooks.push({ type: "command", command: `${HOOK_READ_PATH} | xargs -0 -I{} ${exec} eslint --no-warn-ignored {} 1>&2 || exit 2` });
   }
   const config = {
     hooks: {

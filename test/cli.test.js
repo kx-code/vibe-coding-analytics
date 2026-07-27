@@ -2945,3 +2945,102 @@ test("Dangerous-command guard + scaffold cover recursive rm clustered with non-f
   assert.ok(/Bash\(rm -rd:\*\)/.test(local), "rm -rd scaffolded (recursive + directory)");
   assert.ok(/Bash\(rm -fR:\*\)/.test(local), "rm -fR scaffolded (force + capital recursive)");
 });
+
+// ---- Codex round 12: serialize format-before-lint + exit-2 eslint gate (PR #16) ----
+
+test("scaffolded hooks serialize prettier-before-eslint in ONE command and exit 2 on lint violations (Codex P1+P2)", async () => {
+  // Claude Code runs ALL matching PostToolUse hooks IN PARALLEL. Emitting
+  // prettier and eslint as two separate hooks races them: eslint lints the file
+  // BEFORE prettier has rewritten it (a TOCTOU — eslint flags exactly the style
+  // prettier would have just fixed). They must share ONE command chained with &&
+  // so eslint only runs against the formatted result. eslint must also exit 2 +
+  // stderr: Claude Code feeds a hook's output back to the model ONLY on exit 2
+  // (a non-2 non-zero code is shown to the user but never reaches the agent), and
+  // eslint exits 1 on violations — without `|| exit 2` the lint error the agent
+  // just introduced would silently fail to teach it anything.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-hooks-serialize-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {}, devDependencies: { prettier: "*", eslint: "*" } }));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
+  await runCli(["init", "--cwd", dir, "--write"]);
+  const settings = JSON.parse(fs.readFileSync(path.join(dir, ".claude", "settings.json"), "utf8"));
+  const cmds = (settings.hooks?.PostToolUse || []).flatMap((e) => (e.hooks || []).map((h) => h.command));
+  assert.equal(cmds.length, 1, "exactly ONE combined hook command (prettier && eslint serialized, not two parallel handlers)");
+  const cmd = cmds[0];
+  assert.ok(/xargs -0 -I\{\} sh -c/.test(cmd), "combined command runs through a bare `sh -c` (sh is a system binary, never resolved via the package manager)");
+  assert.ok(cmd.indexOf("prettier") < cmd.indexOf("eslint"), "prettier precedes eslint (format the file BEFORE linting it)");
+  assert.ok(/&&/.test(cmd), "prettier and eslint joined by && (eslint runs only if prettier succeeded)");
+  assert.ok(/\|\| exit 2/.test(cmd), "pipeline promotes any violation to a blocking exit 2 so the model sees it");
+  assert.ok(/1>&2/.test(cmd), "eslint diagnostics routed to stderr (Claude Code surfaces stderr, not stdout, on exit 2)");
+  assert.ok(cmd.indexOf("eslint") < cmd.indexOf("1>&2"), "1>&2 binds to eslint (its diagnostics), not to prettier");
+});
+
+test("scaffolded eslint-only hook (format already wired) exits 2 and routes diagnostics to stderr (Codex P1)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-hooks-eslint-exit2-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {}, devDependencies: { prettier: "*", eslint: "*" } }));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  // Format purpose already covered in settings.local.json; only lint is missing.
+  fs.writeFileSync(
+    path.join(dir, ".claude", "settings.local.json"),
+    JSON.stringify({ hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [{ type: "command", command: "npx prettier --write --ignore-unknown {}" }] }] } }),
+  );
+  await runCli(["init", "--cwd", dir, "--write"]);
+  const settings = JSON.parse(fs.readFileSync(path.join(dir, ".claude", "settings.json"), "utf8"));
+  const cmds = (settings.hooks?.PostToolUse || []).flatMap((e) => (e.hooks || []).map((h) => h.command));
+  assert.equal(cmds.length, 1, "only the MISSING lint purpose is scaffolded");
+  const cmd = cmds[0];
+  assert.ok(/eslint/.test(cmd) && !/prettier/.test(cmd), "eslint-only (prettier already covered, not re-emitted)");
+  assert.ok(/\|\| exit 2/.test(cmd), "eslint-only hook exits 2 on violations");
+  assert.ok(/1>&2/.test(cmd), "eslint-only diagnostics on stderr");
+});
+
+test("scaffolded prettier-only hook (lint already wired) does NOT block on exit 2 (Codex P1)", async () => {
+  // prettier --write rarely fails (--ignore-unknown skips file types with no
+  // parser), so the prettier-only branch deliberately omits exit 2 — blocking the
+  // agent on a benign formatter gap is worse than skipping it. eslint is the gate
+  // that should block (covered by the two tests above).
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-hooks-prettier-no-exit2-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {}, devDependencies: { prettier: "*", eslint: "*" } }));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, ".claude", "settings.local.json"),
+    JSON.stringify({ hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [{ type: "command", command: "npx eslint --no-warn-ignored {}" }] }] } }),
+  );
+  await runCli(["init", "--cwd", dir, "--write"]);
+  const settings = JSON.parse(fs.readFileSync(path.join(dir, ".claude", "settings.json"), "utf8"));
+  const cmds = (settings.hooks?.PostToolUse || []).flatMap((e) => (e.hooks || []).map((h) => h.command));
+  assert.equal(cmds.length, 1, "only the MISSING format purpose is scaffolded");
+  const cmd = cmds[0];
+  assert.ok(/prettier/.test(cmd) && !/eslint/.test(cmd), "prettier-only (eslint already covered)");
+  assert.ok(!/exit 2/.test(cmd), "prettier-only hook does NOT exit 2 (formatter is not a blocking gate)");
+});
+
+test("scaffolded combined command satisfies its own Agent-hooks detector on re-scan (Codex P1)", async () => {
+  // Regression guard: the combined `sh -c 'prettier && eslint' _ {} ` command the
+  // scaffold emits must be recognized by commandPurposes as covering BOTH
+  // purposes, so a fresh project reports Agent hooks PASS right after init —
+  // otherwise init/evolve would loop, re-scaffolding on every run.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-hooks-roundtrip-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {}, devDependencies: { prettier: "*", eslint: "*" } }));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
+  await runCli(["init", "--cwd", dir, "--write"]);
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  assert.ok(hooks && hooks.ok, "the scaffolded combined command satisfies its own detector (both purposes detected)");
+});
+
+test("combined hook's sh -c placeholder passes a tricky path byte-for-byte as $1 (Codex P1)", () => {
+  // The combined command runs `sh -c '... "$1" ...' _ {}`: xargs -0 -I{}
+  // replaces {} with the NUL-delimited path as a SINGLE argv element, which sh
+  // receives as $1 (with $0=_). "$1" double-quotes it inside the script, so
+  // apostrophes/spaces/backslashes reach prettier/eslint without re-parsing. A
+  // naive `sh -c '... {} ...'` (unquoted {}) would word-split the path.
+  const script = "const f=JSON.parse(require('fs').readFileSync(0,'utf8')).tool_input?.file_path;if(f)process.stdout.write(f+String.fromCharCode(0))";
+  const tricky = "docs/it's a\\b.md"; // apostrophe + spaces + backslash
+  const payload = JSON.stringify({ tool_input: { file_path: tricky } });
+  const pathPlusNul = execFileSync("node", ["-e", script], { input: payload, encoding: "utf8" });
+  // Mirror the exact `xargs -0 -I{} sh -c '... "$1" ...' _ {}` shape emitted.
+  const out = execFileSync("xargs", ["-0", "-I{}", "sh", "-c", 'printf "%s\\n" "$1"', "_", "{}"], { input: pathPlusNul, encoding: "utf8" });
+  assert.equal(out.trim(), tricky, "apostrophe+space+backslash path reaches $1 byte-for-byte");
+});
