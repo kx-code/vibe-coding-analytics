@@ -1119,6 +1119,12 @@ const PM_SCRIPT_RE = /\b(?:npm|pnpm|yarn|bun)\s+(?:(?:--?(?:workspace|w|filter|p
 // lets resolveScriptBody see selector + name together. PM_SCRIPT_RE (above)
 // remains the unanchored test used elsewhere; this is the replace-only copy.
 const PM_SCRIPT_CALL_RE_G = /\b(?:npm|pnpm|yarn|bun)\b[^;&|]*/g;
+// npm lifecycle scripts runnable WITHOUT `run` (`npm test`, `npm start`, ...).
+// Every OTHER npm script REQUIRES `run` — `npm lint` errors "Unknown command:
+// lint" (npm run --help) and never invokes scripts.lint. pnpm/yarn/bun run scripts
+// WITHOUT `run`, so this set is npm-only. Used by resolveScriptBody to MISS a bare
+// `npm <script>` whose name is not a lifecycle shortcut. (Codex P2 #3660108922)
+const NPM_LIFECYCLE_SCRIPTS = new Set(["test", "start", "stop", "restart"]);
 // `-w` is prettier's short write flag. Matched as a standalone token (bounded by
 // whitespace or string end) so it does NOT fire inside `--no-write`, whose `-w`
 // sits mid-token after `o` (no preceding boundary).
@@ -1162,14 +1168,15 @@ const SHORT_WRITE_FLAG_RE = /(?:^|\s)-w(?=\s|$)/;
 function parsePmInvocation(invocation) {
   const s = String(invocation || "");
   const pm = s.match(/\b(?:npm|pnpm|yarn|bun)\b/);
-  if (!pm) return { name: null, ws: null };
+  if (!pm) return { name: null, ws: null, pm: null, hasRun: false };
   const isYarn = pm[0] === "yarn";
   const tokens = s.slice(pm.index + pm[0].length).split(/\s+/).filter(Boolean);
   let ws = null;
+  let hasRun = false; // whether an explicit `run` keyword preceded the script name
   let i = 0;
   while (i < tokens.length) {
     const t = tokens[i];
-    if (t === "run") { i++; continue; }
+    if (t === "run") { hasRun = true; i++; continue; }
     // Value-taking selectors — record the FOLLOWING token as the workspace
     // selector (only the FIRST one, before the command name) and skip selector +
     // value so the real script NAME is returned instead of the value:
@@ -1190,9 +1197,9 @@ function parsePmInvocation(invocation) {
       i++; continue;
     }
     if (t.startsWith("-")) { i++; continue; }                                   // boolean option
-    return { name: t, ws };                                                     // first bare token = command
+    return { name: t, ws, pm: pm[0], hasRun };                                  // first bare token = command
   }
-  return { name: null, ws };
+  return { name: null, ws, pm: pm[0], hasRun };
 }
 
 function extractScriptName(invocation) {
@@ -1210,8 +1217,17 @@ function resolveScriptBody(invocation, scripts, seen, workspaceScripts) {
   // (a write body false-PASSes as covered). (Codex P2 #3656425156)
   const forwardedMatch = s.match(/(?:^|\s)--\s+(.+)$/);
   const forwarded = forwardedMatch ? forwardedMatch[1].trim() : "";
-  const { name, ws: wsRaw } = parsePmInvocation(s);
+  const { name, ws: wsRaw, pm, hasRun } = parsePmInvocation(s);
   if (!name) return null;
+  // npm REQUIRES `run` (or a lifecycle shortcut) to execute a user script: `npm
+  // lint` exits "Unknown command: lint" (npm run --help) and never invokes
+  // scripts.lint, so resolving it against the root `lint` script false-PASSes a
+  // hook npm never runs. pnpm/yarn/bun run scripts WITHOUT `run` (unaffected).
+  // Treat a no-`run` npm invocation whose name is not a lifecycle shortcut
+  // (test/start/stop/restart) as a definitive MISS ("") — NOT null (opaque) — so
+  // the caller's name-heuristic trust does NOT credit `npm lint` as a lint script.
+  // (Codex P2 #3660108922)
+  if (pm === "npm" && !hasRun && !NPM_LIFECYCLE_SCRIPTS.has(name)) return "";
   // Workspace/package selector. Long-form flags (--workspace/--filter/--prefix/
   // --dir/-C) are UNAMBIGUOUS PM global flags valid in ANY position, including
   // AFTER the script name (`npm run format --workspace a` — npm scans all args);
@@ -1816,19 +1832,37 @@ function pnpmWorkspacePatterns(root) {
  *  resolving each workspace pattern (npm `workspaces` or pnpm-workspace.yaml,
  *  brace-expanded, literal/`*`/`**`/partial-wildcard) to its concrete directories.
  *  Members without a manifest are skipped. Shared by dependency detection and
- *  script-map population so BOTH honor the same declaration boundary. */
+ *  script-map population so BOTH honor the same declaration boundary.
+ *
+ *  `!`-prefixed patterns are NEGATIONS applied in declaration order: npm workspaces
+ *  (via the `glob` library) and pnpm `--filter` process `!pattern` to REMOVE
+ *  previously-included members, so `["packages/*", "!packages/b"]` yields packages/a
+ *  but NOT packages/b. Without this, the excluded member stays indexed and a
+ *  `npm --workspace b` selector resolves its script (false PASS) when npm itself
+ *  errors "No workspaces found". The negation glob (after stripping `!`) is resolved
+ *  the same way as an inclusion glob and DELETED from the accumulated set.
+ *  (Codex P2 #3660108928) */
 function readDeclaredWorkspaceMembers(root, pkg) {
-  const members = [];
   const patterns = [...workspacePatterns(pkg), ...pnpmWorkspacePatterns(root)];
+  const included = new Set();
   for (const pat of patterns) {
-    for (const p of expandBraces(pat)) {
+    const raw = String(pat).trim();
+    const isNeg = raw.startsWith("!");
+    const glob = isNeg ? raw.slice(1).trim() : raw;
+    if (!glob) continue;
+    for (const p of expandBraces(glob)) {
       const t = p.trim();
       if (!t) continue;
       for (const dir of resolveWorkspacePattern(root, t)) {
-        const memberPkg = readJson(path.join(dir, "package.json"));
-        if (memberPkg) members.push({ dir, pkg: memberPkg });
+        if (isNeg) included.delete(dir);
+        else included.add(dir);
       }
     }
+  }
+  const members = [];
+  for (const dir of included) {
+    const memberPkg = readJson(path.join(dir, "package.json"));
+    if (memberPkg) members.push({ dir, pkg: memberPkg });
   }
   return members;
 }
@@ -2127,27 +2161,33 @@ function packageManagerExecutor(pm) {
   }
 }
 
-/** Whether ESLint has a runnable config in this project. With NO config,
- *  `eslint <file>` errors ("couldn't find an eslint.config.(js|mjs|cjs) file" /
- *  "ESLint couldn't find a configuration file"), exits 2, and a scaffolded
- *  PostToolUse hook would promote that config error to a BLOCKING exit 2 on every
- *  edit until the user manually removes it. Detect the standard flat-config
- *  (ESLint 9+: eslint.config.{js,mjs,cjs}) and legacy (ESLint <=8: .eslintrc*)
- *  files anywhere in the tree, plus the package.json `eslintConfig` field, so the
- *  eslint half of a scaffolded hook is emitted only when eslint can actually run.
- *  Prettier needs no gate: it ships sane defaults and runs without a config.
- *  (Codex P1 #3659665368) */
+/** Whether ESLint has a ROOT-APPLICABLE runnable config in this project. The
+ *  scaffolded eslint hook runs `eslint <file>` from the PRIMARY ROOT on every
+ *  edited file. ESLint flat config (eslint.config.*, ESLint 9+) resolves from
+ *  CWD (the root), NOT recursively into subdirs, and legacy .eslintrc cascades
+ *  DOWN from where it sits — so a config living ONLY in a workspace member does
+ *  NOT apply to root files or sibling packages. With NO root-applicable config,
+ *  `eslint <root-file>` errors ("couldn't find an eslint.config.(js|mjs|cjs)
+ *  file"), exits 2, and the scaffolded PostToolUse `|| exit 2` promotes that
+ *  config error into a BLOCKING hook on every non-member edit. Require a
+ *  ROOT-LEVEL config file (no path separator) or the ROOT package.json
+ *  `eslintConfig` field; do NOT credit configs or inline fields that live only in
+ *  a workspace member. Prettier needs no gate: it ships sane defaults and runs
+ *  without a config. (Codex P1 #3659665368; root-scope tightening #3660108918) */
 function hasEslintConfig(report) {
   const ESLINT_CONFIG_RE = /(?:^|\/)(?:eslint\.config\.(?:js|mjs|cjs)|\.eslintrc(?:\.js|\.cjs|\.mjs|\.json|\.ya?ml)?)$/i;
   if (report.files) {
-    for (const f of report.files) { if (ESLINT_CONFIG_RE.test(f)) return true; }
+    for (const f of report.files) {
+      // Root-level only: a config under a workspace member does NOT apply to root
+      // or sibling-package files, so a root-level scaffolded eslint hook would error
+      // (exit 2 -> blocking) on every non-member edit. File paths are relative with
+      // `/` separators, so a root-level file has no separator. (Codex P1 #3660108918)
+      if (!f.includes("/") && ESLINT_CONFIG_RE.test(f)) return true;
+    }
   }
-  const hasInline = (pkg) => Boolean(pkg?.eslintConfig);
-  if (hasInline(report.packageJson)) return true;
-  const primary = report.roots?.[0];
-  for (const memberPkg of readWorkspaceMemberPackages(primary, report.packageJson)) {
-    if (hasInline(memberPkg)) return true;
-  }
+  // Root inline `eslintConfig` only — member inline configs are out of scope for the
+  // same reason (a root hook cannot use them). (Codex P1 #3660108918)
+  if (Boolean(report.packageJson?.eslintConfig)) return true;
   return false;
 }
 

@@ -4538,3 +4538,147 @@ test("Agent hooks credit format-on-save for `--workspace b` whose format writes 
   const hooks = r.checks.find((c) => c.area === "Agent hooks");
   assert.ok(hooks && hooks.ok, "`npm run format --workspace b` -> b's prettier --write credits format-on-save");
 });
+
+test("init --write omits the eslint hook when an ESLint config exists only in a workspace member, not the root (Codex P1 #3660108918)", async () => {
+  // The scaffolded eslint hook runs `eslint <file>` from the PRIMARY ROOT on every
+  // edited file. ESLint flat config (eslint.config.*) resolves from CWD (the root),
+  // NOT recursively into subdirs, and legacy .eslintrc cascades from where it sits
+  // — so a config under ONLY `packages/a` does not apply to root files or sibling
+  // packages. eslint then errors (exit 2) and the scaffolded `|| exit 2` turns that
+  // config error into a BLOCKING hook on every non-member edit. hasEslintConfig must
+  // require a ROOT-applicable config (root-level file or root package.json
+  // eslintConfig), not merely any member config.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-eslint-member-only-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({
+    name: "root", scripts: {}, workspaces: ["packages/*"],
+    devDependencies: { prettier: "*", eslint: "*" },
+  }));
+  fs.mkdirSync(path.join(dir, "packages", "a"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "packages", "a", "package.json"), JSON.stringify({
+    name: "a", scripts: {},
+  }));
+  // ESLint config ONLY in the member, NOT at the root.
+  fs.writeFileSync(path.join(dir, "packages", "a", "eslint.config.mjs"), "export default [];\n");
+  await runCli(["init", "--cwd", dir, "--write"]);
+  assert.ok(fs.existsSync(path.join(dir, ".claude", "settings.json")), "prettier-only hook still scaffolded");
+  const settings = JSON.parse(fs.readFileSync(path.join(dir, ".claude", "settings.json"), "utf8"));
+  const cmds = (settings.hooks?.PostToolUse || []).flatMap((e) => (e.hooks || []).map((h) => h.command)).join("\n");
+  assert.ok(/prettier/.test(cmds), "prettier hook scaffolded (runs without a config)");
+  assert.ok(!/\beslint\b/.test(cmds), "eslint hook omitted when ESLint config is member-only (a root hook would block non-member edits via exit 2)");
+});
+
+test("Agent hooks MISS when a hook uses `npm <script>` without `run` (npm requires run for non-lifecycle scripts) (Codex P2 #3660108922)", () => {
+  // npm requires `run` to execute a user script: `npm lint` exits "Unknown
+  // command: lint" (npm run --help) and never invokes scripts.lint. Only npm's
+  // lifecycle shortcuts (test/start/stop/restart) are runnable bare. pnpm/yarn/bun
+  // run scripts WITHOUT `run`. A hook `npm lint` that resolves the root `lint`
+  // script false-PASSes a hook npm never executes; it must resolve to a definitive
+  // MISS (""), NOT opaque (null) — otherwise the caller's name-heuristic trusts
+  // `lint` by name and still PASSes.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-npm-no-run-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({
+    name: "root", scripts: { lint: "eslint .", format: "prettier --write ." },
+    devDependencies: { prettier: "*", eslint: "*" },
+  }));
+  fs.writeFileSync(path.join(dir, "eslint.config.mjs"), "export default [];\n");
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({
+    hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [
+      { type: "command", command: "npx eslint --no-warn-ignored {}" },
+      { type: "command", command: "npm lint" },
+      { type: "command", command: "npm format" },
+    ] }] },
+  }));
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  // `npm lint` / `npm format` (no `run`) -> npm errors -> MISS (hook broken).
+  assert.equal(hooks.ok, false, "`npm lint`/`npm format` without `run` -> npm never runs them -> MISS");
+  // Control 1: the SAME names WITH `run` resolve and PASS.
+  fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({
+    hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [
+      { type: "command", command: "npx eslint --no-warn-ignored {}" },
+      { type: "command", command: "npm run lint" },
+      { type: "command", command: "npm run format" },
+    ] }] },
+  }));
+  const r2 = analyzeForTest(dir);
+  const hooks2 = r2.checks.find((c) => c.area === "Agent hooks");
+  assert.ok(hooks2 && hooks2.ok, "`npm run lint`/`npm run format` -> resolve -> PASS (control)");
+  // Control 2: pnpm/yarn/bun run scripts WITHOUT `run` (not affected by the npm rule).
+  fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({
+    hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [
+      { type: "command", command: "npx eslint --no-warn-ignored {}" },
+      { type: "command", command: "pnpm lint" },
+      { type: "command", command: "pnpm format" },
+    ] }] },
+  }));
+  const r3 = analyzeForTest(dir);
+  const hooks3 = r3.checks.find((c) => c.area === "Agent hooks");
+  assert.ok(hooks3 && hooks3.ok, "`pnpm lint`/`pnpm format` (no `run`) -> pnpm runs scripts without run -> PASS (control)");
+});
+
+test("collectAllScripts applies `!` workspace negation to exclude members (Codex P2 #3660108928)", () => {
+  // npm workspaces support ordered `!pattern` exclusion: `["packages/*",
+  // "!packages/b"]` includes packages/a but REMOVES packages/b (glob processes
+  // patterns in order, negation removes prior matches). The analyzer must apply
+  // negation before indexing members, or the excluded member stays in the workspace
+  // map and a `npm --workspace b` selector resolves its script (false PASS) when npm
+  // itself errors "No workspaces found".
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-ws-neg-data-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({
+    name: "root", scripts: {}, workspaces: ["packages/*", "!packages/b"],
+  }));
+  fs.mkdirSync(path.join(dir, "packages", "a"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "packages", "a", "package.json"), JSON.stringify({
+    name: "a", scripts: { format: "prettier --write ." },
+  }));
+  fs.mkdirSync(path.join(dir, "packages", "b"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "packages", "b", "package.json"), JSON.stringify({
+    name: "b", scripts: { format: "prettier --write ." },
+  }));
+  const r = analyzeForTest(dir);
+  assert.ok(r.workspaceScripts.a, "included member `a` is in the workspace map");
+  assert.equal(r.workspaceScripts.b, undefined, "excluded member `b` is NOT in the workspace map (negation applied)");
+  assert.equal(r.workspaceScripts["packages/b"], undefined, "excluded member `packages/b` is NOT in the workspace map");
+});
+
+test("Agent hooks MISS when `npm --workspace <name>` targets a member excluded by `!` negation (Codex P2 #3660108928)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-ws-neg-hook-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.writeFileSync(path.join(dir, "eslint.config.mjs"), "export default [];\n");
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({
+    name: "root", scripts: {}, workspaces: ["packages/*", "!packages/b"],
+    devDependencies: { prettier: "*", eslint: "*" },
+  }));
+  fs.mkdirSync(path.join(dir, "packages", "a"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "packages", "a", "package.json"), JSON.stringify({
+    name: "a", scripts: { format: "prettier --write ." },
+  }));
+  fs.mkdirSync(path.join(dir, "packages", "b"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "packages", "b", "package.json"), JSON.stringify({
+    name: "b", scripts: { format: "prettier --write ." },
+  }));
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({
+    hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [
+      { type: "command", command: "npx eslint --no-warn-ignored {}" },
+      { type: "command", command: "npm --workspace b run format" },
+    ] }] },
+  }));
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  assert.equal(hooks.ok, false, "`npm --workspace b run format` -> b excluded by !packages/b -> npm errors -> MISS");
+  // Control: packages/a is still included and resolves.
+  fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({
+    hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [
+      { type: "command", command: "npx eslint --no-warn-ignored {}" },
+      { type: "command", command: "npm --workspace a run format" },
+    ] }] },
+  }));
+  const r2 = analyzeForTest(dir);
+  const hooks2 = r2.checks.find((c) => c.area === "Agent hooks");
+  assert.ok(hooks2 && hooks2.ok, "`npm --workspace a run format` -> a not excluded -> PASS (control)");
+});
