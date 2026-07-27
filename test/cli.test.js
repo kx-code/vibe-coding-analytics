@@ -4231,6 +4231,85 @@ test("Agent hooks MISS when a workspace selector names an unknown package (Codex
   assert.ok(hooks2 && hooks2.ok, "`npm --workspace a run format` -> a's prettier --write -> format PASS (control)");
 });
 
+test("collectAllScripts roots the unscoped map in the root package and restricts workspace lookups to declared members (Codex P2 #3659878984)", () => {
+  // `npm run <cmd>` with no --workspace selector runs in the CURRENT (root)
+  // package only (npm run --help), so the unscoped resolution map (`report.scripts`)
+  // must be the ROOT scripts — NOT a flat merge of every nested manifest, which
+  // would resolve a member's same-named body for a command npm rejects with
+  // "Missing script: <cmd>". Workspace lookups (`report.workspaceScripts`) must
+  // contain ONLY declared workspace members: a nested manifest that is not in
+  // `workspaces` cannot be selected with `--workspace` (npm errors "No workspaces
+  // found"), so indexing it would make a scoped hook resolve to a command npm
+  // never runs.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-scripts-rooted-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({
+    name: "root", scripts: { build: "tsc" }, workspaces: ["packages/*"],
+  }));
+  // `packages/a` IS declared (matches packages/*); `vendor/extra` is NOT declared.
+  fs.mkdirSync(path.join(dir, "packages", "a"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "packages", "a", "package.json"), JSON.stringify({
+    name: "a", scripts: { format: "prettier --write ." },
+  }));
+  fs.mkdirSync(path.join(dir, "vendor", "extra"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "vendor", "extra", "package.json"), JSON.stringify({
+    name: "extra", scripts: { format: "prettier --write ." },
+  }));
+  const r = analyzeForTest(dir);
+  // Unscoped map = ROOT scripts only: `format` (a member/extra script) must NOT
+  // appear; `build` (root script) must.
+  assert.deepEqual(r.scripts, { build: "tsc" }, "unscoped resolution map is rooted in the root package (no member scripts)");
+  // Workspace map = DECLARED members only: `a`/`packages/a` present, `extra` absent.
+  assert.ok(r.workspaceScripts.a && r.workspaceScripts.a.format === "prettier --write .", "declared member `a` is in the workspace map");
+  assert.ok(r.workspaceScripts["packages/a"], "declared member keyed by directory path");
+  assert.equal(r.workspaceScripts.extra, undefined, "non-declared `extra` must NOT be in the workspace map");
+  assert.equal(r.workspaceScripts["vendor/extra"], undefined, "non-declared `vendor/extra` must NOT be in the workspace map");
+});
+
+test("Agent hooks MISS when `npm --workspace <name>` targets a package not declared as a workspace (Codex P2 #3659878984)", () => {
+  // A nested manifest that exists on disk but is NOT declared in `workspaces`
+  // cannot be selected with `--workspace`; npm errors ("No workspaces found")
+  // and the hook never runs. Indexing such a manifest in the workspace map makes
+  // the selector resolve to a command npm rejects -> false PASS. Workspace
+  // lookups must be populated ONLY from declared workspace members.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-undeclared-ws-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.writeFileSync(path.join(dir, "eslint.config.mjs"), "export default [];\n");
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({
+    name: "root", scripts: {}, workspaces: ["packages/*"],
+    devDependencies: { prettier: "*", eslint: "*" },
+  }));
+  // `packages/a` IS declared (matches packages/*); `vendor/extra` is NOT declared.
+  fs.mkdirSync(path.join(dir, "packages", "a"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "packages", "a", "package.json"), JSON.stringify({
+    name: "a", scripts: { format: "prettier --write ." },
+  }));
+  fs.mkdirSync(path.join(dir, "vendor", "extra"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "vendor", "extra", "package.json"), JSON.stringify({
+    name: "extra", scripts: { format: "prettier --write ." },
+  }));
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({
+    hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [
+      { type: "command", command: "npx eslint --no-warn-ignored {}" },
+      { type: "command", command: "npm --workspace extra run format" },
+    ] }] },
+  }));
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  assert.equal(hooks.ok, false, "`npm --workspace extra run format` -> extra not a declared workspace -> npm errors -> MISS");
+  // Control: a DECLARED member with the same shape still credits format.
+  fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({
+    hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [
+      { type: "command", command: "npx eslint --no-warn-ignored {}" },
+      { type: "command", command: "npm --workspace a run format" },
+    ] }] },
+  }));
+  const r2 = analyzeForTest(dir);
+  const hooks2 = r2.checks.find((c) => c.area === "Agent hooks");
+  assert.ok(hooks2 && hooks2.ok, "`npm --workspace a run format` -> a is declared -> format PASS (control)");
+});
+
 test("Dangerous-command guard NOT N/A when a user-authored .claude/commands/ entry exists without CLAUDE.md (Codex P2)", () => {
   // isClaudeCodeProject recognized agents/ and skills/ but NOT custom slash
   // commands, so a project whose only Claude artifact was

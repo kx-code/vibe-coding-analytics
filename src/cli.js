@@ -91,7 +91,7 @@ function analyzeProject(cwd) {
     roots.some((root) => [...filesByRoot.get(root)].some((file) => file.startsWith(prefix)));
 
   const packageJson = readJson(path.join(cwd, "package.json"));
-  const { flat: scripts, byName: workspaceScripts } = collectAllScripts(cwd, allFiles);
+  const { flat: scripts, byName: workspaceScripts, all: allScripts } = collectAllScripts(cwd, allFiles);
   const shape = detectShape(cwd, packageJson);
   const untrackedHarness = untrackedHarnessFiles(cwd, allFiles);
 
@@ -204,7 +204,7 @@ function analyzeProject(cwd) {
     ),
     check(
       "Deploy hooks",
-      hasScriptPrefix(scripts, ["deploy", "release"]) ||
+      hasScriptPrefix(allScripts, ["deploy", "release"]) ||
         anyMakefileTarget(roots, ["deploy", "release"]) ||
         hasDeployArtifact(filesByRoot),
       "Add a deploy/release script, workflow, or skill so code is never deployed unverified.",
@@ -214,7 +214,7 @@ function analyzeProject(cwd) {
       !(hasAt("CLAUDE.md") || hasAt("AGENTS.md")) ||
         hasTestFiles(allFiles) ||
         hasValidateScript(allFiles) ||
-        Boolean(scripts.lint || scripts["type-check"] || scripts.typecheck || scripts.validate || scripts.ci),
+        Boolean(allScripts.lint || allScripts["type-check"] || allScripts.typecheck || allScripts.validate || allScripts.ci),
       "Rules in CLAUDE.md/AGENTS.md need computational sensors (tests, lint, validators); prose-only rules drift.",
     ),
     check(
@@ -451,50 +451,62 @@ function detectShape(cwd, packageJson) {
   return "single project";
 }
 
-/** Merge scripts from every package.json in the tree (root + nested subpackages).
- *  Returns the flat merged `scripts` map AND a `byName` map keyed by each
- *  package's `name` — the identity `npm run --workspace <name>` uses to select a
- *  specific package, so a workspace-scoped script invocation can be resolved
- *  against THAT package's scripts rather than the flattened value.
+/** Collect script maps for the package tree, split by how npm actually resolves
+ *  them — the SAME script body legitimately resolves or not depending on whether
+ *  the invocation is scoped:
  *
- *  The `byName` map is ALSO keyed by each member's DIRECTORY path (relative to
- *  cwd, e.g. `packages/a`): npm's `--workspace` selector accepts a PATH form
- *  (`--workspace packages/a`, npm run --help), not only a package name. Keyed by
- *  name alone, a path selector missed `byName` and fell back to the flat
- *  last-write-wins map — so `--workspace packages/a` (check-only formatter)
- *  could resolve to another member's writer and false-PASS format-on-save. The
- *  path key is normalized the same way the selector is (leading `./` stripped).
+ *  - `flat` — ROOT package scripts only. An UNSCOPED `npm run <cmd>` runs in the
+ *    CURRENT package (npm run --help: `npm run <command>` with no `--workspace`
+ *    selector runs in the current package), so a member's same-named script must
+ *    NOT satisfy an unscoped hook: npm would print "Missing script: <cmd>" and the
+ *    hook would never run. Rooting the unscoped map in the root package prevents a
+ *    member body from false-PASSing the Agent-hooks check. (Codex P2 #3659878984)
  *
- *  The ROOT manifest is merged LAST so it wins the last-write-wins merge. An
- *  unscoped `npm run X` runs the ROOT package's script (npm run --help: `npm run
- *  <command>` with no --workspace selector runs in the current package), so the
- *  flattened value for an unscoped invocation must be the ROOT body — not a
- *  member's that shadows it. Otherwise a root `prettier --check .` shadowed by a
- *  member's `prettier --write .` false-PASSes the Agent-hooks check and blocks
- *  format-on-save scaffolding. Scoped lookups use `byName` and are unaffected. */
+ *  - `byName` — DECLARED workspace members only (from `workspaces` /
+ *    pnpm-workspace.yaml), keyed by each member's `name` AND its directory path
+ *    (relative to cwd, e.g. `packages/a`). npm's `--workspace` selector accepts a
+ *    package NAME or a member PATH (`--workspace packages/a`, npm run --help); the
+ *    path key is normalized the same way the selector is (leading `./` stripped).
+ *    A nested manifest that exists on disk but is NOT declared as a workspace
+ *    cannot be selected with `--workspace` (npm errors "No workspaces found"), so
+ *    indexing it would make `npm --workspace <name> run <cmd>` resolve to a command
+ *    npm rejects -> false PASS. The root package is also keyed by name (the root is
+ *    an implicit workspace target reachable via `--workspace <rootname>`).
+ *    (Codex P2 #3659878984)
+ *
+ *  - `all` — every manifest's scripts merged (members first, root last so root wins
+ *    on conflict). This is an INVENTORY used only for presence checks that do not
+ *    depend on resolution semantics (the "Deploy hooks" and "Rule sensors" checks,
+ *    which ask "does this repo have a deploy/lint script anywhere?"). It is NOT
+ *    used to resolve hook commands. Scoped lookups use `byName`; unscoped use
+ *    `flat`. */
 function collectAllScripts(cwd, allFiles) {
   const flat = {};
   const byName = {};
+  const all = {};
   const rootPkg = readJson(path.join(cwd, "package.json"));
   for (const file of allFiles) {
     if (file.includes("node_modules/")) continue;
     if (file === "package.json" || file.endsWith("/package.json")) {
-      if (file === "package.json") continue; // root merged last, below
+      if (file === "package.json") continue; // root merged into `all` last, below
       const pkg = readJson(path.join(cwd, file));
-      if (pkg && pkg.scripts) {
-        Object.assign(flat, pkg.scripts);
-        if (typeof pkg.name === "string" && pkg.name) byName[pkg.name] = pkg.scripts;
-        // Also key by member DIRECTORY (relative to cwd) so the `--workspace
-        // <path>` selector form resolves to THIS package rather than the flat map.
-        byName[file.slice(0, -"/package.json".length)] = pkg.scripts;
-      }
+      if (pkg && pkg.scripts) Object.assign(all, pkg.scripts);
     }
   }
   if (rootPkg && rootPkg.scripts) {
     Object.assign(flat, rootPkg.scripts);
+    Object.assign(all, rootPkg.scripts); // root last: wins the inventory merge
     if (typeof rootPkg.name === "string" && rootPkg.name) byName[rootPkg.name] = rootPkg.scripts;
   }
-  return { flat, byName };
+  for (const { dir, pkg } of readDeclaredWorkspaceMembers(cwd, rootPkg)) {
+    if (!pkg.scripts) continue;
+    if (typeof pkg.name === "string" && pkg.name) byName[pkg.name] = pkg.scripts;
+    // Also key by member DIRECTORY (relative to cwd) so the `--workspace <path>`
+    // selector form resolves to THIS package.
+    const rel = path.relative(cwd, dir);
+    if (rel) byName[rel] = pkg.scripts;
+  }
+  return { flat, byName, all };
 }
 
 /** Normalize a `--workspace` selector value for `byName` lookup. npm accepts a
@@ -1786,7 +1798,12 @@ function pnpmWorkspacePatterns(root) {
   return patterns;
 }
 
-function readWorkspaceMemberPackages(root, pkg) {
+/** Read the DECLARED workspace members under `root` as `{ dir, pkg }` pairs by
+ *  resolving each workspace pattern (npm `workspaces` or pnpm-workspace.yaml,
+ *  brace-expanded, literal/`*`/`**`/partial-wildcard) to its concrete directories.
+ *  Members without a manifest are skipped. Shared by dependency detection and
+ *  script-map population so BOTH honor the same declaration boundary. */
+function readDeclaredWorkspaceMembers(root, pkg) {
   const members = [];
   const patterns = [...workspacePatterns(pkg), ...pnpmWorkspacePatterns(root)];
   for (const pat of patterns) {
@@ -1795,11 +1812,15 @@ function readWorkspaceMemberPackages(root, pkg) {
       if (!t) continue;
       for (const dir of resolveWorkspacePattern(root, t)) {
         const memberPkg = readJson(path.join(dir, "package.json"));
-        if (memberPkg) members.push(memberPkg);
+        if (memberPkg) members.push({ dir, pkg: memberPkg });
       }
     }
   }
   return members;
+}
+
+function readWorkspaceMemberPackages(root, pkg) {
+  return readDeclaredWorkspaceMembers(root, pkg).map((m) => m.pkg);
 }
 
 /** True when `cwd` is governed by Yarn Berry (v2+). Berry's default Plug'n'Play
