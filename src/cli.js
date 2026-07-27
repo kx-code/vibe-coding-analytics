@@ -909,6 +909,18 @@ const FORMAT_CMD_RE = /\bprettier\b|\bformat\b|\bfmt\b/i;
 // double dash, which is NOT present in the single-dash `--no-write`).
 const FORMAT_CHECK_RE = /(?:--check|--list-different|--no-write|:check)\b/;
 const FORMAT_WRITE_RE = /(?:--write|--fix)\b/;
+// A package-manager script invocation (`npm/pnpm/yarn/bun [run] <script>`) hides
+// the script body, so its formatter — if any — is trusted as-is: we cannot see
+// whether it passes a write flag. A DIRECT prettier call is different: prettier
+// prints to stdout by default and only rewrites in place with --write/-w, so a
+// bare `prettier {}` does NOT satisfy format-on-save and must not false-PASS.
+// `npx`/`bunx` are NOT matched here — they execute the binary directly, so a
+// flag-less `npx prettier {}` is still a direct (non-writing) call.
+const PM_SCRIPT_RE = /\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?\S/;
+// `-w` is prettier's short write flag. Matched as a standalone token (bounded by
+// whitespace or string end) so it does NOT fire inside `--no-write`, whose `-w`
+// sits mid-token after `o` (no preceding boundary).
+const SHORT_WRITE_FLAG_RE = /(?:^|\s)-w(?=\s|$)/;
 function commandPurposes(cmd) {
   let c = String(cmd || "");
   // Drop the FULL argument list of echo/printf — status text such as
@@ -943,8 +955,16 @@ function commandPurposes(cmd) {
   const segments = c.split(/\s*(?:&&|\|\||\||;)\s*/);
   const formatSatisfied = segments.some((seg) => {
     if (!FORMAT_CMD_RE.test(seg)) return false;
-    const checkOnly = FORMAT_CHECK_RE.test(seg) && !FORMAT_WRITE_RE.test(seg);
-    return !checkOnly;
+    if (PM_SCRIPT_RE.test(seg)) {
+      // Opaque package script: trust it writes unless the name signals check-only
+      // (`format:check`) — the script body is invisible, so we can't apply
+      // prettier's defaults-to-stdout rule to it.
+      return !(FORMAT_CHECK_RE.test(seg) && !FORMAT_WRITE_RE.test(seg));
+    }
+    // Direct binary call: require an explicit write flag. prettier writes to
+    // stdout by default, so a flag-less `prettier {}` leaves the file untouched
+    // and must not satisfy the format-on-save promise.
+    return FORMAT_WRITE_RE.test(seg) || SHORT_WRITE_FLAG_RE.test(seg);
   });
   if (formatSatisfied) purposes.push("format");
   return purposes;
@@ -1215,9 +1235,18 @@ function hasNodeFormattersAnywhere(roots) {
  *  irreversible in any stack with a database. Detected from migrations,
  *  ORM configs, or package deps. */
 function isDbProject(report) {
-  const paths = [...report.files].join("\n").toLowerCase();
-  const dbFileSignals = ["prisma/schema", "drizzle", "knexfile", "migrations/", "schema.sql", "/supabase/"];
+  const files = [...report.files];
+  const paths = files.join("\n").toLowerCase();
+  const dbFileSignals = ["prisma/schema", "drizzle", "knexfile", "migrations/", "schema.sql"];
   if (dbFileSignals.some((sig) => paths.includes(sig))) return true;
+  // A `supabase/` directory at the project root OR nested signals a Supabase
+  // project (config.toml, migrations, functions). The bare `/supabase/` substring
+  // matched only NESTED paths — a root-level `supabase/config.toml` carries no
+  // leading slash, so a fresh Supabase repo with no migrations/ORM deps yet was
+  // misread as non-database and the SQL deny guards were omitted. Match the path
+  // segment anchored at a path boundary so it does not false-positive on
+  // `mysupabase/` (a loose `supabase/` substring would).
+  if (files.some((f) => { const lf = f.toLowerCase(); return lf.startsWith("supabase/") || lf.includes("/supabase/"); })) return true;
   // Match the STANDARD published package names. The old keys (`drizzle`,
   // `prisma`) were nonstandard: `drizzle` is not a real package (the ORM is
   // `drizzle-orm`), and a project depending on `@prisma/client` alone (no `prisma`

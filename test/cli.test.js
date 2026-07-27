@@ -2722,6 +2722,51 @@ test("Agent hooks MISS format when a linter's --fix leaks across a combined comm
   assert.ok(hooks && hooks.ok, "formatter segment with its own --write must satisfy BOTH purposes");
 });
 
+test("Agent hooks MISS format when a DIRECT prettier call lacks a write flag (Codex P2)", () => {
+  // prettier prints to stdout by default and only rewrites with --write/-w. A
+  // flag-less direct call (`prettier {}`, `npx prettier {}`) leaves the file
+  // untouched, so it must NOT satisfy format-on-save. Opaque package scripts
+  // (`npm run format`) hide their body and are still trusted. Lint is always
+  // covered here so the MISS is attributable solely to the missing write flag.
+  for (const noWriteCmd of [
+    "prettier {}",
+    "prettier .",
+    "npx prettier {}",
+    "prettier --no-write .",
+  ]) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-hooks-prettier-nowrite-"));
+    fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {}, devDependencies: { prettier: "*", eslint: "*" } }));
+    fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
+    fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, ".claude", "settings.json"),
+      JSON.stringify({
+        hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [{ type: "command", command: "npx eslint --fix ." }, { type: "command", command: noWriteCmd }] }] },
+      }),
+    );
+    const r = analyzeForTest(dir);
+    const hooks = r.checks.find((c) => c.area === "Agent hooks");
+    assert.ok(hooks && !hooks.ok, `direct prettier without write flag "${noWriteCmd}" must NOT satisfy format`);
+  }
+  // Sanity: a direct prettier write flag (long --write AND short -w) satisfies
+  // format, and an opaque `npm run format` still satisfies it.
+  for (const writeCmd of ["prettier --write .", "prettier -w .", "npx prettier -w .", "npm run format"]) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-hooks-prettier-write-"));
+    fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {}, devDependencies: { prettier: "*", eslint: "*" } }));
+    fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
+    fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, ".claude", "settings.json"),
+      JSON.stringify({
+        hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [{ type: "command", command: "npx eslint --fix ." }, { type: "command", command: writeCmd }] }] },
+      }),
+    );
+    const r = analyzeForTest(dir);
+    const hooks = r.checks.find((c) => c.area === "Agent hooks");
+    assert.ok(hooks && hooks.ok, `formatter "${writeCmd}" must satisfy format`);
+  }
+});
+
 test("Dangerous-command guard recognizes curl|sh entries whose URL contains colons (Codex P2)", () => {
   // denyEntryBlocksDangerousCommand used to slice at the FIRST colon, truncating
   // `Bash(curl https://example.com/install.sh | sh)` to `curl https` so the
@@ -2813,6 +2858,21 @@ test("isDbProject inspects workspace member manifests, not just the root (Codex 
   await runCli(["init", "--cwd", cleanDir, "--write"]);
   const cleanLocal = fs.readFileSync(path.join(cleanDir, ".claude", "settings.local.json"), "utf8");
   assert.ok(!/DROP TABLE/.test(cleanLocal), "monorepo with no DB dep must NOT scaffold SQL guards");
+});
+
+test("isDbProject recognizes a root-level supabase/ directory without migrations or ORM deps (Codex P2)", async () => {
+  // A fresh Supabase repo's only database signal is the standard root-level
+  // `supabase/config.toml`. The `/supabase/` substring matched only NESTED paths
+  // (root paths carry no leading slash), so with no migrations/ or ORM dep the
+  // project was misread as non-database and the SQL deny guards were omitted.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-db-supabase-root-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "supa", scripts: {} }));
+  fs.mkdirSync(path.join(dir, "supabase"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "supabase", "config.toml"), "# supabase config\n");
+  await runCli(["init", "--cwd", dir, "--write"]);
+  const local = fs.readFileSync(path.join(dir, ".claude", "settings.local.json"), "utf8");
+  assert.ok(/DROP TABLE/.test(local), "root-level supabase/ must scaffold SQL deny guards");
 });
 
 test("Dangerous-command guard + scaffold cover recursive rm clustered with non-force flags (Codex P1)", async () => {
