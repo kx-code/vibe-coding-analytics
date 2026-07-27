@@ -3180,6 +3180,49 @@ test("Agent hooks: --workspace <member-path> resolves that member's script (Code
   assert.equal(hooks.ok, false, "--workspace packages/a resolves to a's check-only formatter, not flat-fallback to the root writer");
 });
 
+test("Agent hooks: yarn `workspace <name>` + pnpm `--filter <name>` selectors resolve that member (Codex P2 #3656097552)", () => {
+  // npm's --workspace flag is one of THREE workspace-selector spellings; the
+  // other two were NOT parsed by extractScriptName/resolveScriptBody, so the
+  // member selection was lost and resolution went opaque:
+  //   yarn classic: `yarn workspace <name> <cmd>`  (POSITIONAL — `workspace` keyword, then the name)
+  //   pnpm:         `pnpm --filter <name> <cmd>`   (--filter flag, accepts a name OR a member path)
+  // extractScriptName returned the wrong token (`workspace` for yarn, the package
+  // `a` for pnpm --filter) taken as the script name -> body failed to resolve ->
+  // opaque -> the name-heuristic fallback saw `format` and false-PASSed a
+  // check-only member's formatter. Root is a writer (wins the flat merge) so the
+  // contrast is sharp: the selector MUST land on member `a` (check-only).
+  for (const selectorCmd of [
+    "yarn workspace a run format",           // yarn classic positional
+    "pnpm --filter a run format",            // pnpm --filter (name form)
+    "pnpm --filter ./packages/a run format", // pnpm --filter (path form, normalized to directory key)
+  ]) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-ws-selector-"));
+    fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+    fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({
+      name: "root",
+      workspaces: ["packages/*"],
+      scripts: { format: "prettier --write ." },   // root writer -> wins flat merge
+      devDependencies: { prettier: "*", eslint: "*" },
+    }));
+    fs.mkdirSync(path.join(dir, "packages/a"), { recursive: true });
+    fs.writeFileSync(path.join(dir, "packages/a/package.json"), JSON.stringify({
+      name: "a",
+      scripts: { format: "prettier --check ." },   // member a: check-only
+    }));
+    fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+    fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({
+      hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [
+        { type: "command", command: selectorCmd },                  // selector -> a's check-only
+        { type: "command", command: "npx eslint --no-warn-ignored {}" },
+      ] }] },
+    }));
+    const r = analyzeForTest(dir);
+    const hooks = r.checks.find((c) => c.area === "Agent hooks");
+    assert.ok(hooks, "Agent hooks check present");
+    assert.equal(hooks.ok, false, `selector "${selectorCmd}" resolves to a's check-only formatter, not flat-fallback to the root writer`);
+  }
+});
+
 test("init --write scaffolds a writing formatter when `npm run format` is check-only (Codex P2)", async () => {
   // Practical outcome: because format is now correctly detected as MISSING, init
   // must scaffold a real writing prettier hook instead of skipping it.

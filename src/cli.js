@@ -1065,15 +1065,28 @@ function extractScriptName(invocation) {
   const s = String(invocation || "");
   const pm = s.match(/\b(?:npm|pnpm|yarn|bun)\b/);
   if (!pm) return null;
+  const isYarn = pm[0] === "yarn";
   const tokens = s.slice(pm.index + pm[0].length).split(/\s+/).filter(Boolean);
   let i = 0;
   while (i < tokens.length) {
     const t = tokens[i];
     if (t === "run") { i++; continue; }
-    if (t === "--workspace" || t === "-w") { i += 2; continue; } // value is next token
-    if (/^(?:--workspace|-w)=/.test(t)) { i++; continue; }        // inline value (--workspace=a)
-    if (t.startsWith("-")) { i++; continue; }                     // boolean option
-    return t;                                                      // first bare token = script name
+    // Workspace selectors that consume a VALUE token — skip selector + value so
+    // the real script NAME is returned instead of the selector keyword/value:
+    //   `--workspace <pkg>` / `-w <pkg>`  (npm, pnpm)
+    //   `--filter <pkg>`                  (pnpm)
+    //   `workspace <name> <cmd>`          (yarn classic, POSITIONAL — no flag)
+    // Without this, `yarn workspace a run format` returns `workspace` and
+    // `pnpm --filter a run format` returns the package `a` — both wrong, so the
+    // body fails to resolve -> opaque -> the name-heuristic fallback sees `format`
+    // and false-PASSes a check-only formatter. Yarn's `workspace` keyword is
+    // honored only under yarn so a script literally named "workspace" under
+    // npm/pnpm/bun is not misread as a selector.
+    if (t === "--workspace" || t === "-w" || t === "--filter") { i += 2; continue; }
+    if (isYarn && t === "workspace") { i += 2; continue; }
+    if (/^(?:--workspace|-w|--filter)=/.test(t)) { i++; continue; } // inline value (--filter=a)
+    if (t.startsWith("-")) { i++; continue; }                        // boolean option
+    return t;                                                         // first bare token = script name
   }
   return null;
 }
@@ -1083,15 +1096,22 @@ function resolveScriptBody(invocation, scripts, seen, workspaceScripts) {
   if (!PM_SCRIPT_RE.test(s)) return null;
   const name = extractScriptName(s);
   if (!name || seen.has(name)) return null;
-  // `-w`/`--workspace` are npm/pnpm/yarn's package selector (documented in
-  // `npm run --help`); `[ =]` covers the space and `=` spellings. Bounded by
-  // whitespace so it does not fire mid-token, and `-w` alone (no value) leaves
-  // wsName undefined -> flat fallback. The selector value is NORMALIZED (leading
-  // `./` stripped) before the byName lookup so the PATH form (`--workspace
-  // packages/a` / `./packages/a`) matches the directory key collectAllScripts
-  // records, not only the package-NAME form.
-  const ws = s.match(/(?:^|\s)(?:--workspace|-w)[ =](\S+)/);
-  const wsName = ws ? normalizeWorkspaceKey(ws[1]) : null;
+  // Workspace/package selectors — each picks a specific package so the script
+  // body resolves against THAT package's scripts rather than the flat merged map:
+  //   npm/pnpm: `--workspace <pkg>` / `-w <pkg>` (space or `=` spelling)
+  //   pnpm:     `--filter <pkg>` (accepts a name OR a member path like `./packages/a`)
+  //   yarn:     `workspace <name> <cmd>` (classic POSITIONAL selector — no flag)
+  // Bounded by whitespace so it does not fire mid-token; a bare flag without a
+  // value leaves wsName null -> flat fallback. The value is NORMALIZED (leading
+  // `./` stripped) to match the directory-key form collectAllScripts records for
+  // the PATH spelling. Yarn's positional `workspace <name>` is matched only when
+  // the runner is yarn (pm-keyword check) so a non-yarn `run workspace` script
+  // name is not eaten as a selector value.
+  const pmOf = s.match(/\b(npm|pnpm|yarn|bun)\b/);
+  const wsFlag = s.match(/(?:^|\s)(?:--workspace|-w|--filter)[ =](\S+)/);
+  const wsYarn = pmOf && pmOf[1] === "yarn" ? s.match(/(?:^|\s)workspace\s+(\S+)/) : null;
+  const wsName = wsFlag ? normalizeWorkspaceKey(wsFlag[1])
+    : wsYarn ? normalizeWorkspaceKey(wsYarn[1]) : null;
   const scope = wsName && workspaceScripts && workspaceScripts[wsName]
     ? workspaceScripts[wsName]
     : scripts;
