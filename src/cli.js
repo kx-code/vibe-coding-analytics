@@ -765,7 +765,11 @@ const DANGEROUS_CMD_RE = new RegExp(
       "rm\\s+--recursive\\b.*?(?:--force\\b|-f(?:\\s|$))",
       "git\\s+push\\b.*?\\s(?:--force|-f)(?:\\s|$)",
       "git\\s+reset\\b.*?\\s--hard(?:\\s|$)",
-      "git\\s+clean\\b",
+      // git clean needs a FORCE flag to actually delete (without -f git refuses;
+      // -n/--dry-run only previews). Require -f in a short-flag cluster or
+      // --force, so `Bash(git clean -n:*)` (a safe preview) does not false-satisfy
+      // the guard and skip scaffolding of rm -rf / force-push protection.
+      "git\\s+clean\\b.*?(?:--force\\b|-[fdxXnie]*f[fdxXnie]*(?:\\s|$))",
       "mkfs",
       "dd\\s+if",
       "drop\\s+(?:table|database)",
@@ -881,7 +885,7 @@ function matcherIsEditWriteEntry(matcher) {
 // report the agent-hooks check as PASS, skipping the scaffold.
 const LINT_CMD_RE = /\beslint\b|\blint\b/i;
 const FORMAT_CMD_RE = /\bprettier\b|\bformat\b|\bfmt\b/i;
-function commandPurpose(cmd) {
+function commandPurposes(cmd) {
   // Strip quoted string literals first: an echo/printf argument like
   // "lint and format complete" is human-readable text, not a tool invocation.
   // Stripping single + double quotes leaves real command tokens (npx, eslint,
@@ -889,9 +893,14 @@ function commandPurpose(cmd) {
   const c = String(cmd || "")
     .replace(/'(?:[^'\\]|\\.)*'/g, "")
     .replace(/"(?:[^"\\]|\\.)*"/g, "");
-  if (LINT_CMD_RE.test(c)) return "lint";
-  if (FORMAT_CMD_RE.test(c)) return "format";
-  return null;
+  // Return ALL matched purposes, not just the first: a combined command such as
+  // `npm run lint && npm run format` performs both jobs, so both flags must be
+  // set. Returning a single value left format undetected, and init/evolve then
+  // appended a redundant prettier hook that ran the formatter twice per edit.
+  const purposes = [];
+  if (LINT_CMD_RE.test(c)) purposes.push("lint");
+  if (FORMAT_CMD_RE.test(c)) purposes.push("format");
+  return purposes;
 }
 
 /** Detect Claude Code hooks + permission-guard config for the PRIMARY project
@@ -933,9 +942,10 @@ function detectHooksConfig(roots) {
       // wide matcher entry may carry a lint hook AND a format hook, and a
       // quoted status echo inside one command must not flip the other purpose.
       for (const h of entry.hooks || []) {
-        const purpose = commandPurpose(h?.command);
-        if (purpose === "lint") postToolUseLint = true;
-        else if (purpose === "format") postToolUseFormat = true;
+        for (const purpose of commandPurposes(h?.command)) {
+          if (purpose === "lint") postToolUseLint = true;
+          else if (purpose === "format") postToolUseFormat = true;
+        }
       }
     }
   }
@@ -1562,20 +1572,22 @@ function mergeHooksSettings(existingContent, incomingContent) {
       // satisfies it. Exact-string dedup alone would treat `prettier --write .`
       // as different from the scaffold's `npx prettier --write` and append it,
       // running the formatter and linter twice on every edit. Classification
-      // mirrors detectHooksConfig (commandPurpose), so "already satisfies
+      // mirrors detectHooksConfig (commandPurposes), so "already satisfies
       // detection" and "already merged" stay consistent.
       const coveredPurposes = new Set();
       for (const h of existingEntry.hooks) {
-        const purpose = commandPurpose(h?.command);
-        if (purpose) coveredPurposes.add(purpose);
+        for (const purpose of commandPurposes(h?.command)) coveredPurposes.add(purpose);
       }
       for (const h of entry.hooks || []) {
         if (!h?.command || knownCmds.has(h.command)) continue;
-        const purpose = commandPurpose(h.command);
-        if (purpose && coveredPurposes.has(purpose)) continue;
+        // A combined command (e.g. `npm run lint && npm run format`) carries
+        // multiple purposes; only skip it when EVERY purpose it serves is
+        // already covered, otherwise an uncovered purpose would go unscaffolded.
+        const purposes = commandPurposes(h.command);
+        if (purposes.length && purposes.every((p) => coveredPurposes.has(p))) continue;
         existingEntry.hooks.push(h);
         knownCmds.add(h.command);
-        if (purpose) coveredPurposes.add(purpose);
+        for (const p of purposes) coveredPurposes.add(p);
       }
     }
   }

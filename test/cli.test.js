@@ -2343,7 +2343,7 @@ test("Dangerous-command guard recognizes SQL client / migration reset commands a
 });
 
 test("Agent hooks MISS when a PostToolUse hook only echoes a lint/format status string (Codex P2)", () => {
-  // commandPurpose must strip quoted string literals before the word-boundary
+  // commandPurposes must strip quoted string literals before the word-boundary
   // test, so `echo 'lint and format complete'` is NOT misread as a real
   // eslint/prettier invocation. Without quote-stripping + word boundaries, the
   // bare /lint/ and /format/ substring regexes matched the human-readable echo
@@ -2365,7 +2365,7 @@ test("Agent hooks MISS when a PostToolUse hook only echoes a lint/format status 
 
 test("Agent hooks PASS when PostToolUse hooks run real eslint + prettier via a pipeline (Codex P2)", () => {
   // The scaffolded hook command is a pipeline: `node -e "..." | ... npx
-  // prettier` and `... | ... npx eslint`. commandPurpose must still classify
+  // prettier` and `... | ... npx eslint`. commandPurposes must still classify
   // these: the tool name sits mid-pipeline, and the double-quoted node script
   // must be stripped without eating the trailing `npx prettier` / `npx eslint`.
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-hooks-real-"));
@@ -2391,4 +2391,75 @@ test("Agent hooks PASS when PostToolUse hooks run real eslint + prettier via a p
   const r = analyzeForTest(dir);
   const hooks = r.checks.find((c) => c.area === "Agent hooks");
   assert.ok(hooks && hooks.ok, "a real eslint + prettier pipeline must satisfy the Agent-hooks check");
+});
+
+test("Dangerous-command guard requires a destructive git clean flag, not a dry-run (Codex P2)", () => {
+  // git clean needs -f to actually delete (without -f git refuses; -n only
+  // previews). The old `git\s+clean\b` alternative matched ANY git clean entry,
+  // so `Bash(git clean -n:*)` (a safe dry-run preview) false-satisfied the guard
+  // and init/evolve skipped scaffolding of rm -rf / force-push protection.
+  for (const safe of ["Bash(git clean -n:*)", "Bash(git clean:*)", "Bash(git clean -i:*)"]) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-deny-clean-safe-"));
+    fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+    fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+    fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({ permissions: { deny: [safe] } }));
+    const r = analyzeForTest(dir);
+    const guard = r.checks.find((c) => c.area === "Dangerous-command guard");
+    assert.ok(guard && !guard.ok, `${safe} must NOT satisfy the guard (no force flag)`);
+  }
+  // Destructive forms (short -f cluster in any order, or --force) still satisfy.
+  for (const dangerous of ["Bash(git clean -f:*)", "Bash(git clean -fd:*)", "Bash(git clean -df:*)", "Bash(git clean --force:*)"]) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-deny-clean-destructive-"));
+    fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+    fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+    fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({ permissions: { deny: [dangerous] } }));
+    const r = analyzeForTest(dir);
+    const guard = r.checks.find((c) => c.area === "Dangerous-command guard");
+    assert.ok(guard && guard.ok, `${dangerous} must satisfy the guard (has force flag)`);
+  }
+});
+
+test("Agent hooks PASS when a single combined command runs both lint and format (Codex P2)", () => {
+  // commandPurposes returns ALL matched purposes, not just the first. A combined
+  // command `npm run lint && npm run format` does both jobs; returning a single
+  // "lint" left format undetected, so the Agent-hooks check reported format
+  // missing and a redundant prettier hook was merged in (formatter ran twice).
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-hooks-combined-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {}, devDependencies: { prettier: "*", eslint: "*" } }));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, ".claude", "settings.json"),
+    JSON.stringify({
+      hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [{ type: "command", command: "npm run lint && npm run format" }] }] },
+    }),
+  );
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  assert.ok(hooks && hooks.ok, "a combined lint+format command must satisfy BOTH purposes");
+});
+
+test("evolve --write does not append a redundant formatter hook when an existing combined command already covers both purposes (Codex P2)", async () => {
+  // Mirrors detectHooksConfig: the merge tracks every purpose each existing
+  // command covers. With `npm run lint && npm run format` already present, both
+  // lint and format are covered, so evolve must append NEITHER eslint NOR prettier.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-merge-combined-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {}, devDependencies: { prettier: "*", eslint: "*" } }));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, ".claude", "settings.json"),
+    JSON.stringify({
+      hooks: {
+        PostToolUse: [
+          { matcher: "Edit|Write", hooks: [{ type: "command", command: "npm run lint && npm run format" }] },
+        ],
+      },
+    }),
+  );
+  await runCli(["evolve", "--cwd", dir, "--write"]);
+  const merged = JSON.parse(fs.readFileSync(path.join(dir, ".claude", "settings.json"), "utf8"));
+  const entry = (merged.hooks?.PostToolUse || []).find((e) => String(e.matcher ?? "").trim() === "Edit|Write");
+  const cmds = (entry?.hooks || []).map((h) => h.command);
+  assert.deepEqual(cmds, ["npm run lint && npm run format"], "no redundant eslint/prettier appended when both purposes already covered");
 });
