@@ -4,7 +4,20 @@ import path from "node:path";
 import test from "node:test";
 import { execSync, execFileSync } from "node:child_process";
 import assert from "node:assert/strict";
-import { analyzeForTest, runCli, buildEvolutionPlan, printEvolution, printReport, parseOptions } from "../src/cli.js";
+import { analyzeForTest, runCli, buildEvolutionPlan, printEvolution, printReport, parseOptions, denyEntryFamily } from "../src/cli.js";
+
+// A deny list that covers EVERY always-on irreversible-command family — the
+// coverage the guard now requires to PASS (and that init/evolve require before
+// they skip merging the defaults). One entry per family so the list stays
+// legible. (Codex P1 #3660296403)
+const FULL_GUARD_DENY_LIST = [
+  "Bash(rm -rf:*)",
+  "Bash(git push --force:*)",
+  "Bash(git reset --hard:*)",
+  "Bash(git clean -f:*)",
+  "Bash(mkfs:*)",
+  "Bash(curl *|sh)",
+];
 
 test("analyzes an empty project with missing harness areas", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-empty-"));
@@ -1201,11 +1214,11 @@ test("Dangerous-command guard PASS when settings.local.json has a deny list", ()
   fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
   fs.writeFileSync(
     path.join(dir, ".claude", "settings.local.json"),
-    JSON.stringify({ permissions: { deny: ["Bash(rm -rf:*)"] } }),
+    JSON.stringify({ permissions: { deny: FULL_GUARD_DENY_LIST } }),
   );
   const r = analyzeForTest(dir);
   const guard = r.checks.find((c) => c.area === "Dangerous-command guard");
-  assert.ok(guard && guard.ok, "non-empty permissions.deny should PASS");
+  assert.ok(guard && guard.ok, "a deny list covering every always-on family should PASS");
 });
 
 test("Agent hooks + guard both MISS on a bare project", () => {
@@ -1790,10 +1803,10 @@ test("Dangerous-command guard PASS when deny list is in the shared settings.json
   fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
   fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
   // deny list lives in the SHARED, committed settings.json — must be detected,
-  // not only the gitignored settings.local.json.
+  // not only the gitignored settings.local.json. Covers every always-on family.
   fs.writeFileSync(
     path.join(dir, ".claude", "settings.json"),
-    JSON.stringify({ permissions: { deny: ["Bash(rm -rf:*)"] } }),
+    JSON.stringify({ permissions: { deny: FULL_GUARD_DENY_LIST } }),
   );
   const r = analyzeForTest(dir);
   const guard = r.checks.find((c) => c.area === "Dangerous-command guard");
@@ -2560,15 +2573,15 @@ test("evolve --write skips deny scaffolding when a dangerous-command guard is al
   fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {} }));
   fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
   fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
-  // Committed settings.json already has a detected dangerous-command guard.
-  // evolve --write must NOT create/expand settings.local.json with the full
-  // default deny list — that would duplicate (or expand beyond) the existing guard.
+  // Committed settings.json already has a COMPLETE dangerous-command guard
+  // (every always-on family). evolve --write must NOT create/expand
+  // settings.local.json — that would duplicate an already-sufficient guard.
   fs.writeFileSync(
     path.join(dir, ".claude", "settings.json"),
-    JSON.stringify({ permissions: { deny: ["Bash(rm -rf:*)"] } }),
+    JSON.stringify({ permissions: { deny: FULL_GUARD_DENY_LIST } }),
   );
   await runCli(["evolve", "--cwd", dir, "--write"]);
-  assert.equal(fs.existsSync(path.join(dir, ".claude", "settings.local.json")), false, "deny list NOT scaffolded when a dangerous-command guard already exists");
+  assert.equal(fs.existsSync(path.join(dir, ".claude", "settings.local.json")), false, "deny list NOT scaffolded when a COMPLETE guard already exists");
 });
 
 test("init --write skips deny scaffolding when a dangerous-command guard is already detected (Codex P2)", async () => {
@@ -2576,12 +2589,13 @@ test("init --write skips deny scaffolding when a dangerous-command guard is alre
   fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {} }));
   fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
   fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  // A COMPLETE guard (every always-on family) — init must skip scaffolding.
   fs.writeFileSync(
     path.join(dir, ".claude", "settings.json"),
-    JSON.stringify({ permissions: { deny: ["Bash(git push --force:*)"] } }),
+    JSON.stringify({ permissions: { deny: FULL_GUARD_DENY_LIST } }),
   );
   await runCli(["init", "--cwd", dir, "--write"]);
-  assert.equal(fs.existsSync(path.join(dir, ".claude", "settings.local.json")), false, "deny list NOT scaffolded by init when a dangerous-command guard already exists");
+  assert.equal(fs.existsSync(path.join(dir, ".claude", "settings.local.json")), false, "deny list NOT scaffolded by init when a COMPLETE guard already exists");
 });
 
 test("Agent hooks MISS when lint+format coverage is split across the primary root and a submodule (Codex P2)", () => {
@@ -2710,7 +2724,7 @@ test("Dangerous-command guard recognizes the sudo rm deny entry vca itself scaff
     );
     const r = analyzeForTest(dir);
     const guard = r.checks.find((c) => c.area === "Dangerous-command guard");
-    assert.ok(guard && guard.ok, `deny entry ${entry} must satisfy the dangerous-command guard`);
+    assert.ok(guard && guard.coveredFamilies.includes("rm-recursive"), `deny entry ${entry} must be recognized as the rm-recursive family`);
   }
   // No leading sudo -> unchanged MISS (the -r is a prefix of the -readme token).
   const negDir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-sudo-rm-neg-"));
@@ -2722,7 +2736,7 @@ test("Dangerous-command guard recognizes the sudo rm deny entry vca itself scaff
   );
   const neg = analyzeForTest(negDir);
   const negGuard = neg.checks.find((c) => c.area === "Dangerous-command guard");
-  assert.ok(negGuard && !negGuard.ok, "`Bash(rm -readme:*)` (no sudo) still MISSes after sudo normalization");
+  assert.ok(negGuard && !negGuard.coveredFamilies.includes("rm-recursive"), "`Bash(rm -readme:*)` (no sudo) is NOT recognized as rm-recursive");
 });
 
 test("evolve --write keeps a BROADER-than-edit PostToolUse matcher scoped away from formatter hooks and adds a separate Edit|Write entry (Codex P2)", async () => {
@@ -2787,7 +2801,7 @@ test("Dangerous-command guard recognizes rm long-form and reordered flag spellin
     fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({ permissions: { deny: [variant] } }));
     const r = analyzeForTest(dir);
     const guard = r.checks.find((c) => c.area === "Dangerous-command guard");
-    assert.ok(guard && guard.ok, `${variant} must satisfy the dangerous-command guard`);
+    assert.ok(guard && guard.coveredFamilies.length > 0, `${variant} must be recognized as a dangerous command`);
   }
   // init must scaffold every spelling so Claude Code blocks each one.
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-deny-rm-scaffold-"));
@@ -2813,7 +2827,7 @@ test("Dangerous-command guard recognizes SQL client / migration reset commands a
     fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({ permissions: { deny: [variant] } }));
     const r = analyzeForTest(dir);
     const guard = r.checks.find((c) => c.area === "Dangerous-command guard");
-    assert.ok(guard && guard.ok, `${variant} must satisfy the dangerous-command guard`);
+    assert.ok(guard && guard.coveredFamilies.length > 0, `${variant} must be recognized as a dangerous command`);
   }
   // Negative: a -c/-e that is merely a substring of a longer flag must NOT match.
   // `psql --cluster db` has no real -c (the c belongs to --cluster, and a word
@@ -2825,7 +2839,7 @@ test("Dangerous-command guard recognizes SQL client / migration reset commands a
     fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({ permissions: { deny: [safe] } }));
     const r = analyzeForTest(dir);
     const guard = r.checks.find((c) => c.area === "Dangerous-command guard");
-    assert.ok(guard && !guard.ok, `${safe} must NOT satisfy the guard (no real dangerous flag)`);
+    assert.ok(guard && guard.coveredFamilies.length === 0, `${safe} must NOT be recognized as dangerous (no real dangerous flag)`);
   }
   // DB project: init scaffolds the SQL / migration entries.
   const dbDir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-deny-sql-db-"));
@@ -3014,7 +3028,7 @@ test("Dangerous-command guard requires a destructive git clean flag, not a dry-r
     fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({ permissions: { deny: [safe] } }));
     const r = analyzeForTest(dir);
     const guard = r.checks.find((c) => c.area === "Dangerous-command guard");
-    assert.ok(guard && !guard.ok, `${safe} must NOT satisfy the guard (no force flag)`);
+    assert.ok(guard && guard.coveredFamilies.length === 0, `${safe} must NOT be recognized as dangerous (no force flag)`);
   }
   // Destructive forms (short -f cluster in any order, or --force) still satisfy.
   for (const dangerous of ["Bash(git clean -f:*)", "Bash(git clean -fd:*)", "Bash(git clean -df:*)", "Bash(git clean --force:*)"]) {
@@ -3024,7 +3038,7 @@ test("Dangerous-command guard requires a destructive git clean flag, not a dry-r
     fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({ permissions: { deny: [dangerous] } }));
     const r = analyzeForTest(dir);
     const guard = r.checks.find((c) => c.area === "Dangerous-command guard");
-    assert.ok(guard && guard.ok, `${dangerous} must satisfy the guard (has force flag)`);
+    assert.ok(guard && guard.coveredFamilies.includes("git-clean-force"), `${dangerous} must be recognized as the git-clean-force family (has force flag)`);
   }
 });
 
@@ -3262,7 +3276,7 @@ test("Agent hooks MISS format when a DIRECT prettier call lacks a write flag (Co
 });
 
 test("Dangerous-command guard recognizes curl|sh entries whose URL contains colons (Codex P2)", () => {
-  // denyEntryBlocksDangerousCommand used to slice at the FIRST colon, truncating
+  // denyEntryFamily used to slice at the FIRST colon, truncating
   // `Bash(curl https://example.com/install.sh | sh)` to `curl https` so the
   // remote-execution pattern never matched. Only the trailing `:*` qualifier may
   // be stripped — colons inside a URL are part of the command.
@@ -3277,10 +3291,11 @@ test("Dangerous-command guard recognizes curl|sh entries whose URL contains colo
     fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({ permissions: { deny: [variant] } }));
     const r = analyzeForTest(dir);
     const guard = r.checks.find((c) => c.area === "Dangerous-command guard");
-    assert.ok(guard && guard.ok, `${variant} must satisfy the guard (colons in URL preserved)`);
+    assert.ok(guard && guard.coveredFamilies.includes("pipe-to-shell"), `${variant} must be recognized as the pipe-to-shell family (colons in URL preserved)`);
   }
   // Sanity: the trailing `:*` qualifier is still stripped so `Bash(rm -rf:*)`
-  // resolves to `rm -rf`, and a plain `Bash(curl:*)` (no pipe) stays non-dangerous.
+  // resolves to `rm -rf` (recognized as rm-recursive), and a plain `Bash(curl:*)`
+  // (no pipe) stays non-dangerous (not recognized).
   for (const [entry, want] of [["Bash(rm -rf:*)", true], ["Bash(curl:*)", false]]) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-deny-qual-"));
     fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
@@ -3288,7 +3303,7 @@ test("Dangerous-command guard recognizes curl|sh entries whose URL contains colo
     fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({ permissions: { deny: [entry] } }));
     const r = analyzeForTest(dir);
     const guard = r.checks.find((c) => c.area === "Dangerous-command guard");
-    assert.ok(guard && guard.ok === want, `${entry} guard must be ${want}`);
+    assert.ok(guard && (guard.coveredFamilies.length > 0) === want, `${entry} recognized=${want}`);
   }
 });
 
@@ -3305,7 +3320,7 @@ test("Dangerous-command guard requires a token boundary after bare executables, 
     fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({ permissions: { deny: [fake] } }));
     const r = analyzeForTest(dir);
     const guard = r.checks.find((c) => c.area === "Dangerous-command guard");
-    assert.ok(guard && !guard.ok, `${fake} must NOT satisfy the guard (verb is a prefix of a different command)`);
+    assert.ok(guard && guard.coveredFamilies.length === 0, `${fake} must NOT be recognized (verb is a prefix of a different command)`);
   }
   // The real executables still satisfy the guard (no regression): bare `mkfs`,
   // `TRUNCATE TABLE`, and the `mkfs.ext4` filesystem-type suffix form.
@@ -3316,7 +3331,7 @@ test("Dangerous-command guard requires a token boundary after bare executables, 
     fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({ permissions: { deny: [real] } }));
     const r = analyzeForTest(dir);
     const guard = r.checks.find((c) => c.area === "Dangerous-command guard");
-    assert.ok(guard && guard.ok, `${real} must satisfy the guard (real dangerous command)`);
+    assert.ok(guard && guard.coveredFamilies.length > 0, `${real} must be recognized (real dangerous command)`);
   }
 });
 
@@ -3414,7 +3429,7 @@ test("Dangerous-command guard + scaffold cover recursive rm clustered with non-f
     fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({ permissions: { deny: [variant] } }));
     const r = analyzeForTest(dir);
     const guard = r.checks.find((c) => c.area === "Dangerous-command guard");
-    assert.ok(guard && guard.ok, `${variant} must satisfy the dangerous-command guard`);
+    assert.ok(guard && guard.coveredFamilies.length > 0, `${variant} must be recognized as a dangerous command`);
   }
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-deny-rm-cluster-scaffold-"));
   fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
@@ -4434,16 +4449,16 @@ test("Dangerous-command guard recognizes dd writing to a block device, and no lo
     fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({ permissions: { deny: [variant] } }));
     const r = analyzeForTest(dir);
     const guard = r.checks.find((c) => c.area === "Dangerous-command guard");
-    assert.ok(guard && guard.ok, `${variant} must satisfy the dangerous-command guard (destructive dd device write)`);
+    assert.ok(guard && guard.coveredFamilies.includes("device-write"), `${variant} must be recognized as the device-write family (destructive dd device write)`);
   }
-  // The old `if=`-only entry must NO LONGER satisfy the guard: it blocks only a
+  // The old `if=`-only entry must NO LONGER be recognized: it blocks only a
   // read, leaving the destructive `of=/dev/` form unguarded.
   const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), "vca-deny-dd-old-"));
   fs.writeFileSync(path.join(dir2, "CLAUDE.md"), "# x\n");
   fs.mkdirSync(path.join(dir2, ".claude"), { recursive: true });
   fs.writeFileSync(path.join(dir2, ".claude", "settings.json"), JSON.stringify({ permissions: { deny: ["Bash(dd if=:*)"] } }));
   const guard2 = analyzeForTest(dir2).checks.find((c) => c.area === "Dangerous-command guard");
-  assert.ok(guard2 && !guard2.ok, "`dd if=:*` (read-only) must NOT satisfy the guard anymore");
+  assert.ok(guard2 && guard2.coveredFamilies.length === 0, "`dd if=:*` (read-only) must NOT be recognized anymore");
 });
 
 test("init --write scaffolds dd device-write deny entries, not the read-only if= form (Codex P1)", async () => {
@@ -4467,7 +4482,7 @@ test("Dangerous-command guard recognizes `git reset HEAD~1 --hard` and scaffolds
   fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({ permissions: { deny: ["Bash(git reset * --hard:*)"] } }));
   const r = analyzeForTest(dir);
   const guard = r.checks.find((c) => c.area === "Dangerous-command guard");
-  assert.ok(guard && guard.ok, "`git reset * --hard:*` must satisfy the guard (covers `git reset HEAD~1 --hard`)");
+  assert.ok(guard && guard.coveredFamilies.includes("git-hard-reset"), "`git reset * --hard:*` must be recognized as the git-hard-reset family (covers `git reset HEAD~1 --hard`)");
 });
 
 test("init --write scaffolds git reset covering the revision before --hard (Codex P1)", async () => {
@@ -4681,4 +4696,44 @@ test("Agent hooks MISS when `npm --workspace <name>` targets a member excluded b
   const r2 = analyzeForTest(dir);
   const hooks2 = r2.checks.find((c) => c.area === "Agent hooks");
   assert.ok(hooks2 && hooks2.ok, "`npm --workspace a run format` -> a not excluded -> PASS (control)");
+});
+
+test("Dangerous-command guard MISS when deny list covers only ONE family, not all required (Codex P1 #3660296403)", () => {
+  // A deny list with a SINGLE recognized entry (e.g. only `Bash(mkfs:*)`) covers
+  // device-write but leaves rm-rf, force-push, hard-reset, git-clean, and
+  // pipe-to-shell unguarded. Collapsing coverage to a single boolean reports PASS
+  // and init/evolve skip merging the missing defaults — so those irreversible
+  // commands remain allowed. The guard must track coverage per family and MISS
+  // until EVERY required family is covered.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-deny-one-family-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, ".claude", "settings.local.json"),
+    JSON.stringify({ permissions: { deny: ["Bash(mkfs:*)"] } }),
+  );
+  const r = analyzeForTest(dir);
+  const guard = r.checks.find((c) => c.area === "Dangerous-command guard");
+  assert.equal(guard.ok, false, "a single-family deny list (only mkfs) must MISS — other irreversible commands remain unguarded");
+});
+
+test("init --write merges the missing deny families when an existing list covers only one family (Codex P1 #3660296403)", async () => {
+  // init --write must MERGE the default deny entries (not skip) when the existing
+  // guard does not cover every required family, so rm-rf / force-push / hard-reset
+  // become blocked. The merge is a union: the user's existing entry is preserved
+  // and the missing families are appended.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-deny-merge-missing-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {} }));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, ".claude", "settings.local.json"),
+    JSON.stringify({ permissions: { deny: ["Bash(mkfs:*)"] } }),
+  );
+  await runCli(["init", "--cwd", dir, "--write"]);
+  const local = JSON.parse(fs.readFileSync(path.join(dir, ".claude", "settings.local.json"), "utf8"));
+  assert.ok(local.permissions.deny.includes("Bash(mkfs:*)"), "user's existing mkfs entry preserved (merge is a union)");
+  assert.ok(local.permissions.deny.some((d) => /^Bash\(rm -rf/.test(d)), "rm -rf backfilled (was missing)");
+  assert.ok(local.permissions.deny.some((d) => /^Bash\(git push --force/.test(d)), "git push --force backfilled (was missing)");
+  assert.ok(local.permissions.deny.some((d) => /^Bash\(git reset --hard/.test(d)), "git reset --hard backfilled (was missing)");
 });

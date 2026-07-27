@@ -201,6 +201,7 @@ function analyzeProject(cwd) {
         ? "N/A — not a Claude Code project (no CLAUDE.md / .claude/settings*.json). permissions.deny is a Claude Code settings mechanism."
         : "Add .claude/settings.local.json permissions.deny for irreversible commands (rm -rf, git push -f, git reset --hard, mkfs, dd, DROP TABLE) so agents cannot run them. (vca init --write scaffolds a default list.)",
       guardNa,
+      { coveredFamilies: hooks.coveredDenyFamilies },
     ),
     check(
       "Deploy hooks",
@@ -421,8 +422,8 @@ function enrichDepth(checks, ctx) {
   set("Steering loop", countNumberedRules(ctx.roots), "numbered rule(s)");
 }
 
-function check(area, ok, action, na = false) {
-  return { area, ok, action, na: Boolean(na) };
+function check(area, ok, action, na = false, extra = {}) {
+  return { area, ok, action, na: Boolean(na), ...extra };
 }
 
 /** Project roots = cwd plus every git submodule path declared in .gitmodules. */
@@ -824,9 +825,9 @@ function readJson(filePath) {
  *      from the verb's real flag alphabet (`[frRivIdP]` for rm) and terminated
  *      by whitespace or end-of-line.
  *  Matches the same families that defaultDenyList scaffolds. */
-const DANGEROUS_CMD_RE = new RegExp(
-  "^(?:" +
-    [
+const DANGEROUS_CMD_FAMILIES = [
+  // rm-recursive
+  { fam: "rm-recursive", pats: [
       // rm with a RECURSIVE flag is irreversible (force only suppresses the
       // prompt), so any recursive form counts. `.*?` lets the recursive flag
       // appear after preceding flags (`rm -f -r`, `rm --force --recursive`),
@@ -834,13 +835,25 @@ const DANGEROUS_CMD_RE = new RegExp(
       // is a prefix of the longer token -readme, not a flag) does not match.
       "rm\\s+.*?-[frRivIdP]*[rR][frRivIdP]*(?=\\s|$)",
       "rm\\s+.*?--recursive\\b",
+  ] },
+  // git-force-push
+  { fam: "git-force-push", pats: [
       "git\\s+push\\b.*?\\s(?:--force|-f)(?:\\s|$)",
+  ] },
+  // git-hard-reset
+  { fam: "git-hard-reset", pats: [
       "git\\s+reset\\b.*?\\s--hard(?:\\s|$)",
+  ] },
+  // git-clean-force
+  { fam: "git-clean-force", pats: [
       // git clean needs a FORCE flag to actually delete (without -f git refuses;
       // -n/--dry-run only previews). Require -f in a short-flag cluster or
       // --force, so `Bash(git clean -n:*)` (a safe preview) does not false-satisfy
       // the guard and skip scaffolding of rm -rf / force-push protection.
       "git\\s+clean\\b.*?(?:--force\\b|-[fdxXnie]*f[fdxXnie]*(?:\\s|$))",
+  ] },
+  // device-write
+  { fam: "device-write", pats: [
       // Bare executables need a token boundary so a deny entry whose command
       // merely STARTS WITH the verb — `Bash(mkfs-report:*)`, `Bash(truncate-log:*)`
       // — does not false-satisfy the guard: such an entry blocks a DIFFERENT
@@ -856,6 +869,10 @@ const DANGEROUS_CMD_RE = new RegExp(
       // operand wherever it appears, so the guard is not satisfied by a deny
       // entry that only blocks the `if=` form.
       "dd\\s+.*?\\bof\\s*=\\s*\\/dev\\/",
+      ">\\s*\\/dev\\/sd",
+  ] },
+  // sql-destructive
+  { fam: "sql-destructive", pats: [
       "drop\\s+(?:table|database)",
       "truncate(?![\\w-])",
       // SQL reaches the DB through a client, not as a bare command: block the
@@ -864,22 +881,39 @@ const DANGEROUS_CMD_RE = new RegExp(
       "psql\\s+.*?-(?:c|f)(?=\\s|$)",
       "mysql\\s+.*?(?:-e|--execute)(?=\\s|$)",
       "prisma\\s+migrate\\s+reset\\b",
-      ">\\s*\\/dev\\/sd",
+  ] },
+  // pipe-to-shell
+  { fam: "pipe-to-shell", pats: [
       "curl.*\\|\\s*(?:sh|bash)",
       "wget.*\\|\\s*(?:sh|bash)",
-    ].join("|") +
-    ")",
+  ] },
+];
+
+const DANGEROUS_CMD_RE = new RegExp(
+  "^(?:" + DANGEROUS_CMD_FAMILIES.flatMap((f) => f.pats).join("|") + ")",
   "i",
 );
+// Per-family regexes let the guard track WHICH irreversible-command families
+// a deny list already covers, so a single-family list (e.g. only `Bash(mkfs:*)`)
+// is not mistaken for a complete guard. (Codex P1 #3660296403)
+const DANGEROUS_FAMILY_RES = new Map(
+  DANGEROUS_CMD_FAMILIES.map((f) => [f.fam, new RegExp("^(?:" + f.pats.join("|") + ")", "i")]),
+);
+// A deny list satisfies the guard only when it blocks EVERY always-on
+// irreversible-command family. sql-destructive is intentionally excluded: it
+// is conditionally scaffolded for DB projects only (defaultDenyList) and is not
+// part of the universal baseline. (Codex P1 #3660296403)
+const REQUIRED_DENY_FAMILIES = ["rm-recursive", "git-force-push", "git-hard-reset", "git-clean-force", "device-write", "pipe-to-shell"];
 
 /** A Claude Code deny entry looks like `Bash(<command>:<qualifier>)` (or
  *  `Bash(<command>)`). The blocked command is the `<command>` prefix before the
- *  first `:`. Return true only when THAT prefix starts with an irreversible
- *  command — never when the dangerous verb is merely mentioned later in the line
- *  or hidden inside a longer token like a branch or file name. */
-function denyEntryBlocksDangerousCommand(entry) {
+ *  first `:`. Return the NAME of the irreversible-command family this entry
+ *  blocks (e.g. "rm-recursive", "device-write"), or null when the prefix does
+ *  not start with a dangerous command — never when the verb is merely mentioned
+ *  later in the line or hidden inside a longer token like a branch or file name. */
+export function denyEntryFamily(entry) {
   const m = String(entry).trim().match(/^Bash\(([^)]*)\)$/);
-  if (!m) return false;
+  if (!m) return null;
   let cmd = m[1];
   // Claude Code's argument qualifier is a trailing `:*` (e.g. `Bash(rm -rf:*)`).
   // Strip ONLY that suffix. Slicing at the first colon truncates commands that
@@ -892,16 +926,18 @@ function denyEntryBlocksDangerousCommand(entry) {
   // push --force` resolve to the dangerous verb after sudo (and its trailing
   // space) are stripped. (Codex P2 #3659066974)
   const stripped = cmd.replace(/^sudo\b\s*/, "");
-  if (DANGEROUS_CMD_RE.test(stripped)) return true;
+  for (const [fam, re] of DANGEROUS_FAMILY_RES) {
+    if (re.test(stripped)) return fam;
+  }
   // `Bash(sudo rm:*)` — which defaultDenyList() itself emits — is a BROAD sudo rm
   // block with no explicit recursive flag, so the regex above (which needs a
   // flag) misses it after stripping to bare `rm`. sudo rm as root is dangerous
-  // regardless of flags, so recognize a leading-sudo rm runner explicitly. The
-  // leading-sudo requirement keeps `Bash(rm -readme:*)` (no sudo, where -r is a
-  // prefix of the -readme token) MISSing, and `Bash(echo sudo rm:*)` (sudo not
-  // leading) MISSing.
-  if (/^(?:sudo\s+)+rm\b/.test(cmd)) return true;
-  return false;
+  // regardless of flags, so recognize a leading-sudo rm runner explicitly as
+  // rm-recursive. The leading-sudo requirement keeps `Bash(rm -readme:*)` (no
+  // sudo, where -r is a prefix of the -readme token) MISSing, and
+  // `Bash(echo sudo rm:*)` (sudo not leading) MISSing.
+  if (/^(?:sudo\s+)+rm\b/.test(cmd)) return "rm-recursive";
+  return null;
 }
 
 /** Compile a Claude Code PostToolUse matcher into { catchAll, re }. An empty
@@ -1606,12 +1642,23 @@ function detectHooksConfig(roots, scripts, workspaceScripts) {
   }
   const postToolUseLint = editLint && writeLint;
   const postToolUseFormat = editFormat && writeFormat;
+  // A deny list only fully satisfies the guard when it blocks EVERY always-on
+  // irreversible-command family (REQUIRED_DENY_FAMILIES). Collapsing coverage to
+  // a single boolean — "any one recognized entry" — let a list with only
+  // `Bash(mkfs:*)` pass, so init/evolve skipped merging the defaults and rm -rf /
+  // force-push / hard-reset / git-clean / pipe-to-shell stayed allowed. Collect
+  // the set of families the existing entries already cover; the guard PASSes
+  // (and init/evolve skip) only when that set is complete. (Codex P1 #3660296403)
+  const coveredDenyFamilies = new Set();
   for (const denyList of [settings?.permissions?.deny, local?.permissions?.deny]) {
-    if (Array.isArray(denyList) && denyList.some((d) => denyEntryBlocksDangerousCommand(d))) {
-      permissionsDeny = true;
+    if (!Array.isArray(denyList)) continue;
+    for (const d of denyList) {
+      const fam = denyEntryFamily(d);
+      if (fam) coveredDenyFamilies.add(fam);
     }
   }
-  return { postToolUseLint, postToolUseFormat, editLint, writeLint, editFormat, writeFormat, permissionsDeny };
+  permissionsDeny = REQUIRED_DENY_FAMILIES.every((f) => coveredDenyFamilies.has(f));
+  return { postToolUseLint, postToolUseFormat, editLint, writeLint, editFormat, writeFormat, permissionsDeny, coveredDenyFamilies: [...coveredDenyFamilies] };
 }
 
 /** A user-authored Claude skill: a path under .claude/skills/ that names a
@@ -2088,7 +2135,7 @@ function defaultDenyList(report) {
     deny.push(
       // Destructive SQL KEYWORDS and an unambiguous reset command are HARD-denied:
       // they exist only to discard data. The bare-keyword entries are also what the
-      // dangerous-command detector keys on (denyEntryBlocksDangerousCommand), so the
+      // dangerous-command detector keys on (denyEntryFamily → "sql-destructive"), so
       // guard stays satisfied. (Broad SQL-CLIENT invocations that run arbitrary SQL
       // — psql -c/-f, mysql -e — are routed through `ask` instead; see
       // defaultAskList. Codex P2 #3659221996 / #3656905061.)
@@ -2431,9 +2478,12 @@ function buildInitFiles(report) {
   // of irreversible commands. Skipped for non-Claude stacks (Codex/Cursor).
   // Hooks (settings.json) are also gated on prettier+eslint being present so we
   // don't break every edit in a non-Node stack. The deny list (settings.local.json)
-  // is tool-agnostic and valuable for any Claude project — but it is SKIPPED when
-  // a dangerous-command guard is already detected in either settings file, so
-  // init does not duplicate (or expand beyond) an existing committed guard.
+  // is tool-agnostic and valuable for any Claude project — but it is SKIPPED only
+  // when a COMPLETE dangerous-command guard (every always-on family) is already
+  // detected in either settings file. A PARTIAL list (e.g. only `Bash(mkfs:*)`)
+  // does NOT skip: mergePermissionsLocal unions the missing default families in,
+  // so rm -rf / force-push / hard-reset / git-clean / pipe-to-shell get blocked.
+  // (Codex P1 #3660296403)
   if (isClaudeCodeProject(report.files)) {
     const { permissionsDeny } = detectHooksConfig(report.roots);
     if (!permissionsDeny) {
@@ -2558,8 +2608,9 @@ function buildEvolutionFiles(report, plan) {
   // When settings already exist (but lack the hook/deny entry), writeOrPreview
   // MERGES the missing keys instead of skipping — otherwise the backfill this
   // command advertises would be a no-op and the next scan would still MISS. The
-  // deny list is skipped when a dangerous-command guard is already detected in
-  // either settings file, so evolve does not duplicate or expand an existing one.
+  // deny list is skipped only when a COMPLETE guard (every always-on family) is
+  // already present; a partial list is unioned with the missing defaults instead
+  // of being treated as sufficient. (Codex P1 #3660296403)
   if (isClaudeCodeProject(report.files)) {
     const { permissionsDeny } = detectHooksConfig(report.roots);
     if (!permissionsDeny) {
