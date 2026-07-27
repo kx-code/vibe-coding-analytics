@@ -2270,3 +2270,125 @@ test("evolve --write keeps a BROADER-than-edit PostToolUse matcher scoped away f
     assert.ok(/prettier/.test(editWriteCmds) && /eslint/.test(editWriteCmds), "Edit|Write entry carries the formatter hooks");
   }
 });
+
+test("Dangerous-command guard recognizes rm long-form and reordered flag spellings (Codex P1)", async () => {
+  // The short-flag cluster regex `rm\s+-[frRivIdP]*[rR][frRivIdP]*` only sees
+  // SINGLE-DASH short flags drawn from rm's flag alphabet. `rm --recursive
+  // --force` (long form) slipped past it. Each variant must satisfy the guard
+  // AND be scaffolded, because Claude Code prefix-matches the literal spelling:
+  // `Bash(rm -rf:*)` does not block `rm -fr` / `rm -Rf` / `rm --recursive --force`.
+  for (const variant of ["Bash(rm -fr:*)", "Bash(rm -Rf:*)", "Bash(rm --recursive --force:*)"]) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-deny-rm-var-"));
+    fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+    fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+    fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({ permissions: { deny: [variant] } }));
+    const r = analyzeForTest(dir);
+    const guard = r.checks.find((c) => c.area === "Dangerous-command guard");
+    assert.ok(guard && guard.ok, `${variant} must satisfy the dangerous-command guard`);
+  }
+  // init must scaffold every spelling so Claude Code blocks each one.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-deny-rm-scaffold-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  await runCli(["init", "--cwd", dir, "--write"]);
+  const local = fs.readFileSync(path.join(dir, ".claude", "settings.local.json"), "utf8");
+  assert.ok(/Bash\(rm -fr:\*\)/.test(local), "rm -fr variant scaffolded");
+  assert.ok(/Bash\(rm -Rf:\*\)/.test(local), "rm -Rf variant scaffolded");
+  assert.ok(/Bash\(rm --recursive --force:\*\)/.test(local), "rm long-form variant scaffolded");
+});
+
+test("Dangerous-command guard recognizes SQL client / migration reset commands and scaffolds them for DB projects only (Codex P1)", async () => {
+  // SQL reaches the DB through a client (psql -c/-f, mysql -e) or migration tool
+  // (prisma migrate reset), not as a bare command. Each must satisfy the guard;
+  // init scaffolds them ONLY for DB projects (isDbProject), since a non-DB
+  // project has nothing to DROP/TRUNCATE.
+  for (const variant of ["Bash(psql -c:*)", "Bash(psql -f:*)", "Bash(mysql -e:*)", "Bash(prisma migrate reset:*)"]) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-deny-sql-var-"));
+    fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+    fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+    fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({ permissions: { deny: [variant] } }));
+    const r = analyzeForTest(dir);
+    const guard = r.checks.find((c) => c.area === "Dangerous-command guard");
+    assert.ok(guard && guard.ok, `${variant} must satisfy the dangerous-command guard`);
+  }
+  // Negative: a -c/-e that is merely a substring of a longer flag must NOT match.
+  // `psql --cluster db` has no real -c (the c belongs to --cluster, and a word
+  // boundary / lookahead rejects it); `prisma migrate dev` is not `... reset`.
+  for (const safe of ["Bash(psql --cluster db:*)", "Bash(prisma migrate dev:*)"]) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-deny-sql-safe-"));
+    fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+    fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+    fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({ permissions: { deny: [safe] } }));
+    const r = analyzeForTest(dir);
+    const guard = r.checks.find((c) => c.area === "Dangerous-command guard");
+    assert.ok(guard && !guard.ok, `${safe} must NOT satisfy the guard (no real dangerous flag)`);
+  }
+  // DB project: init scaffolds the SQL / migration entries.
+  const dbDir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-deny-sql-db-"));
+  fs.writeFileSync(path.join(dbDir, "CLAUDE.md"), "# x\n");
+  fs.writeFileSync(path.join(dbDir, "package.json"), JSON.stringify({ name: "demo", dependencies: { prisma: "*" } }));
+  await runCli(["init", "--cwd", dbDir, "--write"]);
+  const dbLocal = fs.readFileSync(path.join(dbDir, ".claude", "settings.local.json"), "utf8");
+  assert.ok(/Bash\(psql -c:\*\)/.test(dbLocal), "psql -c scaffolded for DB project");
+  assert.ok(/Bash\(mysql -e:\*\)/.test(dbLocal), "mysql -e scaffolded for DB project");
+  assert.ok(/Bash\(prisma migrate reset:\*\)/.test(dbLocal), "prisma migrate reset scaffolded for DB project");
+  assert.ok(/Bash\(npx prisma migrate reset:\*\)/.test(dbLocal), "npx prisma migrate reset scaffolded for DB project");
+  // Non-DB project: SQL / migration entries are NOT scaffolded.
+  const webDir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-deny-sql-web-"));
+  fs.writeFileSync(path.join(webDir, "CLAUDE.md"), "# x\n");
+  fs.writeFileSync(path.join(webDir, "package.json"), JSON.stringify({ name: "web", dependencies: { react: "*" } }));
+  await runCli(["init", "--cwd", webDir, "--write"]);
+  const webLocal = fs.readFileSync(path.join(webDir, ".claude", "settings.local.json"), "utf8");
+  assert.ok(!/Bash\(psql -c:\*\)/.test(webLocal), "psql -c NOT scaffolded for non-DB project");
+  assert.ok(!/prisma migrate reset/.test(webLocal), "prisma migrate reset NOT scaffolded for non-DB project");
+});
+
+test("Agent hooks MISS when a PostToolUse hook only echoes a lint/format status string (Codex P2)", () => {
+  // commandPurpose must strip quoted string literals before the word-boundary
+  // test, so `echo 'lint and format complete'` is NOT misread as a real
+  // eslint/prettier invocation. Without quote-stripping + word boundaries, the
+  // bare /lint/ and /format/ substring regexes matched the human-readable echo
+  // argument and false-PASSed the Agent-hooks check, skipping the scaffold.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-hooks-echo-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {}, devDependencies: { prettier: "*", eslint: "*" } }));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, ".claude", "settings.json"),
+    JSON.stringify({
+      hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [{ type: "command", command: "echo 'lint and format complete'" }] }] },
+    }),
+  );
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  assert.ok(hooks && !hooks.ok, "a status-echo hook must NOT satisfy the Agent-hooks check");
+});
+
+test("Agent hooks PASS when PostToolUse hooks run real eslint + prettier via a pipeline (Codex P2)", () => {
+  // The scaffolded hook command is a pipeline: `node -e "..." | ... npx
+  // prettier` and `... | ... npx eslint`. commandPurpose must still classify
+  // these: the tool name sits mid-pipeline, and the double-quoted node script
+  // must be stripped without eating the trailing `npx prettier` / `npx eslint`.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-hooks-real-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {}, devDependencies: { prettier: "*", eslint: "*" } }));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, ".claude", "settings.json"),
+    JSON.stringify({
+      hooks: {
+        PostToolUse: [
+          {
+            matcher: "Edit|Write",
+            hooks: [
+              { type: "command", command: 'node -e "process.exit(0)" | xargs -0 -I{} npx prettier --write --ignore-unknown {}' },
+              { type: "command", command: 'node -e "process.exit(0)" | xargs -0 -I{} npx eslint --no-warn-ignored {}' },
+            ],
+          },
+        ],
+      },
+    }),
+  );
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  assert.ok(hooks && hooks.ok, "a real eslint + prettier pipeline must satisfy the Agent-hooks check");
+});

@@ -762,6 +762,7 @@ const DANGEROUS_CMD_RE = new RegExp(
   "^(?:" +
     [
       "rm\\s+-[frRivIdP]*[rR][frRivIdP]*(?:\\s|$)",
+      "rm\\s+--recursive\\b.*?(?:--force\\b|-f(?:\\s|$))",
       "git\\s+push\\b.*?\\s(?:--force|-f)(?:\\s|$)",
       "git\\s+reset\\b.*?\\s--hard(?:\\s|$)",
       "git\\s+clean\\b",
@@ -769,6 +770,12 @@ const DANGEROUS_CMD_RE = new RegExp(
       "dd\\s+if",
       "drop\\s+(?:table|database)",
       "truncate",
+      // SQL reaches the DB through a client, not as a bare command: block the
+      // execute flags. Lookahead-terminated so `psql --cluster` / `mysql -u`
+      // (where -c/-e is a substring of a different flag) don't false-match.
+      "psql\\s+.*?-(?:c|f)(?=\\s|$)",
+      "mysql\\s+.*?(?:-e|--execute)(?=\\s|$)",
+      "prisma\\s+migrate\\s+reset\\b",
       ">\\s*\\/dev\\/sd",
       "curl.*\\|\\s*(?:sh|bash)",
       "wget.*\\|\\s*(?:sh|bash)",
@@ -867,10 +874,21 @@ function matcherIsEditWriteEntry(matcher) {
  *  as "lint" / "format": if a command already satisfies detection, the merge must
  *  not append a scaffolded command of the same purpose (or every edit runs the
  *  formatter and linter twice). Defined once here so the two stay in lockstep. */
-const LINT_CMD_RE = /eslint|lint/i;
-const FORMAT_CMD_RE = /prettier|format/i;
+// Word-bounded so "lint"/"format" must appear as a whole word (the tool name),
+// not as a substring of an unrelated token. Without boundaries, a hook whose
+// command merely echoes a status string (e.g. `echo 'lint and format done'`)
+// would be misread as a real linter/formatter and init/evolve would wrongly
+// report the agent-hooks check as PASS, skipping the scaffold.
+const LINT_CMD_RE = /\beslint\b|\blint\b/i;
+const FORMAT_CMD_RE = /\bprettier\b|\bformat\b|\bfmt\b/i;
 function commandPurpose(cmd) {
-  const c = String(cmd || "");
+  // Strip quoted string literals first: an echo/printf argument like
+  // "lint and format complete" is human-readable text, not a tool invocation.
+  // Stripping single + double quotes leaves real command tokens (npx, eslint,
+  // the piped prettier mid-pipeline, etc.) intact for the word-boundary test.
+  const c = String(cmd || "")
+    .replace(/'(?:[^'\\]|\\.)*'/g, "")
+    .replace(/"(?:[^"\\]|\\.)*"/g, "");
   if (LINT_CMD_RE.test(c)) return "lint";
   if (FORMAT_CMD_RE.test(c)) return "format";
   return null;
@@ -911,9 +929,14 @@ function detectHooksConfig(roots) {
       // valid lint+format setup with no explicit matcher is honored rather
       // than skipped — which would falsely report Agent hooks as MISS.
       if (!matcherCoversEditWrite(entry?.matcher)) continue;
-      const cmds = (entry.hooks || []).map((h) => h?.command || "").join("\n");
-      if (LINT_CMD_RE.test(cmds)) postToolUseLint = true;
-      if (FORMAT_CMD_RE.test(cmds)) postToolUseFormat = true;
+      // Classify each hook command individually (not the joined blob): a single
+      // wide matcher entry may carry a lint hook AND a format hook, and a
+      // quoted status echo inside one command must not flip the other purpose.
+      for (const h of entry.hooks || []) {
+        const purpose = commandPurpose(h?.command);
+        if (purpose === "lint") postToolUseLint = true;
+        else if (purpose === "format") postToolUseFormat = true;
+      }
     }
   }
   for (const denyList of [settings?.permissions?.deny, local?.permissions?.deny]) {
@@ -1118,6 +1141,9 @@ function isDbProject(report) {
 function defaultDenyList(report) {
   const deny = [
     "Bash(rm -rf:*)",
+    "Bash(rm -fr:*)",
+    "Bash(rm -Rf:*)",
+    "Bash(rm --recursive --force:*)",
     "Bash(rm -r /)",
     "Bash(git push --force:*)",
     "Bash(git push -f:*)",
@@ -1140,7 +1166,19 @@ function defaultDenyList(report) {
     "Bash(wget * | bash)",
   ];
   if (isDbProject(report)) {
-    deny.push("Bash(DROP TABLE:*)", "Bash(DROP DATABASE:*)", "Bash(TRUNCATE TABLE:*)");
+    deny.push(
+      "Bash(DROP TABLE:*)",
+      "Bash(DROP DATABASE:*)",
+      "Bash(TRUNCATE TABLE:*)",
+      // SQL reaches the DB through a client / migration tool, not as a bare
+      // command. psql -c / -f and mysql -e run arbitrary SQL; prisma migrate
+      // reset drops & recreates the dev database irreversibly.
+      "Bash(psql -c:*)",
+      "Bash(psql -f:*)",
+      "Bash(mysql -e:*)",
+      "Bash(prisma migrate reset:*)",
+      "Bash(npx prisma migrate reset:*)",
+    );
   }
   return deny;
 }
