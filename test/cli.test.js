@@ -2740,6 +2740,13 @@ test("Agent hooks MISS format when a DIRECT prettier call lacks a write flag (Co
     "prettier .",
     "npx prettier {}",
     "prettier --no-write .",
+    // PM direct-execution subcommands (exec/dlx) run the binary transparently,
+    // so a flag-less `npm/pnpm/yarn exec prettier {}` is a DIRECT call (prints
+    // to stdout), NOT an opaque package script — it must not false-PASS.
+    "npm exec prettier {}",
+    "pnpm exec prettier {}",
+    "yarn exec prettier {}",
+    "bun dlx prettier {}",
   ]) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-hooks-prettier-nowrite-"));
     fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {}, devDependencies: { prettier: "*", eslint: "*" } }));
@@ -2757,7 +2764,7 @@ test("Agent hooks MISS format when a DIRECT prettier call lacks a write flag (Co
   }
   // Sanity: a direct prettier write flag (long --write AND short -w) satisfies
   // format, and an opaque `npm run format` still satisfies it.
-  for (const writeCmd of ["prettier --write .", "prettier -w .", "npx prettier -w .", "npm run format"]) {
+  for (const writeCmd of ["prettier --write .", "prettier -w .", "npx prettier -w .", "npm run format", "yarn exec prettier --write .", "pnpm exec prettier --write ."]) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-hooks-prettier-write-"));
     fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {}, devDependencies: { prettier: "*", eslint: "*" } }));
     fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
@@ -2802,6 +2809,34 @@ test("Dangerous-command guard recognizes curl|sh entries whose URL contains colo
     const r = analyzeForTest(dir);
     const guard = r.checks.find((c) => c.area === "Dangerous-command guard");
     assert.ok(guard && guard.ok === want, `${entry} guard must be ${want}`);
+  }
+});
+
+test("Dangerous-command guard requires a token boundary after bare executables, not a prefix match (Codex P1)", () => {
+  // A deny entry whose command merely STARTS WITH a dangerous verb —
+  // `Bash(mkfs-report:*)`, `Bash(truncate-log:*)` — blocks a DIFFERENT command,
+  // so it must NOT satisfy the guard. The unbounded `mkfs` / `truncate`
+  // alternatives matched such prefixes and false-reported the guard installed,
+  // causing init/evolve to skip scaffolding rm -rf / force-push protection.
+  for (const fake of ["Bash(mkfs-report:*)", "Bash(mkfs_report:*)", "Bash(truncate-log:*)", "Bash(truncated:*)"]) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-deny-boundary-fake-"));
+    fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+    fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+    fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({ permissions: { deny: [fake] } }));
+    const r = analyzeForTest(dir);
+    const guard = r.checks.find((c) => c.area === "Dangerous-command guard");
+    assert.ok(guard && !guard.ok, `${fake} must NOT satisfy the guard (verb is a prefix of a different command)`);
+  }
+  // The real executables still satisfy the guard (no regression): bare `mkfs`,
+  // `TRUNCATE TABLE`, and the `mkfs.ext4` filesystem-type suffix form.
+  for (const real of ["Bash(mkfs:*)", "Bash(TRUNCATE TABLE:*)", "Bash(mkfs.ext4:*)"]) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-deny-boundary-real-"));
+    fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+    fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+    fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({ permissions: { deny: [real] } }));
+    const r = analyzeForTest(dir);
+    const guard = r.checks.find((c) => c.area === "Dangerous-command guard");
+    assert.ok(guard && guard.ok, `${real} must satisfy the guard (real dangerous command)`);
   }
 });
 

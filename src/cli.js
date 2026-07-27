@@ -775,10 +775,18 @@ const DANGEROUS_CMD_RE = new RegExp(
       // --force, so `Bash(git clean -n:*)` (a safe preview) does not false-satisfy
       // the guard and skip scaffolding of rm -rf / force-push protection.
       "git\\s+clean\\b.*?(?:--force\\b|-[fdxXnie]*f[fdxXnie]*(?:\\s|$))",
-      "mkfs",
+      // Bare executables need a token boundary so a deny entry whose command
+      // merely STARTS WITH the verb — `Bash(mkfs-report:*)`, `Bash(truncate-log:*)`
+      // — does not false-satisfy the guard: such an entry blocks a DIFFERENT
+      // command, leaving rm -rf / force-push unguarded while detection reports
+      // the guard installed. `(?![\w-])` rejects a following letter/digit/
+      // underscore/hyphen (a different command name: `mkfs-report`, `truncated`)
+      // but accepts `.`, `/`, space, or end-of-line, so the bare verb (`mkfs`,
+      // `TRUNCATE TABLE`) AND the `mkfs.ext4` filesystem-type suffix still match.
+      "mkfs(?![\\w-])",
       "dd\\s+if",
       "drop\\s+(?:table|database)",
-      "truncate",
+      "truncate(?![\\w-])",
       // SQL reaches the DB through a client, not as a bare command: block the
       // execute flags. Lookahead-terminated so `psql --cluster` / `mysql -u`
       // (where -c/-e is a substring of a different flag) don't false-match.
@@ -915,8 +923,13 @@ const FORMAT_WRITE_RE = /(?:--write|--fix)\b/;
 // prints to stdout by default and only rewrites in place with --write/-w, so a
 // bare `prettier {}` does NOT satisfy format-on-save and must not false-PASS.
 // `npx`/`bunx` are NOT matched here — they execute the binary directly, so a
-// flag-less `npx prettier {}` is still a direct (non-writing) call.
-const PM_SCRIPT_RE = /\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?\S/;
+// flag-less `npx prettier {}` is still a direct (non-writing) call. The same is
+// true of the PM direct-execution subcommands `exec` (`npm/pnpm/yarn exec
+// prettier`) and `dlx` (`bun dlx prettier`): they run the binary transparently,
+// so a flag-less `yarn exec prettier {}` is direct, NOT an opaque script. The
+// negative lookahead excludes those subcommands so the opaque-trust branch only
+// fires for genuine `[run] <script>` invocations.
+const PM_SCRIPT_RE = /\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?!exec\b|dlx\b)\S/;
 // `-w` is prettier's short write flag. Matched as a standalone token (bounded by
 // whitespace or string end) so it does NOT fire inside `--no-write`, whose `-w`
 // sits mid-token after `o` (no preceding boundary).
