@@ -1094,16 +1094,19 @@ function extractScriptName(invocation) {
     // the real script NAME is returned instead of the selector keyword/value:
     //   `--workspace <pkg>` / `-w <pkg>`  (npm, pnpm)
     //   `--filter <pkg>`                  (pnpm)
+    //   `-C <dir>` / `--dir <dir>`        (pnpm; a directory, like npm --prefix)
     //   `workspace <name> <cmd>`          (yarn classic, POSITIONAL — no flag)
     // Without this, `yarn workspace a run format` returns `workspace` and
     // `pnpm --filter a run format` returns the package `a` — both wrong, so the
     // body fails to resolve -> opaque -> the name-heuristic fallback sees `format`
-    // and false-PASSes a check-only formatter. Yarn's `workspace` keyword is
-    // honored only under yarn so a script literally named "workspace" under
-    // npm/pnpm/bun is not misread as a selector.
-    if (t === "--workspace" || t === "-w" || t === "--filter" || t === "--prefix") { i += 2; continue; }
+    // and false-PASSes a check-only formatter. Likewise `pnpm -C packages/a run
+    // format` returned `packages/a` (the -C value) instead of `format`, hiding a
+    // check-only member script behind the same opaque-trust false-PASS (#3657192849).
+    // Yarn's `workspace` keyword is honored only under yarn so a script literally
+    // named "workspace" under npm/pnpm/bun is not misread as a selector.
+    if (t === "--workspace" || t === "-w" || t === "--filter" || t === "--prefix" || t === "-C" || t === "--dir") { i += 2; continue; }
     if (isYarn && t === "workspace") { i += 2; continue; }
-    if (/^(?:--workspace|-w|--filter|--prefix)=/.test(t)) { i++; continue; } // inline value (--filter=a, --prefix=a)
+    if (/^(?:--workspace|-w|--filter|--prefix|-C|--dir)=/.test(t)) { i++; continue; } // inline value (--filter=a, --prefix=a, --dir=a)
     if (t.startsWith("-")) { i++; continue; }                        // boolean option
     return t;                                                         // first bare token = script name
   }
@@ -1127,6 +1130,7 @@ function resolveScriptBody(invocation, scripts, seen, workspaceScripts) {
   // body resolves against THAT package's scripts rather than the flat merged map:
   //   npm/pnpm: `--workspace <pkg>` / `-w <pkg>` (space or `=` spelling)
   //   pnpm:     `--filter <pkg>` (accepts a name OR a member path like `./packages/a`)
+  //   pnpm:     `-C <dir>` / `--dir <dir>` (a directory, like npm --prefix)
   //   yarn:     `workspace <name> <cmd>` (classic POSITIONAL selector — no flag)
   // Bounded by whitespace so it does not fire mid-token; a bare flag without a
   // value leaves wsName null -> flat fallback. The value is NORMALIZED (leading
@@ -1135,7 +1139,7 @@ function resolveScriptBody(invocation, scripts, seen, workspaceScripts) {
   // the runner is yarn (pm-keyword check) so a non-yarn `run workspace` script
   // name is not eaten as a selector value.
   const pmOf = s.match(/\b(npm|pnpm|yarn|bun)\b/);
-  const wsFlag = s.match(/(?:^|\s)(?:--workspace|-w|--filter|--prefix)[ =](\S+)/);
+  const wsFlag = s.match(/(?:^|\s)(?:--workspace|-w|--filter|--prefix|-C|--dir)[ =](\S+)/);
   const wsYarn = pmOf && pmOf[1] === "yarn" ? s.match(/(?:^|\s)workspace\s+(\S+)/) : null;
   const wsName = wsFlag ? normalizeWorkspaceKey(wsFlag[1])
     : wsYarn ? normalizeWorkspaceKey(wsYarn[1]) : null;

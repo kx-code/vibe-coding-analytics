@@ -1906,6 +1906,39 @@ test("evolve --write splits a partially-covered tool by purpose, not an Edit|Wri
   assert.ok(/prettier/.test(writeCmds) && /eslint/.test(writeCmds), "Write gets the combined prettier&&eslint command");
 });
 
+test("Agent hooks MISS (not false-PASS) when the only format hook is `pnpm -C <dir> run format` resolving to a check-only member (Codex P2 #3657192849)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-pnpm-dir-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  // Root has both formatters so the check is ACTIVE (not N/A).
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({
+    name: "root", scripts: {}, devDependencies: { prettier: "*", eslint: "*" },
+  }));
+  // Member whose `format` is CHECK-ONLY (prettier --check never rewrites).
+  fs.mkdirSync(path.join(dir, "packages", "a"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "packages", "a", "package.json"), JSON.stringify({
+    name: "a", scripts: { format: "prettier --check ." },
+  }));
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  // One Edit|Write hook: real eslint (lint satisfied) + `pnpm -C packages/a run
+  // format` pointing at the member's CHECK-ONLY format. pnpm's -C/--dir takes a
+  // directory VALUE; the extractor must consume that value and resolve the member
+  // body (prettier --check) instead of misreading `packages/a` as the script name,
+  // going opaque, and false-PASSing format via the name heuristic.
+  fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({
+    hooks: { PostToolUse: [
+      { matcher: "Edit|Write", hooks: [
+        { type: "command", command: "npx eslint" },
+        { type: "command", command: "pnpm -C packages/a run format" },
+      ] },
+    ] },
+  }));
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  assert.ok(hooks, "Agent hooks check present");
+  assert.equal(hooks.na, false, "root has prettier+eslint -> not N/A");
+  assert.equal(hooks.ok, false, "check-only member format via `pnpm -C <dir>` must NOT satisfy format-on-save");
+});
+
 test("Agent hooks N/A (not MISS) when formatters live only in a git submodule: deps don't hoist, hooks scaffolded at the root can't resolve them (Codex P2)", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-fmt-roots-"));
   fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
