@@ -2241,12 +2241,14 @@ test("Dangerous-command guard MISS when a flag is only a substring of a longer t
 });
 
 test("evolve --write keeps a BROADER-than-edit PostToolUse matcher scoped away from formatter hooks and adds a separate Edit|Write entry (Codex P2)", async () => {
-  // A non-empty matcher that covers Edit+Write BUT ALSO Read (`.*` or
-  // `Edit|Write|Read`) is not a safe merge target: appending prettier/eslint to
-  // it would fire after Read too (whose payload carries file_path), rewriting
-  // the tree on every file read. It must be preserved untouched, with a separate
-  // Edit|Write entry added — exactly like an empty catch-all.
-  for (const broadMatcher of [".*", "Edit|Write|Read"]) {
+  // A non-empty matcher that covers Edit+Write BUT ALSO a non-edit tool is not a
+  // safe merge target. Read carries file_path but formatting on every read
+  // rewrites the tree needlessly; Bash/Glob/Grep/Task payloads carry NO
+  // file_path, so an appended prettier/eslint hook misfires on the literal `{}`
+  // arg. Each such matcher must be preserved untouched with a separate Edit|Write
+  // entry added — exactly like an empty catch-all. (`Edit|Write|Bash` previously
+  // passed the old "fires on Edit+Write and not Read" check.)
+  for (const broadMatcher of [".*", "Edit|Write|Read", "Edit|Write|Bash", "Edit|Write|Glob", "Edit|Write|Grep"]) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-merge-broad-"));
     fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {}, devDependencies: { prettier: "*", eslint: "*" } }));
     fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
@@ -2702,6 +2704,46 @@ test("isDbProject recognizes standard drizzle-orm / @prisma/client dependency na
   await runCli(["init", "--cwd", webDir, "--write"]);
   const webLocal = fs.readFileSync(path.join(webDir, ".claude", "settings.local.json"), "utf8");
   assert.ok(!/DROP TABLE/.test(webLocal), "nonstandard `drizzle` key must NOT scaffold SQL guards");
+});
+
+test("isDbProject inspects workspace member manifests, not just the root (Codex P2)", async () => {
+  // In a monorepo the DB dependency may live only in a workspace member (e.g.
+  // `packages/api` → `@prisma/client`). report.packageJson is the ROOT manifest;
+  // without scanning members, a DB project with no schema/migration file yet was
+  // missed and the SQL deny guards (DROP/TRUNCATE, psql, prisma reset) were
+  // omitted. The file-signal check already scans the full tree, so this targets
+  // the dep-only member case.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-dbdep-ws-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  // Root declares workspaces but has NO database dependency itself.
+  fs.writeFileSync(
+    path.join(dir, "package.json"),
+    JSON.stringify({ name: "root", scripts: {}, workspaces: ["packages/*"] }),
+  );
+  fs.mkdirSync(path.join(dir, "packages", "api"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, "packages", "api", "package.json"),
+    JSON.stringify({ name: "api", dependencies: { "@prisma/client": "*" } }),
+  );
+  await runCli(["init", "--cwd", dir, "--write"]);
+  const local = fs.readFileSync(path.join(dir, ".claude", "settings.local.json"), "utf8");
+  assert.ok(/DROP TABLE/.test(local), "DB dep in a workspace member must scaffold SQL deny guards");
+  assert.ok(/prisma migrate reset/.test(local), "prisma migrate reset guard scaffolded for member DB dep");
+  // Negative: a monorepo whose members have NO database dep must NOT scaffold.
+  const cleanDir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-dbdep-ws-clean-"));
+  fs.writeFileSync(path.join(cleanDir, "CLAUDE.md"), "# x\n");
+  fs.writeFileSync(
+    path.join(cleanDir, "package.json"),
+    JSON.stringify({ name: "root", scripts: {}, workspaces: ["packages/*"] }),
+  );
+  fs.mkdirSync(path.join(cleanDir, "packages", "ui"), { recursive: true });
+  fs.writeFileSync(
+    path.join(cleanDir, "packages", "ui", "package.json"),
+    JSON.stringify({ name: "ui", dependencies: { react: "*" } }),
+  );
+  await runCli(["init", "--cwd", cleanDir, "--write"]);
+  const cleanLocal = fs.readFileSync(path.join(cleanDir, ".claude", "settings.local.json"), "utf8");
+  assert.ok(!/DROP TABLE/.test(cleanLocal), "monorepo with no DB dep must NOT scaffold SQL guards");
 });
 
 test("Dangerous-command guard + scaffold cover recursive rm clustered with non-force flags (Codex P1)", async () => {

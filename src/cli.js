@@ -869,17 +869,25 @@ function matcherCoversEditWrite(matcher) {
   return c === "catch-all" || c === "both";
 }
 
+/** Tools a formatter/linter hook must NOT run after. Read carries a file_path
+ *  but formatting on every read mutates the working tree needlessly; the others
+ *  (Bash, Glob, Grep, Task) carry NO edited file_path, so an appended
+ *  prettier/eslint hook misfires on the literal `{}` arg. Used to reject merge
+ *  targets that cover edits but also fire on these. */
+const NON_EDIT_TOOLS = ["Read", "Bash", "Glob", "Grep", "Task"];
+
 /** True only for a NON-catch-all matcher scoped to edits — fires on both Edit
  *  and Write AND on nothing else. Used by MERGE: we append formatter hooks to
  *  an existing entry only when it is scoped to edits. Appending to a catch-all
- *  OR a broader matcher (`.*`, `Edit|Write|Read`) would make prettier/eslint run
- *  after Read (whose payload also carries file_path), mutating the working tree
- *  on every file read. Such entries are preserved untouched and a separate
- *  Edit|Write entry is added instead. Detection (matcherCoversEditWrite) stays
- *  lenient — a broad matcher still COVERS edits — only the MERGE needs the
- *  stricter scope. */
+ *  OR a broader matcher (`.*`, `Edit|Write|Read`, `Edit|Write|Bash`) would make
+ *  prettier/eslint run after a non-edit tool — Read mutates the tree on every
+ *  file read, and Bash/Glob/Grep/Task payloads carry no file_path so the hook
+ *  fails on `{`. Such entries are preserved untouched and a separate Edit|Write
+ *  entry is added instead. Detection (matcherCoversEditWrite) stays lenient — a
+ *  broad matcher still COVERS edits — only the MERGE needs the stricter scope. */
 function matcherIsEditWriteEntry(matcher) {
-  return matcherCoverage(matcher) === "both" && !matcherFiresOn(matcher, "Read");
+  if (matcherCoverage(matcher) !== "both") return false;
+  return !NON_EDIT_TOOLS.some((tool) => matcherFiresOn(matcher, tool));
 }
 
 /** Shared classification of a PostToolUse command's formatter purpose. Detection
@@ -1185,13 +1193,29 @@ function isDbProject(report) {
   // `prisma`) were nonstandard: `drizzle` is not a real package (the ORM is
   // `drizzle-orm`), and a project depending on `@prisma/client` alone (no `prisma`
   // CLI devDep) was misclassified as non-database and skipped the SQL guards.
-  const deps = { ...report.packageJson?.dependencies, ...report.packageJson?.devDependencies };
   const DB_DEP_NAMES = [
     "prisma", "@prisma/client", // Prisma: CLI devDep + runtime client
     "drizzle-orm", "drizzle-kit", // Drizzle: ORM + migration toolkit
     "knex", "typeorm", "sequelize", // SQL query builders / ORMs
   ];
-  return Object.keys(deps).some((name) => DB_DEP_NAMES.includes(name));
+  const hasDbDep = (pkg) => {
+    const deps = { ...pkg?.dependencies, ...pkg?.devDependencies };
+    return Object.keys(deps).some((name) => DB_DEP_NAMES.includes(name));
+  };
+  if (hasDbDep(report.packageJson)) return true;
+  // A monorepo may declare the DB dep only in a workspace member (e.g.
+  // `packages/api` → `@prisma/client`). report.packageJson is the ROOT manifest
+  // only; without scanning members, a DB project with no schema/migration file
+  // yet was missed and the SQL deny guards were omitted. (Unlike formatter hooks,
+  // deny guards are permission patterns — they apply regardless of whether the
+  // member's binaries resolve from the primary root.)
+  const primary = report.roots?.[0];
+  if (primary) {
+    for (const memberPkg of readWorkspaceMemberPackages(primary, report.packageJson)) {
+      if (hasDbDep(memberPkg)) return true;
+    }
+  }
+  return false;
 }
 
 /** Default irreversible-command deny list, generalized from production rules.
