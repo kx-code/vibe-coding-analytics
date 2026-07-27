@@ -91,7 +91,7 @@ function analyzeProject(cwd) {
     roots.some((root) => [...filesByRoot.get(root)].some((file) => file.startsWith(prefix)));
 
   const packageJson = readJson(path.join(cwd, "package.json"));
-  const { flat: scripts, byName: workspaceScripts, all: allScripts } = collectAllScripts(cwd, allFiles);
+  const { flat: scripts, byName: workspaceScripts, byDir: dirScripts, all: allScripts } = collectAllScripts(cwd, allFiles);
   const shape = detectShape(cwd, packageJson);
   const untrackedHarness = untrackedHarnessFiles(cwd, allFiles);
 
@@ -100,7 +100,7 @@ function analyzeProject(cwd) {
 
   const numberedRules = countNumberedRules(roots);
   const ruleTrace = analyzeRuleTraceability(roots, allFiles, cwd);
-  const hooks = detectHooksConfig(roots, scripts, workspaceScripts);
+  const hooks = detectHooksConfig(roots, scripts, workspaceScripts, dirScripts);
   const isClaude = isClaudeCodeProject(allFiles);
   const hasFormatters = hasNodeFormattersAnywhere(roots);
   // N/A semantics: a check that does not apply to this project should neither
@@ -110,6 +110,9 @@ function analyzeProject(cwd) {
   const hooksPresent = hooks.postToolUseLint && hooks.postToolUseFormat;
   const hooksNa = !isClaude || (!hasFormatters && !hooksPresent);
   const guardNa = !isClaude;
+  // Entry-level completeness: every scaffolded default must already be present.
+  // See denyGuardIsComplete for why family-level coverage was too coarse.
+  const permissionsDeny = denyGuardIsComplete({ files: allFiles, packageJson, roots });
   const checks = [
     check(
       "Project facts",
@@ -196,7 +199,7 @@ function analyzeProject(cwd) {
     ),
     check(
       "Dangerous-command guard",
-      guardNa || hooks.permissionsDeny,
+      guardNa || permissionsDeny,
       guardNa
         ? "N/A — not a Claude Code project (no CLAUDE.md / .claude/settings*.json). permissions.deny is a Claude Code settings mechanism."
         : "Add .claude/settings.local.json permissions.deny for irreversible commands (rm -rf, git push -f, git reset --hard, mkfs, dd, DROP TABLE) so agents cannot run them. (vca init --write scaffolds a default list.)",
@@ -278,7 +281,7 @@ function analyzeProject(cwd) {
   }
   const score = total === 0 ? 100 : Math.round((earned / total) * 100);
   const warnings = detectWarnings(checks);
-  return { cwd, shape, roots, files: allFiles, packageJson, scripts, workspaceScripts, checks, score, warnings, untrackedHarness };
+  return { cwd, shape, roots, files: allFiles, packageJson, scripts, workspaceScripts, dirScripts, checks, score, warnings, untrackedHarness };
 }
 
 /** Surface false-safety combinations (grounded in SKILL.md Red Flags). */
@@ -484,6 +487,12 @@ function detectShape(cwd, packageJson) {
 function collectAllScripts(cwd, allFiles) {
   const flat = {};
   const byName = {};
+  // EVERY package.json's scripts keyed by its directory (relative to cwd). A
+  // `--prefix <dir>` / `-C <dir>` / `--dir <dir>` hint reads <dir>/package.json
+  // DIRECTLY — whether or not <dir> is a declared workspace member — so resolving
+  // its script body needs a dir->scripts map that is independent of the declared
+  // workspace membership that gates `--workspace`/`--filter`. (Codex P2 #3660483494)
+  const byDir = {};
   const all = {};
   const rootPkg = readJson(path.join(cwd, "package.json"));
   for (const file of allFiles) {
@@ -491,7 +500,11 @@ function collectAllScripts(cwd, allFiles) {
     if (file === "package.json" || file.endsWith("/package.json")) {
       if (file === "package.json") continue; // root merged into `all` last, below
       const pkg = readJson(path.join(cwd, file));
-      if (pkg && pkg.scripts) Object.assign(all, pkg.scripts);
+      if (pkg && pkg.scripts) {
+        Object.assign(all, pkg.scripts);
+        const relDir = path.dirname(file);
+        if (relDir && relDir !== ".") byDir[normalizeWorkspaceKey(relDir)] = pkg.scripts;
+      }
     }
   }
   if (rootPkg && rootPkg.scripts) {
@@ -507,7 +520,7 @@ function collectAllScripts(cwd, allFiles) {
     const rel = path.relative(cwd, dir);
     if (rel) byName[rel] = pkg.scripts;
   }
-  return { flat, byName, all };
+  return { flat, byName, byDir, all };
 }
 
 /** Normalize a `--workspace`/`--filter` selector value for `byName` lookup. npm
@@ -899,11 +912,6 @@ const DANGEROUS_CMD_RE = new RegExp(
 const DANGEROUS_FAMILY_RES = new Map(
   DANGEROUS_CMD_FAMILIES.map((f) => [f.fam, new RegExp("^(?:" + f.pats.join("|") + ")", "i")]),
 );
-// A deny list satisfies the guard only when it blocks EVERY always-on
-// irreversible-command family. sql-destructive is intentionally excluded: it
-// is conditionally scaffolded for DB projects only (defaultDenyList) and is not
-// part of the universal baseline. (Codex P1 #3660296403)
-const REQUIRED_DENY_FAMILIES = ["rm-recursive", "git-force-push", "git-hard-reset", "git-clean-force", "device-write", "pipe-to-shell"];
 
 /** A Claude Code deny entry looks like `Bash(<command>:<qualifier>)` (or
  *  `Bash(<command>)`). The blocked command is the `<command>` prefix before the
@@ -1204,23 +1212,23 @@ const SHORT_WRITE_FLAG_RE = /(?:^|\s)-w(?=\s|$)/;
 function parsePmInvocation(invocation) {
   const s = String(invocation || "");
   const pm = s.match(/\b(?:npm|pnpm|yarn|bun)\b/);
-  if (!pm) return { name: null, ws: null, pm: null, hasRun: false };
+  if (!pm) return { name: null, ws: null, prefix: null, pm: null, hasRun: false };
   const isYarn = pm[0] === "yarn";
   const tokens = s.slice(pm.index + pm[0].length).split(/\s+/).filter(Boolean);
   let ws = null;
+  let prefix = null;
   let hasRun = false; // whether an explicit `run` keyword preceded the script name
   let i = 0;
   while (i < tokens.length) {
     const t = tokens[i];
     if (t === "run") { hasRun = true; i++; continue; }
-    // Value-taking selectors — record the FOLLOWING token as the workspace
-    // selector (only the FIRST one, before the command name) and skip selector +
-    // value so the real script NAME is returned instead of the value:
+    // STRICT workspace selectors — record the FOLLOWING token as the named member
+    // (only the FIRST one, before the command name) and skip selector + value so
+    // the real script NAME is returned instead of the value:
     //   `--workspace <pkg>` / `-w <pkg>`  (npm, pnpm)
     //   `--filter <pkg>`                  (pnpm)
-    //   `--prefix <dir>` / `-C <dir>` / `--dir <dir>`  (npm/pnpm; a directory)
     //   `workspace <name> <cmd>`          (yarn classic, POSITIONAL — no flag)
-    if (t === "--workspace" || t === "-w" || t === "--filter" || t === "--prefix" || t === "-C" || t === "--dir") {
+    if (t === "--workspace" || t === "-w" || t === "--filter") {
       if (ws === null && tokens[i + 1] !== undefined) ws = tokens[i + 1];
       i += 2; continue;
     }
@@ -1228,21 +1236,35 @@ function parsePmInvocation(invocation) {
       if (ws === null && tokens[i + 1] !== undefined) ws = tokens[i + 1];
       i += 2; continue;
     }
-    if (/^(?:--workspace|-w|--filter|--prefix|-C|--dir)=/.test(t)) {            // inline value (--filter=a)
+    // DIRECTORY hints — change WHERE the PM reads package.json, NOT which member
+    // it selects. `--prefix <dir>` / `-C <dir>` / `--dir <dir>` (npm/pnpm). These
+    // are tracked SEPARATELY from `ws` because npm reads <dir>/package.json
+    // directly and does NOT error when <dir> is not a declared workspace member
+    // (unlike `--workspace <unknown>`, which errors "No workspaces found").
+    // (Codex P2 #3660483494)
+    if (t === "--prefix" || t === "-C" || t === "--dir") {
+      if (prefix === null && tokens[i + 1] !== undefined) prefix = tokens[i + 1];
+      i += 2; continue;
+    }
+    if (/^(?:--workspace|-w|--filter)=/.test(t)) {                                // inline strict selector (--filter=a)
       if (ws === null) ws = t.slice(t.indexOf("=") + 1);
       i++; continue;
     }
-    if (t.startsWith("-")) { i++; continue; }                                   // boolean option
-    return { name: t, ws, pm: pm[0], hasRun };                                  // first bare token = command
+    if (/^(?:--prefix|-C|--dir)=/.test(t)) {                                      // inline directory hint (--prefix=a)
+      if (prefix === null) prefix = t.slice(t.indexOf("=") + 1);
+      i++; continue;
+    }
+    if (t.startsWith("-")) { i++; continue; }                                     // boolean option
+    return { name: t, ws, prefix, pm: pm[0], hasRun };                            // first bare token = command
   }
-  return { name: null, ws, pm: pm[0], hasRun };
+  return { name: null, ws, prefix, pm: pm[0], hasRun };
 }
 
 function extractScriptName(invocation) {
   return parsePmInvocation(invocation).name;
 }
 
-function resolveScriptBody(invocation, scripts, seen, workspaceScripts) {
+function resolveScriptBody(invocation, scripts, seen, workspaceScripts, byDir) {
   const s = String(invocation || "");
   if (!PM_SCRIPT_RE.test(s)) return null;
   // npm/pnpm/yarn forward trailing args after a bare `--`: `npm run format --
@@ -1253,7 +1275,7 @@ function resolveScriptBody(invocation, scripts, seen, workspaceScripts) {
   // (a write body false-PASSes as covered). (Codex P2 #3656425156)
   const forwardedMatch = s.match(/(?:^|\s)--\s+(.+)$/);
   const forwarded = forwardedMatch ? forwardedMatch[1].trim() : "";
-  const { name, ws: wsRaw, pm, hasRun } = parsePmInvocation(s);
+  const { name, ws: wsRaw, prefix: prefixRaw, pm, hasRun } = parsePmInvocation(s);
   if (!name) return null;
   // npm REQUIRES `run` (or a lifecycle shortcut) to execute a user script: `npm
   // lint` exits "Unknown command: lint" (npm run --help) and never invokes
@@ -1264,37 +1286,54 @@ function resolveScriptBody(invocation, scripts, seen, workspaceScripts) {
   // the caller's name-heuristic trust does NOT credit `npm lint` as a lint script.
   // (Codex P2 #3660108922)
   if (pm === "npm" && !hasRun && !NPM_LIFECYCLE_SCRIPTS.has(name)) return "";
-  // Workspace/package selector. Long-form flags (--workspace/--filter/--prefix/
-  // --dir/-C) are UNAMBIGUOUS PM global flags valid in ANY position, including
-  // AFTER the script name (`npm run format --workspace a` — npm scans all args);
-  // they are matched non-positionally below. The short `-w` is AMBIGUOUS (npm/pnpm
-  // use it as `--workspace`, but prettier uses it as `--write`), so it is honored
-  // ONLY before the command name — parsePmInvocation's positional walk (wsRaw)
-  // records it there, while a TRAILING `-w` (`bun prettier -w .`) is left as a tool
-  // write flag and never reaches this selector path. The value is NORMALIZED
+  // Workspace/package selector vs directory hint. Long-form flags are
+  // UNAMBIGUOUS PM global flags valid in ANY position, including AFTER the script
+  // name (`npm run format --workspace a` — npm scans all args); they are matched
+  // non-positionally below. The short `-w` is AMBIGUOUS (npm/pnpm use it as
+  // `--workspace`, but prettier uses it as `--write`), so it is honored ONLY
+  // before the command name — parsePmInvocation's positional walk (wsRaw)
+  // records it there, while a TRAILING `-w` (`bun prettier -w .`) is left as a
+  // tool write flag and never reaches this selector path. The value is NORMALIZED
   // (leading `./` stripped) to match collectAllScripts' directory-key form.
-  // (Codex P2 #3659471687)
-  const wsLong = wsRaw ? null : s.match(/(?:^|\s)(?:--workspace|--filter|--prefix|-C|--dir)[ =](\S+)/);
+  //   STRICT selectors (--workspace/-w/--filter, yarn `workspace`) NAME a member;
+  //   an unknown name means the PM ERRORS at runtime. DIRECTORY hints
+  //   (--prefix/-C/--dir) only change WHERE the PM reads package.json; npm reads
+  //   <dir>/package.json directly and does NOT error on an undeclared dir.
+  //   (Codex P2 #3659471687 / #3660483494)
+  const wsLong = wsRaw ? null : s.match(/(?:^|\s)(?:--workspace|--filter)[ =](\S+)/);
+  const prefixLong = prefixRaw ? null : s.match(/(?:^|\s)(?:--prefix|-C|--dir)[ =](\S+)/);
   const wsName = wsRaw ? normalizeWorkspaceKey(wsRaw)
     : wsLong ? normalizeWorkspaceKey(wsLong[1]) : null;
-  // An EXPLICIT selector (--workspace/--filter/--prefix/-C/--dir, or yarn's
-  // positional `workspace`) that does not resolve to a known package means the PM
-  // ERRORS at runtime ("No workspaces found" / "No projects matched") and the
-  // command never runs. Do NOT fall back to the flat map (which would resolve an
-  // UNRELATED package's same-named script and false-PASS): fail closed with a
-  // definitive MISS sentinel (""). The caller classifies the empty body as no
-  // purpose -> MISS, and crucially SKIPS the opaque name-heuristic trust. Only
-  // the UNSCOPED case (wsName null) legitimately uses the flat/root map.
+  const prefixName = prefixRaw ? normalizeWorkspaceKey(prefixRaw)
+    : prefixLong ? normalizeWorkspaceKey(prefixLong[1]) : null;
+  // A STRICT selector that names an unknown package FAILS CLOSED: the PM errors
+  // ("No workspaces found" / "No projects matched") and never runs. Do NOT fall
+  // back to the flat map (which would resolve an UNRELATED package's same-named
+  // script and false-PASS); return the definitive MISS sentinel ("") so the
+  // caller classifies no-purpose -> MISS and SKIPS the opaque name-heuristic
+  // trust. Only the UNSCOPED case legitimately uses the flat/root map.
   // (Codex P2 #3659471687)
   if (wsName && !(workspaceScripts && workspaceScripts[wsName])) return "";
-  const scope = wsName ? workspaceScripts[wsName] : scripts;
+  // A directory hint resolves ONLY when <dir> is a known workspace member (keyed
+  // by directory). An UNKNOWN dir (--prefix <non-member>) is OPAQUE: npm reads
+  // that dir's package.json, which vca cannot reach from the workspace map. Do
+  // NOT fall back to the root map (would resolve an UNRELATED root script and
+  // false-PASS) and do NOT fail-close (npm does not error on an undeclared dir,
+  // unlike --workspace). Return null so the caller's name-heuristic trust applies
+  // — the named script still expresses lint/format intent even when its body lives
+  // where vca can't read it. (Codex P2 #3660483494)
+  const prefixScope = prefixName
+    ? (workspaceScripts && workspaceScripts[prefixName]) || (byDir && byDir[prefixName]) || null
+    : null;
+  if (!wsName && prefixName && !prefixScope) return null;
+  const scope = wsName ? workspaceScripts[wsName] : (prefixScope || scripts);
   // Cycle guard keys on (workspace scope, name), NOT name alone: the same script
   // NAME under a DIFFERENT workspace (root `format` -> member a `format` via
   // `npm --workspace a run format`) is a legitimate cross-package resolution, not
   // a self-cycle. Keying on name only (Codex P2 #3656270108) blocked the nested
   // member lookup as soon as the root name was seen, leaving the body opaque and
   // false-PASSing the name heuristic. `__flat__` namespaces the no-selector case.
-  const scopeKey = wsName || "__flat__";
+  const scopeKey = wsName || prefixName || "__flat__";
   if (seen.has(`${scopeKey}:${name}`)) return null;
   const body = scope ? scope[name] : undefined;
   // Absent from the selected manifest -> OPAQUE (null), NOT a hard MISS. The
@@ -1329,7 +1368,7 @@ function resolveScriptBody(invocation, scripts, seen, workspaceScripts) {
   // PM keyword then signals opaque (return null) so the caller falls back rather
   // than re-resolving the same invocation infinitely.
   const resolved = body.replace(PM_SCRIPT_CALL_RE_G, (match) => {
-    const sub = resolveScriptBody(match.trim(), scope, new Set(seen), workspaceScripts);
+    const sub = resolveScriptBody(match.trim(), scope, new Set(seen), workspaceScripts, byDir);
     return sub != null ? sub : match;
   });
   if (PM_SCRIPT_RE.test(resolved)) return null;
@@ -1475,7 +1514,7 @@ function maskDataQuotes(cmd) {
   return out;
 }
 
-function commandPurposes(cmd, scripts, workspaceScripts) {
+function commandPurposes(cmd, scripts, workspaceScripts, byDir) {
   let c = String(cmd || "");
   // Drop the FULL argument list of echo/printf — status text such as
   // 'lint and format complete' OR unquoted `echo lint && echo format`. Their
@@ -1518,8 +1557,8 @@ function commandPurposes(cmd, scripts, workspaceScripts) {
   // package.json we saw), so a real lint script we cannot see is still credited.
   const lintSatisfied = segments.some((seg) => {
     if (PM_SCRIPT_RE.test(seg) && segmentExecutes(seg, PM_KEYWORD_RE)) {
-      const body = resolveScriptBody(seg, scripts || {}, new Set(), workspaceScripts);
-      if (body != null) return commandPurposes(body, scripts, workspaceScripts).includes("lint");
+      const body = resolveScriptBody(seg, scripts || {}, new Set(), workspaceScripts, byDir);
+      if (body != null) return commandPurposes(body, scripts, workspaceScripts, byDir).includes("lint");
       return LINT_CMD_RE.test(seg);
     }
     // Direct binary call: lint/eslint must be the EXECUTED command, not a
@@ -1547,8 +1586,8 @@ function commandPurposes(cmd, scripts, workspaceScripts) {
       // (prettier --check reports drift but never rewrites), so it must NOT
       // credit format-on-save. The body is classified recursively so a script
       // that chains to prettier --write (or --check) is followed all the way down.
-      const body = resolveScriptBody(seg, scripts || {}, new Set(), workspaceScripts);
-      if (body != null) return commandPurposes(body, scripts, workspaceScripts).includes("format");
+      const body = resolveScriptBody(seg, scripts || {}, new Set(), workspaceScripts, byDir);
+      if (body != null) return commandPurposes(body, scripts, workspaceScripts, byDir).includes("format");
       // Opaque (body unresolvable). `yarn prettier .` / `bun prettier .` (no
       // `run`) resolve the dependency binary DIRECTLY (implicit binary mode) when
       // no script matches, so the flags on the line are the real prettier flags:
@@ -1594,7 +1633,7 @@ function commandPurposes(cmd, scripts, workspaceScripts) {
  *  could not repair either half. Scoping to the primary keeps the check honest
  *  (split coverage reports MISS) and the repair working (the missing purpose is
  *  scaffolded at the primary). */
-function detectHooksConfig(roots, scripts, workspaceScripts) {
+function detectHooksConfig(roots, scripts, workspaceScripts, dirScripts) {
   const primary = roots?.[0];
   const settings = primary ? readJson(path.join(primary, ".claude", "settings.json")) : null;
   const local = primary ? readJson(path.join(primary, ".claude", "settings.local.json")) : null;
@@ -1605,7 +1644,6 @@ function detectHooksConfig(roots, scripts, workspaceScripts) {
   // is satisfied only when BOTH Edit and Write carry it, preserving the old
   // single-entry "matcher covers Edit|Write" semantics for the combined case.
   let editLint = false, writeLint = false, editFormat = false, writeFormat = false;
-  let permissionsDeny = false;
   // PostToolUse hooks and permissions.deny may each live in the shared
   // settings.json OR the gitignored settings.local.json — both are supported
   // Claude settings locations. Inspect both for hooks (as we already do for
@@ -1626,7 +1664,7 @@ function detectHooksConfig(roots, scripts, workspaceScripts) {
       // quoted status echo inside one command must not flip the other purpose.
       const purposes = new Set();
       for (const h of entry.hooks || []) {
-        for (const purpose of commandPurposes(h?.command, scripts, workspaceScripts)) {
+        for (const purpose of commandPurposes(h?.command, scripts, workspaceScripts, dirScripts)) {
           purposes.add(purpose);
         }
       }
@@ -1642,13 +1680,16 @@ function detectHooksConfig(roots, scripts, workspaceScripts) {
   }
   const postToolUseLint = editLint && writeLint;
   const postToolUseFormat = editFormat && writeFormat;
-  // A deny list only fully satisfies the guard when it blocks EVERY always-on
-  // irreversible-command family (REQUIRED_DENY_FAMILIES). Collapsing coverage to
-  // a single boolean — "any one recognized entry" — let a list with only
-  // `Bash(mkfs:*)` pass, so init/evolve skipped merging the defaults and rm -rf /
-  // force-push / hard-reset / git-clean / pipe-to-shell stayed allowed. Collect
-  // the set of families the existing entries already cover; the guard PASSes
-  // (and init/evolve skip) only when that set is complete. (Codex P1 #3660296403)
+  // Collect which irreversible-command families the existing deny entries block,
+  // surfaced as recognition metadata in the report (which families are
+  // represented). This is NOT the guard's PASS/MISS signal anymore: family-level
+  // coverage was too coarse — one entry per family "covered" it while dangerous
+  // within-family variants (dd of=/dev/ vs mkfs) stayed allowed, and a project
+  // that LATER adds Prisma kept the always-on families satisfied while the
+  // conditional SQL denies were never merged. The PASS/MISS decision now lives in
+  // denyGuardIsComplete (entry-level: every scaffolded default present). Kept
+  // here because it reads the same settings files and reports useful detail.
+  // (Codex P1 #3660296403 / #3660483486 / #3660483492)
   const coveredDenyFamilies = new Set();
   for (const denyList of [settings?.permissions?.deny, local?.permissions?.deny]) {
     if (!Array.isArray(denyList)) continue;
@@ -1657,8 +1698,7 @@ function detectHooksConfig(roots, scripts, workspaceScripts) {
       if (fam) coveredDenyFamilies.add(fam);
     }
   }
-  permissionsDeny = REQUIRED_DENY_FAMILIES.every((f) => coveredDenyFamilies.has(f));
-  return { postToolUseLint, postToolUseFormat, editLint, writeLint, editFormat, writeFormat, permissionsDeny, coveredDenyFamilies: [...coveredDenyFamilies] };
+  return { postToolUseLint, postToolUseFormat, editLint, writeLint, editFormat, writeFormat, coveredDenyFamilies: [...coveredDenyFamilies] };
 }
 
 /** A user-authored Claude skill: a path under .claude/skills/ that names a
@@ -2035,7 +2075,7 @@ function isDbProject(report) {
 
 /** Default irreversible-command deny list, generalized from production rules.
  *  Bash(...) patterns follow Claude Code permission syntax. */
-function defaultDenyList(report) {
+export function defaultDenyList(report) {
   const deny = [
     // rm with a recursive flag is irreversible whether or not -f is present
     // (force only suppresses the prompt), so block EVERY recursive form.
@@ -2149,6 +2189,29 @@ function defaultDenyList(report) {
     );
   }
   return deny;
+}
+
+/** The dangerous-command guard is COMPLETE only when EVERY entry the scaffolder
+ *  emits (defaultDenyList) is already present in settings.json ∪
+ *  settings.local.json. Family-level coverage was too coarse: a list with one
+ *  representative per family (e.g. only `Bash(mkfs:*)` for device-write) marked
+ *  the family "covered" while `dd of=/dev/sda` stayed allowed, and a project that
+ *  LATER adds Prisma/Drizzle kept the always-on families satisfied while the
+ *  conditional SQL denies (DROP/TRUNCATE/prisma migrate reset) were never merged.
+ *  Comparing against the exact scaffolded defaults closes both gaps, because the
+ *  default set itself grows the moment isDbProject becomes true. (Codex P1
+ *  #3660483486 / #3660483492) */
+export function denyGuardIsComplete(report) {
+  const defaults = defaultDenyList(report);
+  const primary = report.roots?.[0];
+  const settings = primary ? readJson(path.join(primary, ".claude", "settings.json")) : null;
+  const local = primary ? readJson(path.join(primary, ".claude", "settings.local.json")) : null;
+  const existing = new Set();
+  for (const denyList of [settings?.permissions?.deny, local?.permissions?.deny]) {
+    if (!Array.isArray(denyList)) continue;
+    for (const entry of denyList) existing.add(String(entry).trim());
+  }
+  return defaults.every((entry) => existing.has(entry));
 }
 
 /** Broad SQL-CLIENT invocations (psql -c/-f, mysql -e) run ARBITRARY SQL — a safe
@@ -2485,12 +2548,11 @@ function buildInitFiles(report) {
   // so rm -rf / force-push / hard-reset / git-clean / pipe-to-shell get blocked.
   // (Codex P1 #3660296403)
   if (isClaudeCodeProject(report.files)) {
-    const { permissionsDeny } = detectHooksConfig(report.roots);
-    if (!permissionsDeny) {
+    if (!denyGuardIsComplete(report)) {
       files.push(file(".claude/settings.local.json", claudePermissionsLocal(report), mergePermissionsLocal));
     }
     const hooksContent = claudeHooksSettings(report);
-    if (hooksContent) files.push(file(".claude/settings.json", hooksContent, (existing, incoming) => mergeHooksSettings(existing, incoming, report.scripts, report.workspaceScripts)));
+    if (hooksContent) files.push(file(".claude/settings.json", hooksContent, (existing, incoming) => mergeHooksSettings(existing, incoming, report.scripts, report.workspaceScripts, report.dirScripts)));
   }
   return files;
 }
@@ -2612,12 +2674,11 @@ function buildEvolutionFiles(report, plan) {
   // already present; a partial list is unioned with the missing defaults instead
   // of being treated as sufficient. (Codex P1 #3660296403)
   if (isClaudeCodeProject(report.files)) {
-    const { permissionsDeny } = detectHooksConfig(report.roots);
-    if (!permissionsDeny) {
+    if (!denyGuardIsComplete(report)) {
       files.push(file(".claude/settings.local.json", claudePermissionsLocal(report), mergePermissionsLocal));
     }
     const hooksContent = claudeHooksSettings(report);
-    if (hooksContent) files.push(file(".claude/settings.json", hooksContent, (existing, incoming) => mergeHooksSettings(existing, incoming, report.scripts, report.workspaceScripts)));
+    if (hooksContent) files.push(file(".claude/settings.json", hooksContent, (existing, incoming) => mergeHooksSettings(existing, incoming, report.scripts, report.workspaceScripts, report.dirScripts)));
   }
   return files;
 }
@@ -2630,7 +2691,7 @@ function file(relativePath, content, merge) {
  *  unrelated user settings. Dedupes commands within the Edit|Write matcher.
  *  Used as the `merge` strategy so `evolve --write` backfills hooks even when
  *  settings.json already exists with user content. */
-function mergeHooksSettings(existingContent, incomingContent, scripts, workspaceScripts) {
+function mergeHooksSettings(existingContent, incomingContent, scripts, workspaceScripts, dirScripts) {
   const existing = JSON.parse(existingContent);
   const incoming = JSON.parse(incomingContent);
   existing.hooks ??= {};
@@ -2670,14 +2731,14 @@ function mergeHooksSettings(existingContent, incomingContent, scripts, workspace
       // detection" and "already merged" stay consistent.
       const coveredPurposes = new Set();
       for (const h of existingEntry.hooks) {
-        for (const purpose of commandPurposes(h?.command, scripts, workspaceScripts)) coveredPurposes.add(purpose);
+        for (const purpose of commandPurposes(h?.command, scripts, workspaceScripts, dirScripts)) coveredPurposes.add(purpose);
       }
       for (const h of entry.hooks || []) {
         if (!h?.command || knownCmds.has(h.command)) continue;
         // A combined command (e.g. `npm run lint && npm run format`) carries
         // multiple purposes; only skip it when EVERY purpose it serves is
         // already covered, otherwise an uncovered purpose would go unscaffolded.
-        const purposes = commandPurposes(h.command, scripts, workspaceScripts);
+        const purposes = commandPurposes(h.command, scripts, workspaceScripts, dirScripts);
         if (purposes.length && purposes.every((p) => coveredPurposes.has(p))) continue;
         existingEntry.hooks.push(h);
         knownCmds.add(h.command);

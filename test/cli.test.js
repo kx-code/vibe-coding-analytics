@@ -4,12 +4,14 @@ import path from "node:path";
 import test from "node:test";
 import { execSync, execFileSync } from "node:child_process";
 import assert from "node:assert/strict";
-import { analyzeForTest, runCli, buildEvolutionPlan, printEvolution, printReport, parseOptions, denyEntryFamily } from "../src/cli.js";
+import { analyzeForTest, runCli, buildEvolutionPlan, printEvolution, printReport, parseOptions, denyEntryFamily, defaultDenyList } from "../src/cli.js";
 
-// A deny list that covers EVERY always-on irreversible-command family — the
-// coverage the guard now requires to PASS (and that init/evolve require before
-// they skip merging the defaults). One entry per family so the list stays
-// legible. (Codex P1 #3660296403)
+// One representative entry per always-on irreversible-command family. This
+// satisfied the OLD family-level coverage (a single entry marks a family
+// "covered") but is NOT enough for entry-level coverage: the device-write
+// family has only `Bash(mkfs:*)`, so `dd of=/dev/sda` and `:> /dev/sd*` stay
+// unguarded. Kept as the deliberately-insufficient fixture for the #3660483486
+// regression. (Codex P1 #3660296403 / #3660483486)
 const FULL_GUARD_DENY_LIST = [
   "Bash(rm -rf:*)",
   "Bash(git push --force:*)",
@@ -18,6 +20,14 @@ const FULL_GUARD_DENY_LIST = [
   "Bash(mkfs:*)",
   "Bash(curl *|sh)",
 ];
+
+// The EXACT set the scaffolder emits for a non-DB project — every always-on
+// entry, INCLUDING within-family variants (dd of=/dev/, git push * --force,
+// rm -Rf, the four curl|sh spacings, etc.). Entry-level coverage requires this
+// complete set (not merely one representative per family) to PASS, and for
+// init/evolve to skip merging. Built from the real defaultDenyList so the
+// fixture cannot drift from the implementation. (Codex P1 #3660483486)
+const COMPLETE_NON_DB_DENY = defaultDenyList({ files: new Set(), packageJson: null, roots: [] });
 
 test("analyzes an empty project with missing harness areas", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-empty-"));
@@ -1214,11 +1224,11 @@ test("Dangerous-command guard PASS when settings.local.json has a deny list", ()
   fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
   fs.writeFileSync(
     path.join(dir, ".claude", "settings.local.json"),
-    JSON.stringify({ permissions: { deny: FULL_GUARD_DENY_LIST } }),
+    JSON.stringify({ permissions: { deny: COMPLETE_NON_DB_DENY } }),
   );
   const r = analyzeForTest(dir);
   const guard = r.checks.find((c) => c.area === "Dangerous-command guard");
-  assert.ok(guard && guard.ok, "a deny list covering every always-on family should PASS");
+  assert.ok(guard && guard.ok, "a deny list with every scaffolded entry should PASS");
 });
 
 test("Agent hooks + guard both MISS on a bare project", () => {
@@ -1803,10 +1813,10 @@ test("Dangerous-command guard PASS when deny list is in the shared settings.json
   fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
   fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
   // deny list lives in the SHARED, committed settings.json — must be detected,
-  // not only the gitignored settings.local.json. Covers every always-on family.
+  // not only the gitignored settings.local.json. Carries every scaffolded entry.
   fs.writeFileSync(
     path.join(dir, ".claude", "settings.json"),
-    JSON.stringify({ permissions: { deny: FULL_GUARD_DENY_LIST } }),
+    JSON.stringify({ permissions: { deny: COMPLETE_NON_DB_DENY } }),
   );
   const r = analyzeForTest(dir);
   const guard = r.checks.find((c) => c.area === "Dangerous-command guard");
@@ -2574,11 +2584,11 @@ test("evolve --write skips deny scaffolding when a dangerous-command guard is al
   fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
   fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
   // Committed settings.json already has a COMPLETE dangerous-command guard
-  // (every always-on family). evolve --write must NOT create/expand
+  // (every scaffolded entry). evolve --write must NOT create/expand
   // settings.local.json — that would duplicate an already-sufficient guard.
   fs.writeFileSync(
     path.join(dir, ".claude", "settings.json"),
-    JSON.stringify({ permissions: { deny: FULL_GUARD_DENY_LIST } }),
+    JSON.stringify({ permissions: { deny: COMPLETE_NON_DB_DENY } }),
   );
   await runCli(["evolve", "--cwd", dir, "--write"]);
   assert.equal(fs.existsSync(path.join(dir, ".claude", "settings.local.json")), false, "deny list NOT scaffolded when a COMPLETE guard already exists");
@@ -2589,10 +2599,10 @@ test("init --write skips deny scaffolding when a dangerous-command guard is alre
   fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {} }));
   fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
   fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
-  // A COMPLETE guard (every always-on family) — init must skip scaffolding.
+  // A COMPLETE guard (every scaffolded entry) — init must skip scaffolding.
   fs.writeFileSync(
     path.join(dir, ".claude", "settings.json"),
-    JSON.stringify({ permissions: { deny: FULL_GUARD_DENY_LIST } }),
+    JSON.stringify({ permissions: { deny: COMPLETE_NON_DB_DENY } }),
   );
   await runCli(["init", "--cwd", dir, "--write"]);
   assert.equal(fs.existsSync(path.join(dir, ".claude", "settings.local.json")), false, "deny list NOT scaffolded by init when a COMPLETE guard already exists");
@@ -4736,4 +4746,165 @@ test("init --write merges the missing deny families when an existing list covers
   assert.ok(local.permissions.deny.some((d) => /^Bash\(rm -rf/.test(d)), "rm -rf backfilled (was missing)");
   assert.ok(local.permissions.deny.some((d) => /^Bash\(git push --force/.test(d)), "git push --force backfilled (was missing)");
   assert.ok(local.permissions.deny.some((d) => /^Bash\(git reset --hard/.test(d)), "git reset --hard backfilled (was missing)");
+});
+
+test("Dangerous-command guard MISS when one entry per family is present but a dangerous variant is absent (Codex P1 #3660483486)", () => {
+  // One representative per family satisfied the OLD family-level coverage, but
+  // device-write here has ONLY `Bash(mkfs:*)` — `dd of=/dev/sda` and `:> /dev/sd*`
+  // stay unblocked. Family coverage is too coarse: a missing variant can hide
+  // behind a sibling entry. The guard must require the exact scaffolded entries.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-deny-variant-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, ".claude", "settings.local.json"),
+    JSON.stringify({ permissions: { deny: FULL_GUARD_DENY_LIST } }),
+  );
+  const r = analyzeForTest(dir);
+  const guard = r.checks.find((c) => c.area === "Dangerous-command guard");
+  assert.equal(guard.ok, false, "one entry per family is insufficient — the dd of=/dev/ variant must also be present");
+});
+
+test("init --write backfills the missing dd variant even though every family has a representative (Codex P1 #3660483486)", async () => {
+  // init must MERGE (not skip) when the existing list lacks within-family
+  // variants, so `dd of=/dev/` becomes blocked despite device-write being
+  // "covered" by a sibling `mkfs` entry. The merge is a union: existing entries
+  // are preserved and the missing variants are appended.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-deny-variant-init-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {} }));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, ".claude", "settings.json"),
+    JSON.stringify({ permissions: { deny: FULL_GUARD_DENY_LIST } }),
+  );
+  await runCli(["init", "--cwd", dir, "--write"]);
+  const local = JSON.parse(fs.readFileSync(path.join(dir, ".claude", "settings.local.json"), "utf8"));
+  assert.ok(local.permissions.deny.some((d) => /^Bash\(dd of=\/dev\//.test(d)), "dd of=/dev/ variant backfilled (was missing despite family coverage)");
+  assert.ok(local.permissions.deny.some((d) => /^Bash\(mkfs/.test(d)), "user's existing mkfs entry preserved (merge is a union)");
+});
+
+test("Dangerous-command guard MISS for a DB project whose deny list lacks the SQL entries (Codex P1 #3660483492)", () => {
+  // A project that LATER adds Prisma/Drizzle keeps the always-on families
+  // satisfied, but the DB-specific denies (DROP TABLE / TRUNCATE / prisma migrate
+  // reset) are conditional and were never merged. Family-level coverage
+  // intentionally excludes the conditional sql-destructive family, so it reports
+  // PASS — leaving destructive SQL unguarded. The guard must compare against the
+  // exact scaffolded defaults, which themselves grow once isDbProject is true.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-deny-db-miss-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "db", dependencies: { "@prisma/client": "*" } }));
+  fs.mkdirSync(path.join(dir, "prisma"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "prisma", "schema.prisma"), 'datasource db { provider = "postgres" }\n');
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  // Full always-on (non-DB) list, but NO SQL entries.
+  fs.writeFileSync(
+    path.join(dir, ".claude", "settings.local.json"),
+    JSON.stringify({ permissions: { deny: COMPLETE_NON_DB_DENY } }),
+  );
+  const r = analyzeForTest(dir);
+  const guard = r.checks.find((c) => c.area === "Dangerous-command guard");
+  assert.equal(guard.ok, false, "a DB project without DROP/TRUNCATE/prisma-reset denies must MISS");
+});
+
+test("init --write adds the SQL denies when a DB project's existing list omits them (Codex P1 #3660483492)", async () => {
+  // init must detect that the default set for a DB project now includes SQL
+  // entries and merge them in, even though every always-on family was already
+  // satisfied before the project became a DB project.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-deny-db-init-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "db", scripts: {}, dependencies: { "@prisma/client": "*" } }));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# db\n");
+  fs.mkdirSync(path.join(dir, "prisma"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "prisma", "schema.prisma"), 'datasource db { provider = "postgres" }\n');
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, ".claude", "settings.json"),
+    JSON.stringify({ permissions: { deny: COMPLETE_NON_DB_DENY } }),
+  );
+  await runCli(["init", "--cwd", dir, "--write"]);
+  const local = JSON.parse(fs.readFileSync(path.join(dir, ".claude", "settings.local.json"), "utf8"));
+  assert.ok(local.permissions.deny.some((d) => /^Bash\(DROP TABLE/.test(d)), "DROP TABLE deny added for DB project (was missing)");
+  assert.ok(local.permissions.deny.some((d) => /^Bash\(TRUNCATE TABLE/.test(d)), "TRUNCATE TABLE deny added for DB project (was missing)");
+  assert.ok(local.permissions.deny.some((d) => /prisma migrate reset/.test(d)), "prisma migrate reset deny added for DB project (was missing)");
+});
+
+test("Agent hooks PASS for `npm --prefix <non-member-dir> run format` (Codex P2 #3660483494)", () => {
+  // `--prefix` changes WHERE npm reads package.json, NOT which workspace member
+  // it selects. `npm --prefix tools/a run format` runs tools/a's format script
+  // even when tools/a is NOT a declared workspace member — npm reads
+  // tools/a/package.json directly and does NOT error (unlike `--workspace <name>`
+  // which errors "No workspaces found"). Treating --prefix as a strict workspace
+  // selector fail-closed the resolution on the unknown "member" -> a real WRITE
+  // format hook false-MISSed. The analyzer must RESOLVE the target dir's script
+  // body (from its package.json, member or not) and classify THAT.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-prefix-nomember-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({
+    name: "root", scripts: {}, devDependencies: { prettier: "*", eslint: "*" },
+  }));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  // tools/a is NOT a declared workspace member (no `workspaces` field), but it has
+  // a package.json with a real WRITE format script. npm --prefix tools/a runs it.
+  fs.mkdirSync(path.join(dir, "tools", "a"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "tools", "a", "package.json"), JSON.stringify({
+    name: "tools-a", scripts: { format: "prettier --write ." },
+  }));
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({
+    hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [
+      { type: "command", command: "npx eslint --no-warn-ignored {}" },
+      { type: "command", command: "npm --prefix tools/a run format" },
+    ] }] },
+  }));
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  assert.ok(hooks && hooks.ok, "`npm --prefix <non-member> run format` resolves tools/a's WRITE format -> PASS");
+});
+
+test("Agent hooks MISS for `npm --prefix <non-member-dir> run format` when that dir's format is check-only (Codex P2 #3660483494 / #3657192849)", () => {
+  // Mirror of the -C check-only regression, via --prefix: the target dir's
+  // package.json has a CHECK-ONLY format (prettier --check never rewrites), so
+  // resolving its body must NOT credit format-on-save. This is the complement of
+  // the PASS case above and proves the fix RESOLVES the body (not opaque-trust,
+  // which would false-PASS a check-only script by name).
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-prefix-checkonly-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({
+    name: "root", scripts: {}, devDependencies: { prettier: "*", eslint: "*" },
+  }));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.mkdirSync(path.join(dir, "tools", "a"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "tools", "a", "package.json"), JSON.stringify({
+    name: "tools-a", scripts: { format: "prettier --check ." },
+  }));
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({
+    hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [
+      { type: "command", command: "npx eslint" },
+      { type: "command", command: "npm --prefix tools/a run format" },
+    ] }] },
+  }));
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  assert.equal(hooks.ok, false, "`npm --prefix <dir> run format` resolving to check-only must MISS");
+});
+
+test("Agent hooks MISS for `npm --workspace <non-member> run format` stays fail-closed (Codex P2 #3660483494 control)", () => {
+  // CONTROL: `--workspace` IS a strict selector and must STILL fail-closed on an
+  // unknown package (npm errors "No workspaces found"). The --prefix fix must not
+  // loosen --workspace semantics — only the directory hints (--prefix/-C/--dir)
+  // become opaque on an unknown target.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-workspace-nomember-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({
+    name: "root", scripts: {}, devDependencies: { prettier: "*", eslint: "*" },
+  }));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({
+    hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [
+      { type: "command", command: "npx eslint --no-warn-ignored {}" },
+      { type: "command", command: "npm --workspace tools/a run format" },
+    ] }] },
+  }));
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  assert.equal(hooks.ok, false, "`npm --workspace <unknown> run format` must stay fail-closed MISS (npm errors at runtime)");
 });
