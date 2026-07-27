@@ -1025,11 +1025,17 @@ const FORMAT_WRITE_RE = /(?:--write|--fix)\b/;
 // only fires for genuine `[run] <script>` invocations. `([^\s]+)` captures the
 // first token as the script name (flags like `--silent` that follow are ignored).
 const PM_SCRIPT_RE = /\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?!exec\b|dlx\b)([^\s]+)/;
-// Global-flagged copy for inline replacement of EVERY PM invocation in a script
-// body (resolveScriptBody). PM_SCRIPT_RE has no `g` flag, so String.replace would
-// only substitute the first match and drop sibling `npm run b` in `npm run a &&
-// npm run b`.
-const PM_SCRIPT_RE_G = new RegExp(PM_SCRIPT_RE.source, "g");
+// Global-flagged regex matching a FULL PM invocation span — the keyword plus
+// every non-operator token up to the next shell operator (&& || ; |) or end of
+// string — for inline substitution in a script body (resolveScriptBody).
+// PM_SCRIPT_RE captures only the FIRST token after the keyword, so for a
+// selector-before-run body like `npm --workspace a run format` its match is the
+// TRUNCATED `npm --workspace` — passing that to resolveScriptBody loses both the
+// selector and the script name, resolution goes opaque, and the caller's
+// name-heuristic false-PASSes (Codex P2 #3656270108). Matching the whole span
+// lets resolveScriptBody see selector + name together. PM_SCRIPT_RE (above)
+// remains the unanchored test used elsewhere; this is the replace-only copy.
+const PM_SCRIPT_CALL_RE_G = /\b(?:npm|pnpm|yarn|bun)\b[^;&|]*/g;
 // `-w` is prettier's short write flag. Matched as a standalone token (bounded by
 // whitespace or string end) so it does NOT fire inside `--no-write`, whose `-w`
 // sits mid-token after `o` (no preceding boundary).
@@ -1095,7 +1101,7 @@ function resolveScriptBody(invocation, scripts, seen, workspaceScripts) {
   const s = String(invocation || "");
   if (!PM_SCRIPT_RE.test(s)) return null;
   const name = extractScriptName(s);
-  if (!name || seen.has(name)) return null;
+  if (!name) return null;
   // Workspace/package selectors — each picks a specific package so the script
   // body resolves against THAT package's scripts rather than the flat merged map:
   //   npm/pnpm: `--workspace <pkg>` / `-w <pkg>` (space or `=` spelling)
@@ -1115,6 +1121,14 @@ function resolveScriptBody(invocation, scripts, seen, workspaceScripts) {
   const scope = wsName && workspaceScripts && workspaceScripts[wsName]
     ? workspaceScripts[wsName]
     : scripts;
+  // Cycle guard keys on (workspace scope, name), NOT name alone: the same script
+  // NAME under a DIFFERENT workspace (root `format` -> member a `format` via
+  // `npm --workspace a run format`) is a legitimate cross-package resolution, not
+  // a self-cycle. Keying on name only (Codex P2 #3656270108) blocked the nested
+  // member lookup as soon as the root name was seen, leaving the body opaque and
+  // false-PASSing the name heuristic. `__flat__` namespaces the no-selector case.
+  const scopeKey = wsName || "__flat__";
+  if (seen.has(`${scopeKey}:${name}`)) return null;
   const body = scope ? scope[name] : undefined;
   // Absent from the selected manifest -> OPAQUE (null), NOT a hard MISS. The
   // caller's name-heuristic fallback (`LINT_CMD_RE`/`FORMAT_CMD_RE`) then trusts
@@ -1129,7 +1143,7 @@ function resolveScriptBody(invocation, scripts, seen, workspaceScripts) {
   // a hard MISS; rejected because it conflicts with this documented trust policy
   // — see the `npm run format` + scripts:{} PASS cases in cli.test.js.)
   if (typeof body !== "string" || body.trim() === "") return null;
-  seen.add(name);
+  seen.add(`${scopeKey}:${name}`);
   if (!PM_SCRIPT_RE.test(body)) return body;
   // Resolve nested PM invocations INLINE — substitute each `npm/pnpm/yarn/bun
   // [run] <name>` occurrence in the body with ITS resolved body — so SIBLING
@@ -1147,8 +1161,8 @@ function resolveScriptBody(invocation, scripts, seen, workspaceScripts) {
   // be resolved (cycle, or absent from the map), it is left in place; a leftover
   // PM keyword then signals opaque (return null) so the caller falls back rather
   // than re-resolving the same invocation infinitely.
-  const resolved = body.replace(PM_SCRIPT_RE_G, (match) => {
-    const sub = resolveScriptBody(match, scope, new Set(seen), workspaceScripts);
+  const resolved = body.replace(PM_SCRIPT_CALL_RE_G, (match) => {
+    const sub = resolveScriptBody(match.trim(), scope, new Set(seen), workspaceScripts);
     return sub != null ? sub : match;
   });
   return PM_SCRIPT_RE.test(resolved) ? null : resolved;
@@ -1176,6 +1190,12 @@ function resolveScriptBody(invocation, scripts, seen, workspaceScripts) {
  *    combined hook is `xargs -0 -I{} sh -c 'npx prettier --write ... && npx
  *    eslint ...' _ {}`: after quote-stripping, `sh` precedes the inner tool
  *    tokens, so shells MUST be pass-throughs or format/lint both false-MISS.
+ *  - `env` (POSIX) / `cross-env` (npm): set environment variables then run the
+ *    next command, so `cross-env FOO=1 prettier --write .` must still credit
+ *    format (Codex P2 #3656270114). A `VAR=value` ASSIGNMENT that follows one of
+ *    these runners (or stands alone as a leading prefix, e.g.
+ *    `NODE_ENV=test npx prettier`) is an env setting, not a terminal command, so
+ *    it is skipped via ENV_ASSIGN to reach the tool behind it.
  *
  *  Deliberately NOT pass-through: `node`/`cat`/`tee`/`git`/etc are TERMINAL —
  *  their following tokens are DATA (a script file's args, a file to read), so
@@ -1184,11 +1204,18 @@ function resolveScriptBody(invocation, scripts, seen, workspaceScripts) {
  *  here. */
 function segmentExecutes(seg, cmdRe) {
   const tokens = String(seg || "").split(/\s+/).filter(Boolean);
-  const PASS_THROUGH = /^(?:npx|bunx|xargs|exec|dlx|npm|pnpm|yarn|bun|sh|bash|dash|zsh|ksh|ash)$/;
+  // env (POSIX) / cross-env (npm) set env vars, then run the following command.
+  const PASS_THROUGH = /^(?:npx|bunx|xargs|exec|dlx|npm|pnpm|yarn|bun|sh|bash|dash|zsh|ksh|ash|env|cross-env)$/;
+  // A leading `VAR=value` assignment (NODE_ENV=test, FOO=1) prefixes the real
+  // command; skip it so the formatter/linter behind it is reached. Bounded: the
+  // name starts with a letter/underscore, so a `-` option flag (handled above)
+  // never matches.
+  const ENV_ASSIGN = /^[A-Za-z_][A-Za-z0-9_]*=/;
   for (const t of tokens) {
     if (cmdRe.test(t)) return true;        // reached as the executed command
     if (t.startsWith("-")) continue;        // option flag consumed by a runner
-    if (PASS_THROUGH.test(t)) continue;     // pass-through runner / PM exec / shell -c
+    if (PASS_THROUGH.test(t)) continue;     // pass-through runner / PM exec / shell -c / env setter
+    if (ENV_ASSIGN.test(t)) continue;       // VAR=value environment-prefix assignment
     return false;                           // terminal command: tool not executed
   }
   return false;

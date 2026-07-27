@@ -3223,6 +3223,74 @@ test("Agent hooks: yarn `workspace <name>` + pnpm `--filter <name>` selectors re
   }
 });
 
+test("Agent hooks: nested `npm --workspace <m> run format` in a script body resolves the member (Codex P2 #3656270108)", () => {
+  // When a PM invocation with a workspace selector sits INSIDE a script body
+  // (root `format` -> `npm --workspace a run format`), resolveScriptBody substitutes
+  // every PM invocation in that body. PM_SCRIPT_RE captured only the FIRST token
+  // after the keyword, so the invocation was truncated to `npm --workspace` — the
+  // selector AND script name were lost, nested resolution went opaque, and the
+  // caller's name-heuristic false-PASSed `format` even though the root script
+  // chains to a check-only member formatter. The full-span match resolves through
+  // to member a's `prettier --check .`.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-nested-ws-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({
+    name: "root",
+    workspaces: ["packages/*"],
+    scripts: { format: "npm --workspace a run format" },   // root chains to member a
+    devDependencies: { prettier: "*", eslint: "*" },
+  }));
+  fs.mkdirSync(path.join(dir, "packages/a"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "packages/a/package.json"), JSON.stringify({
+    name: "a",
+    scripts: { format: "prettier --check ." },             // member a: check-only
+  }));
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({
+    hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [
+      { type: "command", command: "npm run format" },      // root -> nested ws selector -> a
+      { type: "command", command: "npx eslint --no-warn-ignored {}" },
+    ] }] },
+  }));
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  assert.ok(hooks, "Agent hooks check present");
+  assert.equal(hooks.ok, false, "root `npm run format` chains via a nested workspace selector to a check-only member formatter, not a writer");
+});
+
+test("Agent hooks: `env`/`cross-env` runners and `VAR=value` prefixes still credit the tool behind them (Codex P2 #3656270114)", () => {
+  // segmentExecutes stops at the first TERMINAL (non-runner, non-option) token.
+  // `cross-env`/`env` set env vars then run the next command, and a leading
+  // `VAR=value` assignment prefixes the real command — all three must be skipped
+  // or `cross-env FOO=1 prettier --write .` / `NODE_ENV=test prettier --write .`
+  // false-MISS format (the env token looks terminal), so init/evolve append a
+  // racing duplicate writer.
+  for (const cmd of [
+    "cross-env FOO=1 prettier --write .",            // cross-env runner + VAR=value
+    "NODE_ENV=test prettier --write .",              // bare VAR=value prefix
+    "env NODE_ENV=production npx prettier --write .", // env runner + assignment + npx
+  ]) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-env-prefix-"));
+    fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+    fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({
+      name: "x",
+      scripts: {},
+      devDependencies: { prettier: "*", eslint: "*" },
+    }));
+    fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+    fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({
+      hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [
+        { type: "command", command: cmd },
+        { type: "command", command: "npx eslint --no-warn-ignored {}" },
+      ] }] },
+    }));
+    const r = analyzeForTest(dir);
+    const hooks = r.checks.find((c) => c.area === "Agent hooks");
+    assert.ok(hooks, "Agent hooks check present");
+    assert.equal(hooks.ok, true, `env-prefixed command "${cmd}" reaches prettier --write (a writer)`);
+  }
+});
+
 test("init --write scaffolds a writing formatter when `npm run format` is check-only (Codex P2)", async () => {
   // Practical outcome: because format is now correctly detected as MISSING, init
   // must scaffold a real writing prettier hook instead of skipping it.
