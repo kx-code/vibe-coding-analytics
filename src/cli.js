@@ -970,6 +970,10 @@ const LINT_CMD_RE = /\beslint\b|\blint\b/i;
 // `./node_modules/.bin/eslint` count, and only the basename (after the last slash)
 // is matched against lint|eslint.
 const COMMAND_IS_LINTER_RE = /^(?:.*\/)?(?:lint|eslint)$/i;
+// Symmetric to COMMAND_IS_LINTER_RE for the DIRECT-binary format branch: the
+// formatter (prettier/format/fmt) must be the executed command, so `cat prettier
+// --write` or `node tool.js format --write` does not false-PASS format-on-save.
+const COMMAND_IS_FORMATTER_RE = /^(?:.*\/)?(?:prettier|format|fmt)$/i;
 const FORMAT_CMD_RE = /\bprettier\b|\bformat\b|\bfmt\b/i;
 // A formatter in CHECK mode reports drift but does not rewrite the file, so it
 // does not satisfy the "format-on-save" promise the Agent-hooks check advertises.
@@ -1064,20 +1068,44 @@ function resolveScriptBody(invocation, scripts, seen, workspaceScripts) {
   return PM_SCRIPT_RE.test(body) ? resolveScriptBody(body, scope, seen, workspaceScripts) : body;
 }
 
-/** True when a NON-package-manager command segment EXECUTES a linter. `lint`/
- *  `eslint` must appear as a COMPLETE whitespace-delimited token (or a
- *  path-prefixed executable such as `./node_modules/.bin/eslint`), not a substring
- *  buried inside a filename or argument. LINT_CMD_RE scans the whole line, so
- *  `cat lint.log` / `tee lint-report` matched \blint\b inside a filename and
- *  false-PASSed the lint check (the format path is gated by a write flag; lint is
- *  not). Testing each token against the anchored COMMAND_IS_LINTER_RE keeps
- *  pipelines working too: `... | xargs ... npx eslint` still credits lint because
- *  the bare `eslint` token is the executed command. PM `[run] <script>`
+/** True when a NON-package-manager command segment EXECUTES a tool whose name
+ *  matches `cmdRe` (a lint or format binary). The tool must be reached as the
+ *  EXECUTED command — the first token, or the first command token after one or
+ *  more pass-through runners and their option flags — NOT a bare word that
+ *  appears as a filename or argument AFTER a terminal command. LINT_CMD_RE/
+ *  FORMAT_CMD_RE scan the whole line, so `cat lint.log`, `cat lint`,
+ *  `node tool.js eslint`, and `cat prettier --write` matched the tool name
+ *  inside an argument and false-PASSed the check. Scanning left-to-right and
+ *  stopping at the first terminal (non-runner, non-option) token keeps
+ *  pipelines working too: `... | xargs ... npx eslint` still credits lint
+ *  because xargs/npx are pass-throughs and eslint is reached as the command.
+ *
+ *  Pass-through runners (do NOT execute the tool themselves; the tool is a later
+ *  token they dispatch to):
+ *  - `npx`/`bunx`/`dlx` and a PM `exec`/the PM keyword (`npm`/`pnpm`/`yarn`/`bun`):
+ *    resolve and run an npm package binary.
+ *  - `xargs`: feeds piped input as args to a later command.
+ *  - `sh`/`bash`/`dash`/`zsh`/`ksh`/`ash` with `-c`: EXECUTE a script argument, so
+ *    tool tokens inside the (quote-stripped) script ARE executed. The scaffolded
+ *    combined hook is `xargs -0 -I{} sh -c 'npx prettier --write ... && npx
+ *    eslint ...' _ {}`: after quote-stripping, `sh` precedes the inner tool
+ *    tokens, so shells MUST be pass-throughs or format/lint both false-MISS.
+ *
+ *  Deliberately NOT pass-through: `node`/`cat`/`tee`/`git`/etc are TERMINAL —
+ *  their following tokens are DATA (a script file's args, a file to read), so
+ *  `node tool.js eslint` and `cat lint` correctly MISS. PM `[run] <script>`
  *  invocations are handled by the caller via resolveScriptBody and never reach
  *  here. */
-function segmentExecutesLinter(seg) {
+function segmentExecutes(seg, cmdRe) {
   const tokens = String(seg || "").split(/\s+/).filter(Boolean);
-  return tokens.some((t) => COMMAND_IS_LINTER_RE.test(t));
+  const PASS_THROUGH = /^(?:npx|bunx|xargs|exec|dlx|npm|pnpm|yarn|bun|sh|bash|dash|zsh|ksh|ash)$/;
+  for (const t of tokens) {
+    if (cmdRe.test(t)) return true;        // reached as the executed command
+    if (t.startsWith("-")) continue;        // option flag consumed by a runner
+    if (PASS_THROUGH.test(t)) continue;     // pass-through runner / PM exec / shell -c
+    return false;                           // terminal command: tool not executed
+  }
+  return false;
 }
 
 function commandPurposes(cmd, scripts, workspaceScripts) {
@@ -1121,8 +1149,9 @@ function commandPurposes(cmd, scripts, workspaceScripts) {
       return LINT_CMD_RE.test(seg);
     }
     // Direct binary call: lint/eslint must be the EXECUTED command, not a
-    // filename/argument that merely contains the word (`cat lint.log`).
-    return segmentExecutesLinter(seg);
+    // filename/argument that merely contains the word (`cat lint.log`,
+    // `cat lint`, `node tool.js eslint`).
+    return segmentExecutes(seg, COMMAND_IS_LINTER_RE);
   });
   if (lintSatisfied) purposes.push("lint");
   // Determine the format purpose from the FORMATTER segment(s) only. A combined
@@ -1150,10 +1179,12 @@ function commandPurposes(cmd, scripts, workspaceScripts) {
       // by name (`format:check`) or flag.
       return FORMAT_CMD_RE.test(seg) && !(FORMAT_CHECK_RE.test(seg) && !FORMAT_WRITE_RE.test(seg));
     }
-    // Direct binary call: must be a formatter AND carry a write flag. prettier
-    // writes to stdout by default, so a flag-less `prettier {}` leaves the file
-    // untouched and must not satisfy the format-on-save promise.
-    if (!FORMAT_CMD_RE.test(seg)) return false;
+    // Direct binary call: a formatter must be the EXECUTED command (not a bare
+    // word in an argument like `cat prettier --write` / `node tool.js format
+    // --write`) AND carry a write flag. prettier writes to stdout by default, so a
+    // flag-less `prettier {}` leaves the file untouched and must not satisfy the
+    // format-on-save promise.
+    if (!segmentExecutes(seg, COMMAND_IS_FORMATTER_RE)) return false;
     return FORMAT_WRITE_RE.test(seg) || SHORT_WRITE_FLAG_RE.test(seg);
   });
   if (formatSatisfied) purposes.push("format");

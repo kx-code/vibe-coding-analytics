@@ -3346,16 +3346,60 @@ test("Agent hooks do NOT credit lint when `lint` is a filename/argument, only wh
     }));
     return analyzeForTest(dir).checks.find((c) => c.area === "Agent hooks").ok;
   };
-  // `lint` as a filename/argument is NOT a lint command -> lint MISS.
+  // `lint`/`eslint` as a filename OR a bare argument after a terminal command is
+  // NOT a lint invocation -> lint MISS.
   assert.equal(evalLint("cat lint.log"), false, "`cat lint.log` -> lint is a filename -> MISS");
   assert.equal(evalLint("tee lint-report"), false, "`tee lint-report` -> lint is a filename -> MISS");
+  assert.equal(evalLint("cat lint"), false, "`cat lint` -> lint is an arg to cat (terminal cmd) -> MISS");
+  assert.equal(evalLint("node tool.js eslint"), false, "`node tool.js eslint` -> eslint is an arg, node is terminal -> MISS");
   // Real lint commands still credit (control): eslint is the executed command.
   assert.ok(evalLint("eslint ."), "`eslint .` -> eslint is the command -> PASS");
   assert.ok(evalLint("npx eslint ."), "`npx eslint .` -> eslint after runner -> PASS");
   assert.ok(evalLint("./node_modules/.bin/eslint ."), "`./node_modules/.bin/eslint .` -> basename eslint -> PASS");
+  assert.ok(evalLint("pnpm exec eslint ."), "`pnpm exec eslint .` -> eslint after PM exec pass-through -> PASS");
   // A pipeline whose eslint token sits AFTER xargs must still credit lint: the
-  // bare `eslint` token is the executed command, not a filename substring.
+  // bare `eslint` token is the executed command, reached via pass-throughs.
   assert.ok(evalLint("node -e \"process.exit(0)\" | xargs -0 -I{} npx eslint --no-warn-ignored {}"), "pipeline `... | xargs ... npx eslint` -> eslint token credits lint -> PASS");
+  // A shell wrapper (`sh -c '...'`) EXECUTES its script argument, so eslint inside
+  // the (quote-stripped) script IS the executed command. This is the scaffolded
+  // combined-command shape; `sh` must be a pass-through or lint false-MISSes.
+  assert.ok(evalLint("sh -c 'npx eslint --no-warn-ignored \"$1\" 1>&2' _ {}"), "`sh -c '...npx eslint...' _ {}` -> eslint inside sh -c script credits lint -> PASS");
+});
+
+test("Agent hooks do NOT credit format when the formatter is an argument, only when it is the executed command (Codex P2)", () => {
+  // The DIRECT-binary format branch searched the whole segment for a formatter
+  // name + a write flag without verifying the executable, so `cat prettier
+  // --write` / `node tool.js format --write` false-PASSed format-on-save (and
+  // suppressed prettier scaffolding). The formatter must be the EXECUTED command,
+  // symmetric to the lint path. A real npx eslint provides lint; format varies.
+  const evalFmt = (fmtCmd) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-fmt-cmd-"));
+    fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+    fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({
+      name: "demo",
+      devDependencies: { prettier: "*", eslint: "*" },
+    }));
+    fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+    fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({
+      hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [
+        { type: "command", command: "npx eslint --no-warn-ignored {}" },
+        { type: "command", command: fmtCmd },
+      ] }] },
+    }));
+    return analyzeForTest(dir).checks.find((c) => c.area === "Agent hooks").ok;
+  };
+  // Formatter as an argument (even WITH a write flag) is NOT format-on-save -> MISS.
+  assert.equal(evalFmt("cat prettier --write"), false, "`cat prettier --write` -> prettier is an arg to cat -> format MISS");
+  assert.equal(evalFmt("node tool.js format --write"), false, "`node tool.js format --write` -> format is an arg, node terminal -> MISS");
+  // Real format commands still credit (control): prettier is the executed command.
+  assert.ok(evalFmt("prettier --write ."), "`prettier --write .` -> prettier is the command + --write -> PASS");
+  assert.ok(evalFmt("npx prettier --write --ignore-unknown {}"), "`npx prettier --write ...` -> prettier after runner -> PASS");
+  // A pipeline whose prettier token sits AFTER xargs must still credit format.
+  assert.ok(evalFmt("node -e \"process.exit(0)\" | xargs -0 -I{} npx prettier --write --ignore-unknown {}"), "pipeline `... | xargs ... npx prettier` -> prettier token credits format -> PASS");
+  // A shell wrapper (`sh -c '...'`) EXECUTES its script argument, so prettier
+  // inside the (quote-stripped) script IS executed. This is the scaffolded
+  // combined-command shape; `sh` must be a pass-through or format false-MISSes.
+  assert.ok(evalFmt("sh -c 'npx prettier --write --ignore-unknown \"$1\"' _ {}"), "`sh -c '...npx prettier --write...' _ {}` -> prettier inside sh -c script credits format -> PASS");
 });
 
 test("Agent hooks resolve `npm --workspace <pkg> run format` (selector BEFORE/BETWEEN run) by that member's body (Codex P2)", () => {
