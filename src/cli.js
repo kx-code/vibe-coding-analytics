@@ -1114,47 +1114,63 @@ const SHORT_WRITE_FLAG_RE = /(?:^|\s)-w(?=\s|$)/;
  *  scoping a workspace that runs `prettier --check` is misread as another
  *  workspace's `prettier --write` and falsely credited as format-on-save. The
  *  scope carries through the chain (a workspace's `format` -> its own `_fmt`),
- *  and a selector whose package is absent from the map falls back to the flat map
- *  rather than guessing. */
-/** Extract the script NAME from a package-manager invocation, tolerating option
- *  flags placed before the name — notably the workspace selector `--workspace
- *  <pkg>` / `-w <pkg>` BEFORE `run` (`npm --workspace a run format`) or between
- *  `run` and the name (`npm run --workspace a format`). PM_SCRIPT_RE's `[^\s]+`
- *  capture grabs the FIRST token after the PM keyword, so a leading `--workspace`
- *  would be misread as the script name and the body would never resolve (the
- *  check then false-PASSes via the opaque-trust fallback). Returns the first bare
- *  (non-option) token, or null when none remains. */
-function extractScriptName(invocation) {
+ *  and a selector whose package is absent from the map FAILS CLOSED (definitive
+ *  MISS) rather than falling back to the flat map, which would resolve an
+ *  unrelated package's same-named script and false-PASS (#3659471687). */
+/** Walk a package-manager invocation's tokens POSITIONALLY to extract both the
+ *  script/command NAME and the workspace SELECTOR value. Positional is the key
+ *  invariant: a selector is recorded only when it appears BEFORE the command
+ *  name. `-w` is overloaded — npm/pnpm use `-w <pkg>` as `--workspace` (a
+ *  pre-command selector) while prettier uses `-w` as `--write` (a POST-command
+ *  write flag). A non-positional regex would misread prettier's `-w` as a
+ *  workspace selector, pick a bogus package, and (with the fail-closed selector
+ *  guard in resolveScriptBody) false-MISS a valid `bun prettier -w .` write hook.
+ *  The walk reaches prettier as the command name first and returns ws=null so the
+ *  caller falls through to the unscoped/flat map as intended. (Codex P2 #3659471687)
+ *
+ *  Returns { name, ws }: name is the first bare (non-option) token after the PM
+ *  keyword + `run` + any selectors (or null); ws is the FIRST selector value seen
+ *  before the name (or null). The inline `=val` spelling is a single token handled
+ *  by its own branch. Yarn's positional `workspace <name>` is honored only under
+ *  yarn so a script literally named "workspace" under npm/pnpm/bun is not eaten. */
+function parsePmInvocation(invocation) {
   const s = String(invocation || "");
   const pm = s.match(/\b(?:npm|pnpm|yarn|bun)\b/);
-  if (!pm) return null;
+  if (!pm) return { name: null, ws: null };
   const isYarn = pm[0] === "yarn";
   const tokens = s.slice(pm.index + pm[0].length).split(/\s+/).filter(Boolean);
+  let ws = null;
   let i = 0;
   while (i < tokens.length) {
     const t = tokens[i];
     if (t === "run") { i++; continue; }
-    // Workspace selectors that consume a VALUE token — skip selector + value so
-    // the real script NAME is returned instead of the selector keyword/value:
+    // Value-taking selectors — record the FOLLOWING token as the workspace
+    // selector (only the FIRST one, before the command name) and skip selector +
+    // value so the real script NAME is returned instead of the value:
     //   `--workspace <pkg>` / `-w <pkg>`  (npm, pnpm)
     //   `--filter <pkg>`                  (pnpm)
-    //   `-C <dir>` / `--dir <dir>`        (pnpm; a directory, like npm --prefix)
+    //   `--prefix <dir>` / `-C <dir>` / `--dir <dir>`  (npm/pnpm; a directory)
     //   `workspace <name> <cmd>`          (yarn classic, POSITIONAL — no flag)
-    // Without this, `yarn workspace a run format` returns `workspace` and
-    // `pnpm --filter a run format` returns the package `a` — both wrong, so the
-    // body fails to resolve -> opaque -> the name-heuristic fallback sees `format`
-    // and false-PASSes a check-only formatter. Likewise `pnpm -C packages/a run
-    // format` returned `packages/a` (the -C value) instead of `format`, hiding a
-    // check-only member script behind the same opaque-trust false-PASS (#3657192849).
-    // Yarn's `workspace` keyword is honored only under yarn so a script literally
-    // named "workspace" under npm/pnpm/bun is not misread as a selector.
-    if (t === "--workspace" || t === "-w" || t === "--filter" || t === "--prefix" || t === "-C" || t === "--dir") { i += 2; continue; }
-    if (isYarn && t === "workspace") { i += 2; continue; }
-    if (/^(?:--workspace|-w|--filter|--prefix|-C|--dir)=/.test(t)) { i++; continue; } // inline value (--filter=a, --prefix=a, --dir=a)
-    if (t.startsWith("-")) { i++; continue; }                        // boolean option
-    return t;                                                         // first bare token = script name
+    if (t === "--workspace" || t === "-w" || t === "--filter" || t === "--prefix" || t === "-C" || t === "--dir") {
+      if (ws === null && tokens[i + 1] !== undefined) ws = tokens[i + 1];
+      i += 2; continue;
+    }
+    if (isYarn && t === "workspace") {
+      if (ws === null && tokens[i + 1] !== undefined) ws = tokens[i + 1];
+      i += 2; continue;
+    }
+    if (/^(?:--workspace|-w|--filter|--prefix|-C|--dir)=/.test(t)) {            // inline value (--filter=a)
+      if (ws === null) ws = t.slice(t.indexOf("=") + 1);
+      i++; continue;
+    }
+    if (t.startsWith("-")) { i++; continue; }                                   // boolean option
+    return { name: t, ws };                                                     // first bare token = command
   }
-  return null;
+  return { name: null, ws };
+}
+
+function extractScriptName(invocation) {
+  return parsePmInvocation(invocation).name;
 }
 
 function resolveScriptBody(invocation, scripts, seen, workspaceScripts) {
@@ -1168,28 +1184,32 @@ function resolveScriptBody(invocation, scripts, seen, workspaceScripts) {
   // (a write body false-PASSes as covered). (Codex P2 #3656425156)
   const forwardedMatch = s.match(/(?:^|\s)--\s+(.+)$/);
   const forwarded = forwardedMatch ? forwardedMatch[1].trim() : "";
-  const name = extractScriptName(s);
+  const { name, ws: wsRaw } = parsePmInvocation(s);
   if (!name) return null;
-  // Workspace/package selectors — each picks a specific package so the script
-  // body resolves against THAT package's scripts rather than the flat merged map:
-  //   npm/pnpm: `--workspace <pkg>` / `-w <pkg>` (space or `=` spelling)
-  //   pnpm:     `--filter <pkg>` (accepts a name OR a member path like `./packages/a`)
-  //   pnpm:     `-C <dir>` / `--dir <dir>` (a directory, like npm --prefix)
-  //   yarn:     `workspace <name> <cmd>` (classic POSITIONAL selector — no flag)
-  // Bounded by whitespace so it does not fire mid-token; a bare flag without a
-  // value leaves wsName null -> flat fallback. The value is NORMALIZED (leading
-  // `./` stripped) to match the directory-key form collectAllScripts records for
-  // the PATH spelling. Yarn's positional `workspace <name>` is matched only when
-  // the runner is yarn (pm-keyword check) so a non-yarn `run workspace` script
-  // name is not eaten as a selector value.
-  const pmOf = s.match(/\b(npm|pnpm|yarn|bun)\b/);
-  const wsFlag = s.match(/(?:^|\s)(?:--workspace|-w|--filter|--prefix|-C|--dir)[ =](\S+)/);
-  const wsYarn = pmOf && pmOf[1] === "yarn" ? s.match(/(?:^|\s)workspace\s+(\S+)/) : null;
-  const wsName = wsFlag ? normalizeWorkspaceKey(wsFlag[1])
-    : wsYarn ? normalizeWorkspaceKey(wsYarn[1]) : null;
-  const scope = wsName && workspaceScripts && workspaceScripts[wsName]
-    ? workspaceScripts[wsName]
-    : scripts;
+  // Workspace/package selector. Long-form flags (--workspace/--filter/--prefix/
+  // --dir/-C) are UNAMBIGUOUS PM global flags valid in ANY position, including
+  // AFTER the script name (`npm run format --workspace a` — npm scans all args);
+  // they are matched non-positionally below. The short `-w` is AMBIGUOUS (npm/pnpm
+  // use it as `--workspace`, but prettier uses it as `--write`), so it is honored
+  // ONLY before the command name — parsePmInvocation's positional walk (wsRaw)
+  // records it there, while a TRAILING `-w` (`bun prettier -w .`) is left as a tool
+  // write flag and never reaches this selector path. The value is NORMALIZED
+  // (leading `./` stripped) to match collectAllScripts' directory-key form.
+  // (Codex P2 #3659471687)
+  const wsLong = wsRaw ? null : s.match(/(?:^|\s)(?:--workspace|--filter|--prefix|-C|--dir)[ =](\S+)/);
+  const wsName = wsRaw ? normalizeWorkspaceKey(wsRaw)
+    : wsLong ? normalizeWorkspaceKey(wsLong[1]) : null;
+  // An EXPLICIT selector (--workspace/--filter/--prefix/-C/--dir, or yarn's
+  // positional `workspace`) that does not resolve to a known package means the PM
+  // ERRORS at runtime ("No workspaces found" / "No projects matched") and the
+  // command never runs. Do NOT fall back to the flat map (which would resolve an
+  // UNRELATED package's same-named script and false-PASS): fail closed with a
+  // definitive MISS sentinel (""). The caller classifies the empty body as no
+  // purpose -> MISS, and crucially SKIPS the opaque name-heuristic trust. Only
+  // the UNSCOPED case (wsName null) legitimately uses the flat/root map.
+  // (Codex P2 #3659471687)
+  if (wsName && !(workspaceScripts && workspaceScripts[wsName])) return "";
+  const scope = wsName ? workspaceScripts[wsName] : scripts;
   // Cycle guard keys on (workspace scope, name), NOT name alone: the same script
   // NAME under a DIFFERENT workspace (root `format` -> member a `format` via
   // `npm --workspace a run format`) is a legitimate cross-package resolution, not

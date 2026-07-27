@@ -4150,6 +4150,44 @@ test("Agent hooks resolve `npm --workspace <pkg> run format` (selector BEFORE/BE
   assert.equal(evalFmt("npm run --workspace a format"), false, "`npm run --workspace a format` -> a's check-only -> format MISS");
 });
 
+test("Agent hooks MISS when a workspace selector names an unknown package (Codex P2 #3659471687)", () => {
+  // `npm --workspace missing run format`: "missing" is not a workspace, so npm
+  // errors ("No workspaces found") and the command NEVER runs. resolveScriptBody
+  // must NOT fall back to the flat map (which holds a real member's `format`
+  // body) and credit format for a hook that is broken. Fail closed: an
+  // unresolvable explicit selector is a definitive MISS, not opaque-trust.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-ws-missing-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({
+    name: "root", workspaces: ["packages/*"],
+    devDependencies: { prettier: "*", eslint: "*" },
+  }));
+  fs.mkdirSync(path.join(dir, "packages", "a"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "packages", "a", "package.json"), JSON.stringify({
+    name: "a", scripts: { format: "prettier --write ." },
+  }));
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({
+    hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [
+      { type: "command", command: "npx eslint --no-warn-ignored {}" },
+      { type: "command", command: "npm --workspace missing run format" },
+    ] }] },
+  }));
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  assert.equal(hooks.ok, false, "`npm --workspace missing run format` -> unknown selector -> npm errors -> format MISS (no flat fallback)");
+  // Control: a VALID selector to a real member still credits format.
+  fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({
+    hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [
+      { type: "command", command: "npx eslint --no-warn-ignored {}" },
+      { type: "command", command: "npm --workspace a run format" },
+    ] }] },
+  }));
+  const r2 = analyzeForTest(dir);
+  const hooks2 = r2.checks.find((c) => c.area === "Agent hooks");
+  assert.ok(hooks2 && hooks2.ok, "`npm --workspace a run format` -> a's prettier --write -> format PASS (control)");
+});
+
 test("Dangerous-command guard NOT N/A when a user-authored .claude/commands/ entry exists without CLAUDE.md (Codex P2)", () => {
   // isClaudeCodeProject recognized agents/ and skills/ but NOT custom slash
   // commands, so a project whose only Claude artifact was
