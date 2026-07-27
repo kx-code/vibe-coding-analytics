@@ -961,6 +961,15 @@ function matcherIsEditWriteEntry(matcher) {
 // would be misread as a real linter/formatter and init/evolve would wrongly
 // report the agent-hooks check as PASS, skipping the scaffold.
 const LINT_CMD_RE = /\beslint\b|\blint\b/i;
+// The DIRECT-binary lint branch (commandPurposes) requires `lint`/`eslint` to be
+// the EXECUTED command — the first non-option, non-runner token — not merely a
+// word appearing anywhere in the segment. LINT_CMD_RE above scans the whole line,
+// so `cat lint.log` or `tee lint-report` would match \blint\b inside a filename
+// or argument and false-PASS the lint check (the format path is gated by a write
+// flag; lint has no such secondary gate). The `.*\/` prefix lets an explicit
+// `./node_modules/.bin/eslint` count, and only the basename (after the last slash)
+// is matched against lint|eslint.
+const COMMAND_IS_LINTER_RE = /^(?:.*\/)?(?:lint|eslint)$/i;
 const FORMAT_CMD_RE = /\bprettier\b|\bformat\b|\bfmt\b/i;
 // A formatter in CHECK mode reports drift but does not rewrite the file, so it
 // does not satisfy the "format-on-save" promise the Agent-hooks check advertises.
@@ -1010,11 +1019,35 @@ const SHORT_WRITE_FLAG_RE = /(?:^|\s)-w(?=\s|$)/;
  *  scope carries through the chain (a workspace's `format` -> its own `_fmt`),
  *  and a selector whose package is absent from the map falls back to the flat map
  *  rather than guessing. */
+/** Extract the script NAME from a package-manager invocation, tolerating option
+ *  flags placed before the name — notably the workspace selector `--workspace
+ *  <pkg>` / `-w <pkg>` BEFORE `run` (`npm --workspace a run format`) or between
+ *  `run` and the name (`npm run --workspace a format`). PM_SCRIPT_RE's `[^\s]+`
+ *  capture grabs the FIRST token after the PM keyword, so a leading `--workspace`
+ *  would be misread as the script name and the body would never resolve (the
+ *  check then false-PASSes via the opaque-trust fallback). Returns the first bare
+ *  (non-option) token, or null when none remains. */
+function extractScriptName(invocation) {
+  const s = String(invocation || "");
+  const pm = s.match(/\b(?:npm|pnpm|yarn|bun)\b/);
+  if (!pm) return null;
+  const tokens = s.slice(pm.index + pm[0].length).split(/\s+/).filter(Boolean);
+  let i = 0;
+  while (i < tokens.length) {
+    const t = tokens[i];
+    if (t === "run") { i++; continue; }
+    if (t === "--workspace" || t === "-w") { i += 2; continue; } // value is next token
+    if (/^(?:--workspace|-w)=/.test(t)) { i++; continue; }        // inline value (--workspace=a)
+    if (t.startsWith("-")) { i++; continue; }                     // boolean option
+    return t;                                                      // first bare token = script name
+  }
+  return null;
+}
+
 function resolveScriptBody(invocation, scripts, seen, workspaceScripts) {
   const s = String(invocation || "");
-  const m = PM_SCRIPT_RE.exec(s);
-  if (!m) return null;
-  const name = m[1];
+  if (!PM_SCRIPT_RE.test(s)) return null;
+  const name = extractScriptName(s);
   if (!name || seen.has(name)) return null;
   // `-w`/`--workspace` are npm/pnpm/yarn's package selector (documented in
   // `npm run --help`); `[ =]` covers the space and `=` spellings. Bounded by
@@ -1029,6 +1062,22 @@ function resolveScriptBody(invocation, scripts, seen, workspaceScripts) {
   if (typeof body !== "string" || body.trim() === "") return null;
   seen.add(name);
   return PM_SCRIPT_RE.test(body) ? resolveScriptBody(body, scope, seen, workspaceScripts) : body;
+}
+
+/** True when a NON-package-manager command segment EXECUTES a linter. `lint`/
+ *  `eslint` must appear as a COMPLETE whitespace-delimited token (or a
+ *  path-prefixed executable such as `./node_modules/.bin/eslint`), not a substring
+ *  buried inside a filename or argument. LINT_CMD_RE scans the whole line, so
+ *  `cat lint.log` / `tee lint-report` matched \blint\b inside a filename and
+ *  false-PASSed the lint check (the format path is gated by a write flag; lint is
+ *  not). Testing each token against the anchored COMMAND_IS_LINTER_RE keeps
+ *  pipelines working too: `... | xargs ... npx eslint` still credits lint because
+ *  the bare `eslint` token is the executed command. PM `[run] <script>`
+ *  invocations are handled by the caller via resolveScriptBody and never reach
+ *  here. */
+function segmentExecutesLinter(seg) {
+  const tokens = String(seg || "").split(/\s+/).filter(Boolean);
+  return tokens.some((t) => COMMAND_IS_LINTER_RE.test(t));
 }
 
 function commandPurposes(cmd, scripts, workspaceScripts) {
@@ -1071,7 +1120,9 @@ function commandPurposes(cmd, scripts, workspaceScripts) {
       if (body != null) return commandPurposes(body, scripts, workspaceScripts).includes("lint");
       return LINT_CMD_RE.test(seg);
     }
-    return LINT_CMD_RE.test(seg);
+    // Direct binary call: lint/eslint must be the EXECUTED command, not a
+    // filename/argument that merely contains the word (`cat lint.log`).
+    return segmentExecutesLinter(seg);
   });
   if (lintSatisfied) purposes.push("lint");
   // Determine the format purpose from the FORMATTER segment(s) only. A combined
@@ -1175,6 +1226,26 @@ function isUserAuthoredSkillPath(f) {
   return /(?:^|\/)\.claude\/skills\/(?!project-evolution(?:\/|$))[^/]+/.test(f);
 }
 
+// The flat command files `vca init`/`evolve` scaffold. Counting them would make a
+// freshly-evolved non-Claude baseline look like a Claude project (see the
+// "commands-only dir must NOT count" test), so they are excluded below.
+const GENERATED_COMMAND_TOPS = new Set(["analytics", "init", "evolve", "steer"]);
+
+/** A user-authored Claude Code slash command (`.claude/commands/<name>.md`) — one
+ *  NOT generated by `vca init`/`evolve`. A custom command such as
+ *  `.claude/commands/review.md` is a real signal the project uses Claude Code, so
+ *  a project whose ONLY Claude artifact is a custom command still gets the hooks +
+ *  deny-list checks (otherwise it was reported N/A). Nested commands
+ *  (`.claude/commands/team/x.md`) are always user-authored; a flat command is
+ *  excluded only when its name is one vca generates. */
+function isUserAuthoredCommandPath(f) {
+  const m = f.match(/(?:^|\/)\.claude\/commands\/(.+)$/i);
+  if (!m || !m[1].endsWith(".md")) return false;
+  const top = m[1].slice(0, -3);
+  if (top.includes("/")) return true;           // nested command -> user-authored
+  return !GENERATED_COMMAND_TOPS.has(top);       // flat -> excluded only if generated
+}
+
 /** A project is "Claude Code" when it ships CLAUDE.md, a .claude/settings*.json
  *  file, or user-authored Claude Code extensions (.claude/agents/, .claude/skills/)
  *  ANYWHERE in the tree — including an npm workspace member such as
@@ -1195,6 +1266,7 @@ function isClaudeCodeProject(allFiles) {
     if (f === ".claude/settings.local.json" || f.endsWith("/.claude/settings.local.json")) return true;
     if (f.startsWith(".claude/agents/") || f.includes("/.claude/agents/")) return true;
     if (isUserAuthoredSkillPath(f)) return true;
+    if (isUserAuthoredCommandPath(f)) return true;
   }
   return false;
 }
@@ -1287,9 +1359,54 @@ function resolveWorkspacePattern(root, pattern) {
 /** Read the manifests of npm workspace members under `root` by resolving each
  *  workspace pattern (literal path, `*`, or `**`) to its concrete directories and
  *  reading each one's package.json. Members without a manifest are skipped. */
+/** Read the `packages` workspace globs from a root-level `pnpm-workspace.yaml`.
+ *  pnpm declares workspace members HERE (not in package.json#workspaces), so
+ *  without parsing it a pnpm monorepo's members are invisible to
+ *  readWorkspaceMemberPackages and a DB dependency declared only in a member is
+ *  missed by isDbProject (the SQL deny guards are then omitted). Only the
+ *  top-level `packages:` list of glob strings is needed, so we parse the two
+ *  common YAML shapes (block list and inline `[...]`) without a YAML dependency. */
+function pnpmWorkspacePatterns(root) {
+  let text;
+  try {
+    text = fs.readFileSync(path.join(root, "pnpm-workspace.yaml"), "utf8");
+  } catch {
+    return [];
+  }
+  const clean = (v) => v.replace(/#.*$/, "").trim().replace(/^["']|["']$/g, "");
+  const patterns = [];
+  // Inline form: `packages: ['a', 'b']` / `packages: [a, b]`.
+  const inline = text.match(/^packages\s*:\s*\[([^\]]*)\]/m);
+  if (inline) {
+    for (const part of inline[1].split(",")) {
+      const v = clean(part);
+      if (v) patterns.push(v);
+    }
+    return patterns;
+  }
+  // Block form: `packages:` followed by indented `- glob` items.
+  let inPackages = false;
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.replace(/\s+$/, "");
+    if (!inPackages) {
+      if (/^packages\s*:\s*$/.test(line)) inPackages = true;
+      continue;
+    }
+    const item = line.match(/^\s*-\s+(.+)$/);
+    if (item) {
+      const v = clean(item[1]);
+      if (v) patterns.push(v);
+    } else if (line.trim() !== "" && !line.trim().startsWith("#") && /^\S/.test(line)) {
+      break; // a dedented key marks the end of the packages list
+    }
+  }
+  return patterns;
+}
+
 function readWorkspaceMemberPackages(root, pkg) {
   const members = [];
-  for (const pat of workspacePatterns(pkg)) {
+  const patterns = [...workspacePatterns(pkg), ...pnpmWorkspacePatterns(root)];
+  for (const pat of patterns) {
     const p = String(pat ?? "").trim();
     if (!p) continue;
     for (const dir of resolveWorkspacePattern(root, p)) {

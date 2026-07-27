@@ -3323,6 +3323,138 @@ test("Agent hooks resolve an unscoped hook from the ROOT package, not a shadowin
   assert.equal(hooks.ok, false, "unscoped `npm run format` resolves to ROOT's prettier --check (check-only) -> format MISS");
 });
 
+// ---- Codex: lint command-position, workspace-flag script resolution, custom commands, pnpm workspaces (PR #16) ----
+
+test("Agent hooks do NOT credit lint when `lint` is a filename/argument, only when it is the executed command (Codex P2)", () => {
+  // LINT_CMD_RE scans the whole segment, so `cat lint.log` / `tee lint-report`
+  // matched \blint\b inside a filename/argument and false-PASSed the lint check
+  // (the format path is gated by a write flag; lint was not). lint/eslint must be
+  // the EXECUTED command (first non-option token), not a bare word in an arg.
+  const evalLint = (lintCmd) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-lint-cmd-"));
+    fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+    fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({
+      name: "demo",
+      devDependencies: { prettier: "*", eslint: "*" },
+    }));
+    fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+    fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({
+      hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [
+        { type: "command", command: "prettier --write --ignore-unknown {}" },
+        { type: "command", command: lintCmd },
+      ] }] },
+    }));
+    return analyzeForTest(dir).checks.find((c) => c.area === "Agent hooks").ok;
+  };
+  // `lint` as a filename/argument is NOT a lint command -> lint MISS.
+  assert.equal(evalLint("cat lint.log"), false, "`cat lint.log` -> lint is a filename -> MISS");
+  assert.equal(evalLint("tee lint-report"), false, "`tee lint-report` -> lint is a filename -> MISS");
+  // Real lint commands still credit (control): eslint is the executed command.
+  assert.ok(evalLint("eslint ."), "`eslint .` -> eslint is the command -> PASS");
+  assert.ok(evalLint("npx eslint ."), "`npx eslint .` -> eslint after runner -> PASS");
+  assert.ok(evalLint("./node_modules/.bin/eslint ."), "`./node_modules/.bin/eslint .` -> basename eslint -> PASS");
+  // A pipeline whose eslint token sits AFTER xargs must still credit lint: the
+  // bare `eslint` token is the executed command, not a filename substring.
+  assert.ok(evalLint("node -e \"process.exit(0)\" | xargs -0 -I{} npx eslint --no-warn-ignored {}"), "pipeline `... | xargs ... npx eslint` -> eslint token credits lint -> PASS");
+});
+
+test("Agent hooks resolve `npm --workspace <pkg> run format` (selector BEFORE/BETWEEN run) by that member's body (Codex P2)", () => {
+  // PM_SCRIPT_RE's `[^\s]+` capture grabbed the FIRST token after the PM keyword,
+  // so a leading `--workspace` was misread as the script name and the body never
+  // resolved (the check then false-PASSed via the opaque-trust fallback). The
+  // workspace selector placed BEFORE `run` and BETWEEN run and the name must both
+  // resolve to the selected member's script body.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-ws-flag-before-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({
+    name: "root",
+    workspaces: ["packages/*"],
+    devDependencies: { prettier: "*", eslint: "*" },
+  }));
+  for (const [pkg, body] of [["a", "prettier --check ."], ["b", "prettier --write ."]]) {
+    fs.mkdirSync(path.join(dir, "packages", pkg), { recursive: true });
+    fs.writeFileSync(path.join(dir, "packages", pkg, "package.json"), JSON.stringify({
+      name: pkg, scripts: { format: body },
+    }));
+  }
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  const evalFmt = (cmd) => {
+    fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({
+      hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [
+        { type: "command", command: cmd },
+        { type: "command", command: "npx eslint --no-warn-ignored {}" },
+      ] }] },
+    }));
+    return analyzeForTest(dir).checks.find((c) => c.area === "Agent hooks").ok;
+  };
+  // selector BEFORE run: a is check-only -> MISS; b writes -> PASS.
+  assert.equal(evalFmt("npm --workspace a run format"), false, "`npm --workspace a run format` -> a's prettier --check -> format MISS");
+  assert.ok(evalFmt("npm --workspace b run format"), "`npm --workspace b run format` -> b's prettier --write -> format PASS");
+  // selector BETWEEN run and the name resolves the same way.
+  assert.equal(evalFmt("npm run --workspace a format"), false, "`npm run --workspace a format` -> a's check-only -> format MISS");
+});
+
+test("Dangerous-command guard NOT N/A when a user-authored .claude/commands/ entry exists without CLAUDE.md (Codex P2)", () => {
+  // isClaudeCodeProject recognized agents/ and skills/ but NOT custom slash
+  // commands, so a project whose only Claude artifact was
+  // `.claude/commands/review.md` was reported N/A and skipped the hooks +
+  // deny-list checks. A user-authored command (not one vca init/evolve generates)
+  // is a real Claude Code signal.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-claude-cmd-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {} }));
+  fs.mkdirSync(path.join(dir, ".claude", "commands"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".claude", "commands", "review.md"), "# /review command");
+  const r = analyzeForTest(dir);
+  const guard = r.checks.find((c) => c.area === "Dangerous-command guard");
+  assert.equal(guard.na, false, "user-authored .claude/commands/review.md -> Claude project -> guard NOT N/A");
+});
+
+test("Dangerous-command guard STAYS N/A when only a generated command (analytics/init/evolve/steer) exists (Codex P2 regression guard)", () => {
+  // The custom-command signal must NOT fire for the files vca init/evolve itself
+  // generates, or a freshly-evolved non-Claude baseline is misread as Claude and
+  // fails its own (absent) hook checks on the next scan.
+  for (const generated of ["analytics", "init", "evolve", "steer"]) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-claude-gen-cmd-"));
+    fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {} }));
+    fs.mkdirSync(path.join(dir, ".claude", "commands"), { recursive: true });
+    fs.writeFileSync(path.join(dir, ".claude", "commands", `${generated}.md`), "# generated");
+    const r = analyzeForTest(dir);
+    const guard = r.checks.find((c) => c.area === "Dangerous-command guard");
+    assert.ok(guard && guard.ok, `generated .claude/commands/${generated}.md alone is NOT a Claude project -> guard N/A`);
+  }
+});
+
+test("isDbProject inspects pnpm-workspace.yaml members when package.json has no workspaces (Codex P2)", async () => {
+  // pnpm declares workspace members in pnpm-workspace.yaml, NOT package.json#
+  // workspaces. readWorkspaceMemberPackages previously read only package.json#
+  // workspaces, so a pnpm monorepo whose DB dep lived only in a member was missed
+  // and the SQL deny guards (DROP/TRUNCATE, psql, prisma reset) were omitted.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-dbdep-pnpm-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  // Root has NO workspaces field and NO database dependency itself.
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "root", scripts: {} }));
+  fs.writeFileSync(path.join(dir, "pnpm-workspace.yaml"), "packages:\n  - 'packages/*'\n");
+  fs.mkdirSync(path.join(dir, "packages", "api"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "packages", "api", "package.json"), JSON.stringify({
+    name: "api", dependencies: { "@prisma/client": "*" },
+  }));
+  await runCli(["init", "--cwd", dir, "--write"]);
+  const local = fs.readFileSync(path.join(dir, ".claude", "settings.local.json"), "utf8");
+  assert.ok(/DROP TABLE/.test(local), "DB dep in a pnpm-workspace.yaml member must scaffold SQL deny guards");
+  // Inline array form (`packages: ['packages/*']`) parses the same way.
+  const inlineDir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-dbdep-pnpm-inline-"));
+  fs.writeFileSync(path.join(inlineDir, "CLAUDE.md"), "# x\n");
+  fs.writeFileSync(path.join(inlineDir, "package.json"), JSON.stringify({ name: "root", scripts: {} }));
+  fs.writeFileSync(path.join(inlineDir, "pnpm-workspace.yaml"), "packages: ['packages/*']\n");
+  fs.mkdirSync(path.join(inlineDir, "packages", "api"), { recursive: true });
+  fs.writeFileSync(path.join(inlineDir, "packages", "api", "package.json"), JSON.stringify({
+    name: "api", dependencies: { "@prisma/client": "*" },
+  }));
+  await runCli(["init", "--cwd", inlineDir, "--write"]);
+  const inlineLocal = fs.readFileSync(path.join(inlineDir, ".claude", "settings.local.json"), "utf8");
+  assert.ok(/DROP TABLE/.test(inlineLocal), "inline `packages: [...]` pnpm-workspace.yaml member DB dep must scaffold SQL deny guards");
+});
+
 // ---- Codex round 14: destructive dd output operand, hard-reset flag order, workspace script scope (PR #16) ----
 
 test("Dangerous-command guard recognizes dd writing to a block device, and no longer accepts the read-only if= form (Codex P1)", () => {
