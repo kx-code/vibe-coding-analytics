@@ -1295,6 +1295,13 @@ function segmentExecutes(seg, cmdRe) {
   for (let i = 0; i < tokens.length; i++) {
     const t = tokens[i];
     if (cmdRe.test(t)) return true;        // reached as the executed command
+    // PM value-taking options (--workspace/-w/--filter/--prefix/-C/--dir) consume
+    // the FOLLOWING token as their value (npm config: -C is shorthand for
+    // --prefix). Skip flag AND value, else `npm --prefix packages/a exec
+    // prettier` reads `packages/a` as the terminal command and never reaches the
+    // formatter (false-MISS). The `=val` inline form is a single token already
+    // skipped by the startsWith("-") branch below. (Codex P2 #3659471694)
+    if (/^(?:--workspace|-w|--filter|--prefix|-C|--dir)$/.test(t)) { i++; continue; }
     if (t.startsWith("-")) continue;        // option flag consumed by a runner
     if (PASS_THROUGH.test(t)) continue;     // pass-through runner / PM exec / env setter
     if (SHELL_RE.test(t)) {

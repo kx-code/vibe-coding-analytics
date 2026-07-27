@@ -4100,6 +4100,12 @@ test("Agent hooks do NOT credit format when the formatter is an argument, only w
   // Real format commands still credit (control): prettier is the executed command.
   assert.ok(evalFmt("prettier --write ."), "`prettier --write .` -> prettier is the command + --write -> PASS");
   assert.ok(evalFmt("npx prettier --write --ignore-unknown {}"), "`npx prettier --write ...` -> prettier after runner -> PASS");
+  // `npm --prefix <dir> exec <binary>`: --prefix takes a VALUE token (npm config
+  // shorthand -C). segmentExecutes must consume flag AND value, else `packages/a`
+  // is read as the terminal command and prettier is never reached (false-MISS).
+  // (Codex P2 #3659471694)
+  assert.ok(evalFmt("npm --prefix packages/a exec prettier --write --ignore-unknown {}"), "`npm --prefix packages/a exec prettier --write ...` -> --prefix value consumed -> prettier reached -> PASS");
+  assert.ok(evalFmt("npm -C packages/a exec prettier --write ."), "`npm -C packages/a exec prettier --write .` -> -C value consumed -> PASS");
   // A pipeline whose prettier token sits AFTER xargs must still credit format.
   assert.ok(evalFmt("node -e \"process.exit(0)\" | xargs -0 -I{} npx prettier --write --ignore-unknown {}"), "pipeline `... | xargs ... npx prettier` -> prettier token credits format -> PASS");
   // A shell wrapper (`sh -c '...'`) EXECUTES its script argument, so prettier
