@@ -1100,6 +1100,14 @@ function extractScriptName(invocation) {
 function resolveScriptBody(invocation, scripts, seen, workspaceScripts) {
   const s = String(invocation || "");
   if (!PM_SCRIPT_RE.test(s)) return null;
+  // npm/pnpm/yarn forward trailing args after a bare `--`: `npm run format --
+  // --write` runs the format script body with `--write` appended (documented in
+  // `npm run --help`). Capture them so they reach the caller's purpose
+  // classifier — otherwise a forwarded `--write` is dropped (format false-MISSes
+  // and init/evolve append a redundant hook) or a forwarded `--check` is hidden
+  // (a write body false-PASSes as covered). (Codex P2 #3656425156)
+  const forwardedMatch = s.match(/(?:^|\s)--\s+(.+)$/);
+  const forwarded = forwardedMatch ? forwardedMatch[1].trim() : "";
   const name = extractScriptName(s);
   if (!name) return null;
   // Workspace/package selectors — each picks a specific package so the script
@@ -1144,7 +1152,7 @@ function resolveScriptBody(invocation, scripts, seen, workspaceScripts) {
   // — see the `npm run format` + scripts:{} PASS cases in cli.test.js.)
   if (typeof body !== "string" || body.trim() === "") return null;
   seen.add(`${scopeKey}:${name}`);
-  if (!PM_SCRIPT_RE.test(body)) return body;
+  if (!PM_SCRIPT_RE.test(body)) return forwarded ? `${body} ${forwarded}` : body;
   // Resolve nested PM invocations INLINE — substitute each `npm/pnpm/yarn/bun
   // [run] <name>` occurrence in the body with ITS resolved body — so SIBLING
   // commands are preserved for the caller (commandPurposes) to split on
@@ -1165,7 +1173,12 @@ function resolveScriptBody(invocation, scripts, seen, workspaceScripts) {
     const sub = resolveScriptBody(match.trim(), scope, new Set(seen), workspaceScripts);
     return sub != null ? sub : match;
   });
-  return PM_SCRIPT_RE.test(resolved) ? null : resolved;
+  if (PM_SCRIPT_RE.test(resolved)) return null;
+  // Append forwarded `--` args to the resolved body so they participate in
+  // classification (e.g. `npm run format -- --write` -> `prettier . --write`).
+  // Only when the body resolved to a concrete command; an opaque body returns
+  // above and the caller's name heuristic does not consult forwarded args.
+  return forwarded ? `${resolved} ${forwarded}` : resolved;
 }
 
 /** True when a NON-package-manager command segment EXECUTES a tool whose name
@@ -1722,6 +1735,13 @@ function defaultDenyList(report) {
     // only match when the flag comes first). Git accepts the trailing placement.
     "Bash(git push * --force)",
     "Bash(git push * -f)",
+    // Git also accepts the force flag BETWEEN the repository and a later refspec
+    // — e.g. `git push origin --force main` — which neither the prefix entries
+    // above nor the trailing-flag entries catch (`* --force` requires the flag to
+    // END the command, so a trailing refspec defeats it). A trailing `*` permits
+    // the refspec that follows the flag, closing the bypass. (Codex P1 #3656425150)
+    "Bash(git push * --force *)",
+    "Bash(git push * -f *)",
     "Bash(git reset --hard:*)",
     // Git accepts the revision BEFORE the mode (`git reset HEAD~1 --hard`), which
     // does not start with the `git reset --hard` prefix above and so bypasses it

@@ -1221,6 +1221,8 @@ test("init --write scaffolds hooks + deny list for Claude Code projects", async 
   assert.ok(/Bash\(git push --force:\*\)/.test(local), "deny list includes git push --force (leading flag)");
   assert.ok(/Bash\(git push \* --force\)/.test(local), "deny list covers force flag AFTER the refspec (git push origin main --force)");
   assert.ok(/Bash\(git push \* -f\)/.test(local), "deny list covers -f flag AFTER the refspec (git push origin main -f)");
+  assert.ok(/Bash\(git push \* --force \*\)/.test(local), "deny list covers --force BETWEEN repo and refspec (git push origin --force main, Codex P1 #3656425150)");
+  assert.ok(/Bash\(git push \* -f \*\)/.test(local), "deny list covers -f BETWEEN repo and refspec (git push origin -f main, Codex P1 #3656425150)");
 });
 
 test("init --write does NOT scaffold hooks for non-Claude-Code projects", async () => {
@@ -3289,6 +3291,33 @@ test("Agent hooks: `env`/`cross-env` runners and `VAR=value` prefixes still cred
     assert.ok(hooks, "Agent hooks check present");
     assert.equal(hooks.ok, true, `env-prefixed command "${cmd}" reaches prettier --write (a writer)`);
   }
+});
+
+test("Agent hooks: `npm run <script> -- --write` forwards the flag into the body (Codex P2 #3656425156)", () => {
+  // npm/pnpm/yarn forward args after a bare `--` (`npm run --help`): `npm run
+  // format -- --write` runs the format body with `--write` appended. resolveScriptBody
+  // returned only the body and DROPPED the forwarded `--write`, so a body like
+  // `prettier .` (no write flag of its own) false-MISSed format-on-save and
+  // init/evolve appended a redundant writer. The forwarded flag must reach the
+  // purpose classifier.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-forward-args-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({
+    name: "x",
+    scripts: { format: "prettier ." },   // body has NO write flag; --write is FORWARDED
+    devDependencies: { prettier: "*", eslint: "*" },
+  }));
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({
+    hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [
+      { type: "command", command: "npm run format -- --write" },
+      { type: "command", command: "npx eslint --no-warn-ignored {}" },
+    ] }] },
+  }));
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  assert.ok(hooks, "Agent hooks check present");
+  assert.equal(hooks.ok, true, "forwarded --write turns `prettier .` into a writer, so format-on-save is satisfied");
 });
 
 test("init --write scaffolds a writing formatter when `npm run format` is check-only (Codex P2)", async () => {
