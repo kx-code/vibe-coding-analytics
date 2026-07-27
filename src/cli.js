@@ -1014,6 +1014,14 @@ const COMMAND_IS_FORMATTER_RE = /^(?:.*\/)?(?:prettier|format|fmt)$/i;
 // aware) so `... | xargs npm run lint` still counts.
 const PM_KEYWORD_RE = /^(?:.*\/)?(?:npm|pnpm|yarn|bun)$/i;
 const FORMAT_CMD_RE = /\bprettier\b|\bformat\b|\bfmt\b/i;
+// A REAL formatter binary name (`prettier`) versus a generic script-name word
+// (`format`/`fmt`/`style`). When a PM script resolves OPAQUE (body unseen) and
+// the captured name is a real binary, yarn/bun running it WITHOUT `run`
+// (implicit binary mode) executes node_modules/.bin/prettier directly, so the
+// flags on the line are the real prettier flags — prettier writes to stdout by
+// default and only rewrites with --write/-w. Generic script names keep
+// opaque-trust (the write flag lives in the unseen body). (Codex P2 #3659302760)
+const FORMATTER_BINARY_NAME_RE = /^(?:.*\/)?prettier$/i;
 // A formatter in CHECK mode reports drift but does not rewrite the file, so it
 // does not satisfy the "format-on-save" promise the Agent-hooks check advertises.
 // `:check` covers script names like `npm run format:check`. FORMAT_WRITE_RE
@@ -1436,9 +1444,23 @@ function commandPurposes(cmd, scripts, workspaceScripts) {
       // that chains to prettier --write (or --check) is followed all the way down.
       const body = resolveScriptBody(seg, scripts || {}, new Set(), workspaceScripts);
       if (body != null) return commandPurposes(body, scripts, workspaceScripts).includes("format");
-      // Opaque (body unresolvable): trust only when the invocation name itself
-      // looks like a formatter, and then credit write unless it signals check-only
-      // by name (`format:check`) or flag.
+      // Opaque (body unresolvable). `yarn prettier .` / `bun prettier .` (no
+      // `run`) resolve the dependency binary DIRECTLY (implicit binary mode) when
+      // no script matches, so the flags on the line are the real prettier flags:
+      // prettier writes to stdout by default, so require an explicit write flag,
+      // symmetric to the direct-binary path. npm/pnpm cannot do implicit binary,
+      // and an explicit `run` always targets a package script, so those keep
+      // opaque-trust (the write flag lives in the unseen body). (Codex P2 #3659302760)
+      const opName = extractScriptName(seg);
+      if (
+        opName && FORMATTER_BINARY_NAME_RE.test(opName)
+        && /\b(?:yarn|bun)\b/.test(seg) && !/\brun\b/.test(seg)
+      ) {
+        return FORMAT_WRITE_RE.test(seg) || SHORT_WRITE_FLAG_RE.test(seg);
+      }
+      // Generic script name (format/fmt/style): trust only when the invocation
+      // name itself looks like a formatter, and then credit write unless it
+      // signals check-only by name (`format:check`) or flag.
       return FORMAT_CMD_RE.test(seg) && !(FORMAT_CHECK_RE.test(seg) && !FORMAT_WRITE_RE.test(seg));
     }
     // Direct binary call: a formatter must be the EXECUTED command (not a bare

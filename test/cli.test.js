@@ -3181,6 +3181,13 @@ test("Agent hooks MISS format when a DIRECT prettier call lacks a write flag (Co
     "pnpm exec prettier {}",
     "yarn exec prettier {}",
     "bun dlx prettier {}",
+    // yarn/bun IMPLICIT binary mode (no `run`/`exec`/`dlx`): with no matching
+    // package script, yarn/bun runs node_modules/.bin/prettier directly, so the
+    // flags on the line are the real prettier flags. prettier writes to stdout by
+    // default, so `yarn prettier .` (no --write) leaves files untouched and must
+    // NOT credit format-on-save. (Codex P2 #3659302760)
+    "yarn prettier .",
+    "bun prettier .",
   ]) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-hooks-prettier-nowrite-"));
     fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {}, devDependencies: { prettier: "*", eslint: "*" } }));
@@ -3198,7 +3205,7 @@ test("Agent hooks MISS format when a DIRECT prettier call lacks a write flag (Co
   }
   // Sanity: a direct prettier write flag (long --write AND short -w) satisfies
   // format, and an opaque `npm run format` still satisfies it.
-  for (const writeCmd of ["prettier --write .", "prettier -w .", "npx prettier -w .", "npm run format", "yarn exec prettier --write .", "pnpm exec prettier --write ."]) {
+  for (const writeCmd of ["prettier --write .", "prettier -w .", "npx prettier -w .", "npm run format", "yarn exec prettier --write .", "pnpm exec prettier --write .", "yarn prettier --write .", "bun prettier -w ."]) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-hooks-prettier-write-"));
     fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {}, devDependencies: { prettier: "*", eslint: "*" } }));
     fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
