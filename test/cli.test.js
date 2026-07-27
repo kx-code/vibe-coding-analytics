@@ -3292,6 +3292,72 @@ test("Agent hooks PASS when an arbitrarily named script resolves to a writing fo
   assert.ok(hooks && hooks.ok, "`npm run style` -> prettier --write credits format (body resolved before the name filter)");
 });
 
+test("Agent hooks preserve sibling commands when resolving a script body with a nested script (Codex P2)", () => {
+  // resolveScriptBody recursed on the WHOLE body as a single invocation, so
+  // extractScriptName grabbed only the FIRST script name and the rest of a
+  // conjunction body was discarded. `"format": "npm run prep && prettier --write ."`
+  // followed `prep` (= `echo done`) and dropped `prettier --write .` -> format
+  // false-MISSed -> init/evolve appended a racing duplicate. Resolve every shell
+  // segment: the writing sibling must still credit format.
+  const evalFormatBody = (formatBody) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-scripts-sibling-"));
+    fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+    fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({
+      name: "demo",
+      scripts: { format: formatBody, prep: "echo done", style: "prettier --write ." },
+      devDependencies: { prettier: "*", eslint: "*" },
+    }));
+    fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+    fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({
+      hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [
+        { type: "command", command: "npm run format" },
+        { type: "command", command: "npx eslint --no-warn-ignored {}" },
+      ] }] },
+    }));
+    return analyzeForTest(dir).checks.find((c) => c.area === "Agent hooks").ok;
+  };
+  // The writing prettier SIBLING (after a nested `npm run prep`) is preserved and
+  // credits format -> hooks PASS (lint provided by the real eslint hook).
+  assert.ok(evalFormatBody("npm run prep && prettier --write ."), "`npm run prep && prettier --write .` -> prettier sibling preserved -> format PASS");
+  // Order-independent: the writing formatter FIRST, then a nested script.
+  assert.ok(evalFormatBody("prettier --write . && npm run prep"), "`prettier --write . && npm run prep` -> writing formatter preserved -> format PASS");
+  // Both conjuncts are nested scripts that chain to a writing formatter.
+  assert.ok(evalFormatBody("npm run prep && npm run style"), "two nested scripts where one writes -> format PASS");
+  // A check-only sibling must still MISS (prettier --check never rewrites).
+  assert.equal(evalFormatBody("npm run prep && prettier --check ."), false, "`npm run prep && prettier --check .` -> check-only sibling -> format MISS");
+  // Single-segment regression: a plain chain (no siblings) still resolves.
+  assert.ok(evalFormatBody("prettier --write ."), "`prettier --write .` (no nesting) -> format PASS");
+});
+
+test("Agent hooks do NOT credit lint when `npm run lint` is data inside another command (Codex P2)", () => {
+  // PM_SCRIPT_RE is unanchored, so `npm run lint` appearing as a STRING argument
+  // to another executable (`node -e "console.log('npm run lint')"`) matched it,
+  // resolved the real `lint` script, and credited lint though npm never ran. With
+  // a genuine formatter alongside, the check false-PASSed and init/evolve omitted
+  // the missing lint hook. The PM keyword must be the EXECUTED command to enter the
+  // script-resolution branch (mirror of the direct-binary segmentExecutes guard).
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-scripts-pm-data-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({
+    name: "demo",
+    scripts: { lint: "eslint ." },
+    devDependencies: { prettier: "*", eslint: "*" },
+  }));
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({
+    hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [
+      // `npm run lint` is merely logged by the node script — it is DATA, not an
+      // executed command. A genuine writing formatter is present, so the only way
+      // hooks PASS is by wrongly crediting lint from the string literal.
+      { type: "command", command: "node -e \"console.log('npm run lint')\"" },
+      { type: "command", command: "npx prettier --write --ignore-unknown {}" },
+    ] }] },
+  }));
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  assert.equal(hooks.ok, false, "`node -e \"console.log('npm run lint')\"` does NOT execute npm -> lint MISS -> hooks FAIL");
+});
+
 test("Agent hooks resolve an unscoped hook from the ROOT package, not a shadowing member (Codex P2)", () => {
   // Root and a workspace member both define `format`; root body is check-only
   // (`prettier --check .`), member body writes (`prettier --write .`). An

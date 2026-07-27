@@ -974,6 +974,13 @@ const COMMAND_IS_LINTER_RE = /^(?:.*\/)?(?:lint|eslint)$/i;
 // formatter (prettier/format/fmt) must be the executed command, so `cat prettier
 // --write` or `node tool.js format --write` does not false-PASS format-on-save.
 const COMMAND_IS_FORMATTER_RE = /^(?:.*\/)?(?:prettier|format|fmt)$/i;
+// The package-manager keyword must be the EXECUTED command to enter the
+// script-resolution branch. PM_SCRIPT_RE is unanchored (\b), so `npm run lint`
+// appearing as DATA — e.g. `node -e "console.log('npm run lint')"` — matched it,
+// resolved the real `lint` script, and credited lint though npm never ran. This
+// mirrors COMMAND_IS_LINTER_RE and is checked via segmentExecutes (pass-through
+// aware) so `... | xargs npm run lint` still counts.
+const PM_KEYWORD_RE = /^(?:.*\/)?(?:npm|pnpm|yarn|bun)$/i;
 const FORMAT_CMD_RE = /\bprettier\b|\bformat\b|\bfmt\b/i;
 // A formatter in CHECK mode reports drift but does not rewrite the file, so it
 // does not satisfy the "format-on-save" promise the Agent-hooks check advertises.
@@ -1000,6 +1007,11 @@ const FORMAT_WRITE_RE = /(?:--write|--fix)\b/;
 // only fires for genuine `[run] <script>` invocations. `([^\s]+)` captures the
 // first token as the script name (flags like `--silent` that follow are ignored).
 const PM_SCRIPT_RE = /\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?!exec\b|dlx\b)([^\s]+)/;
+// Global-flagged copy for inline replacement of EVERY PM invocation in a script
+// body (resolveScriptBody). PM_SCRIPT_RE has no `g` flag, so String.replace would
+// only substitute the first match and drop sibling `npm run b` in `npm run a &&
+// npm run b`.
+const PM_SCRIPT_RE_G = new RegExp(PM_SCRIPT_RE.source, "g");
 // `-w` is prettier's short write flag. Matched as a standalone token (bounded by
 // whitespace or string end) so it does NOT fire inside `--no-write`, whose `-w`
 // sits mid-token after `o` (no preceding boundary).
@@ -1065,7 +1077,28 @@ function resolveScriptBody(invocation, scripts, seen, workspaceScripts) {
   const body = scope ? scope[name] : undefined;
   if (typeof body !== "string" || body.trim() === "") return null;
   seen.add(name);
-  return PM_SCRIPT_RE.test(body) ? resolveScriptBody(body, scope, seen, workspaceScripts) : body;
+  if (!PM_SCRIPT_RE.test(body)) return body;
+  // Resolve nested PM invocations INLINE — substitute each `npm/pnpm/yarn/bun
+  // [run] <name>` occurrence in the body with ITS resolved body — so SIBLING
+  // commands are preserved for the caller (commandPurposes) to split on
+  // &&/||/;/| and classify per-segment. Recursing on the WHOLE body (old
+  // behavior) treated it as a single invocation: extractScriptName grabbed only
+  // the FIRST script name, so `"format": "npm run prep && prettier --write ."`
+  // followed `prep` and discarded `prettier --write .` — the valid format hook
+  // false-MISSed and init/evolve appended a racing duplicate.
+  //
+  // Each sibling resolves on its OWN path copy of `seen` (new Set(seen)), so the
+  // same script appearing in two conjunction branches (`npm run a && npm run b`
+  // where both chain to a shared `c`) resolves in BOTH; the copy still includes
+  // `name`, so a true cycle (`a -> b -> a`) is caught. If a PM invocation cannot
+  // be resolved (cycle, or absent from the map), it is left in place; a leftover
+  // PM keyword then signals opaque (return null) so the caller falls back rather
+  // than re-resolving the same invocation infinitely.
+  const resolved = body.replace(PM_SCRIPT_RE_G, (match) => {
+    const sub = resolveScriptBody(match, scope, new Set(seen), workspaceScripts);
+    return sub != null ? sub : match;
+  });
+  return PM_SCRIPT_RE.test(resolved) ? null : resolved;
 }
 
 /** True when a NON-package-manager command segment EXECUTES a tool whose name
@@ -1143,14 +1176,15 @@ function commandPurposes(cmd, scripts, workspaceScripts) {
   // invocation line only when the body is opaque (absent from every
   // package.json we saw), so a real lint script we cannot see is still credited.
   const lintSatisfied = segments.some((seg) => {
-    if (PM_SCRIPT_RE.test(seg)) {
+    if (PM_SCRIPT_RE.test(seg) && segmentExecutes(seg, PM_KEYWORD_RE)) {
       const body = resolveScriptBody(seg, scripts || {}, new Set(), workspaceScripts);
       if (body != null) return commandPurposes(body, scripts, workspaceScripts).includes("lint");
       return LINT_CMD_RE.test(seg);
     }
     // Direct binary call: lint/eslint must be the EXECUTED command, not a
     // filename/argument that merely contains the word (`cat lint.log`,
-    // `cat lint`, `node tool.js eslint`).
+    // `cat lint`, `node tool.js eslint`), and a PM invocation must actually be
+    // executed (not data after another command like `node -e "...'npm run lint'"`).
     return segmentExecutes(seg, COMMAND_IS_LINTER_RE);
   });
   if (lintSatisfied) purposes.push("lint");
@@ -1162,7 +1196,7 @@ function commandPurposes(cmd, scripts, workspaceScripts) {
   // OWN flags: format counts when at least one formatter segment is not
   // check-only.
   const formatSatisfied = segments.some((seg) => {
-    if (PM_SCRIPT_RE.test(seg)) {
+    if (PM_SCRIPT_RE.test(seg) && segmentExecutes(seg, PM_KEYWORD_RE)) {
       // Package-manager script invocation (`npm/pnpm/yarn/bun [run] <script>`).
       // Resolve the BODY and classify THAT before requiring the invocation name
       // to look like a formatter: an arbitrarily named script (`npm run style`
