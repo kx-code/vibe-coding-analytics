@@ -1918,44 +1918,44 @@ function claudeHooksSettings(report) {
   // the path as a SINGLE argv element (NUL-delimited, byte-for-byte), which
   // becomes $1 — so paths with spaces/apostrophes/backslashes are never
   // re-parsed by a shell.
-  const hooks = [];
-  // Which tools still need each emitted purpose. A backfilled hook must fire ONLY
-  // on the tools MISSING that purpose: scoping it to Edit|Write when, say, Edit
-  // already runs prettier (Write does not) would run the formatter TWICE on every
-  // Edit — once from the existing entry, once from this one — and the two matching
-  // hooks run in parallel, racing on the same file. The matcher is built from the
-  // per-tool gaps (exposed by detectHooksConfig) so an already-covered tool is left
-  // untouched; the common fresh-setup case (neither tool has either purpose) still
-  // yields Edit|Write. (Codex P2 #3656905057)
-  let editNeeds = false, writeNeeds = false;
-  if (!postToolUseFormat && !postToolUseLint) {
-    hooks.push({ type: "command", command: `${HOOK_READ_PATH} | xargs -0 -I{} sh -c '${exec} prettier --write --ignore-unknown "$1" && ${exec} eslint --no-warn-ignored "$1" 1>&2' _ {} || exit 2` });
-    editNeeds = !editFormat || !editLint;
-    writeNeeds = !writeFormat || !writeLint;
-  } else if (!postToolUseFormat) {
-    hooks.push({ type: "command", command: `${HOOK_READ_PATH} | xargs -0 -I{} ${exec} prettier --write --ignore-unknown {}` });
-    editNeeds = !editFormat;
-    writeNeeds = !writeFormat;
-  } else if (!postToolUseLint) {
-    hooks.push({ type: "command", command: `${HOOK_READ_PATH} | xargs -0 -I{} ${exec} eslint --no-warn-ignored {} 1>&2 || exit 2` });
-    editNeeds = !editLint;
-    writeNeeds = !writeLint;
-  }
-  const tools = [];
-  if (editNeeds) tools.push("Edit");
-  if (writeNeeds) tools.push("Write");
-  // A taken branch always has at least one tool needing the purpose (its
-  // postToolUse flag is false), so `tools` is never empty. Guard regardless: an
-  // empty matcher is a CATCH-ALL in Claude Code and would fire after Read/Bash/
-  // etc. (whose payload carries no file_path), so fall back to Edit|Write.
-  const matcher = tools.length ? tools.join("|") : "Edit|Write";
-  const config = {
-    hooks: {
-      PostToolUse: [
-        { matcher, hooks },
-      ],
-    },
+  // Each tool is emitted with ONLY the purpose(s) it is still missing, so a tool
+  // already running a writer (prettier) never receives a SECOND writer in parallel
+  // — two --write hooks matching the same tool race on the same file. The earlier
+  // combined branch (#3656905057) scoped ONE matcher to every tool needing
+  // *anything*, but that matcher still carried prettier into a tool that only
+  // lacked eslint, racing two formatters on Edit (#3657032372). Splitting per
+  // (tool, purpose) closes that gap: a tool needing BOTH still gets one combined
+  // command (prettier THEN eslint, see below), while a tool needing one purpose
+  // gets just that purpose, on its own matcher.
+  const commandForGap = (needFormat, needLint) => {
+    if (needFormat && needLint) {
+      return `${HOOK_READ_PATH} | xargs -0 -I{} sh -c '${exec} prettier --write --ignore-unknown "$1" && ${exec} eslint --no-warn-ignored "$1" 1>&2' _ {} || exit 2`;
+    }
+    if (needFormat) {
+      return `${HOOK_READ_PATH} | xargs -0 -I{} ${exec} prettier --write --ignore-unknown {}`;
+    }
+    if (needLint) {
+      return `${HOOK_READ_PATH} | xargs -0 -I{} ${exec} eslint --no-warn-ignored {} 1>&2 || exit 2`;
+    }
+    return null;
   };
+  const editCmd = commandForGap(!editFormat, !editLint);
+  const writeCmd = commandForGap(!writeFormat, !writeLint);
+  const entries = [];
+  if (editCmd && writeCmd && editCmd === writeCmd) {
+    // Both tools share the IDENTICAL gap (common fresh setup, both missing both):
+    // one Edit|Write entry avoids duplicating the same command in two entries.
+    entries.push({ matcher: "Edit|Write", hooks: [{ type: "command", command: editCmd }] });
+  } else {
+    if (editCmd) entries.push({ matcher: "Edit", hooks: [{ type: "command", command: editCmd }] });
+    if (writeCmd) entries.push({ matcher: "Write", hooks: [{ type: "command", command: writeCmd }] });
+  }
+  // At least one tool must have a gap (the early return above guarantees at least
+  // one postToolUse flag is false), so entries is non-empty. Guard regardless: an
+  // empty matcher is a CATCH-ALL in Claude Code (fires after Read/Bash/etc., whose
+  // payload carries no file_path).
+  if (!entries.length) return null;
+  const config = { hooks: { PostToolUse: entries } };
   return `${JSON.stringify(config, null, 2)}\n`;
 }
 

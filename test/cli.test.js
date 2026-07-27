@@ -1856,6 +1856,56 @@ test("evolve --write scopes the backfilled formatter to only the tool missing it
   assert.ok(fmtMatchers.includes("Write"), "scaffolded formatter scoped to Write only");
 });
 
+test("evolve --write splits a partially-covered tool by purpose, not an Edit|Write combined command (Codex P2 #3657032372)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-hooks-split-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "x", scripts: {}, devDependencies: { prettier: "*", eslint: "*" } }));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  // Edit runs prettier (format) but has NO eslint (lint); Write has neither.
+  // The scaffold must NOT emit one combined prettier&&eslint on Edit|Write: that
+  // would hand Edit a SECOND parallel prettier — two writers racing on the same
+  // file. Instead Edit (already formatted) gets eslint-only, and Write (needs
+  // both) gets the combined command on its own matcher.
+  fs.writeFileSync(
+    path.join(dir, ".claude", "settings.json"),
+    JSON.stringify({
+      hooks: { PostToolUse: [
+        { matcher: "Edit", hooks: [
+          { type: "command", command: "npx prettier --write" },
+        ] },
+      ] },
+    }),
+  );
+  await runCli(["evolve", "--cwd", dir, "--write"]);
+  const merged = JSON.parse(fs.readFileSync(path.join(dir, ".claude", "settings.json"), "utf8"));
+  const entries = merged.hooks?.PostToolUse || [];
+  // NO entry scoped to Edit|Write may carry a combined prettier&&eslint command:
+  // that is the two-writer race this regression guards against (Edit would run its
+  // existing prettier AND the combined one in parallel).
+  const combinedEntries = entries.filter((e) =>
+    (e.hooks || []).some((h) => {
+      const cmd = h?.command || "";
+      return /prettier/.test(cmd) && /eslint/.test(cmd);
+    }),
+  );
+  for (const e of combinedEntries) {
+    assert.notEqual(e.matcher, "Edit|Write", "combined prettier&&eslint must not fire on Edit|Write (would double-run prettier on Edit)");
+  }
+  // Edit's gap is lint ONLY, so its scaffolded command must be eslint WITHOUT
+  // prettier (Edit already has a formatter).
+  const editScaffold = entries.find((e) =>
+    (e.matcher || "") === "Edit" && (e.hooks || []).some((h) => /eslint/.test(h?.command || "")),
+  );
+  assert.ok(editScaffold, "Edit gap (lint) scaffolded as eslint-only");
+  const editCmds = (editScaffold.hooks || []).map((h) => h?.command || "").join(" ");
+  assert.ok(!/prettier/.test(editCmds), "Edit scaffold carries eslint only — no redundant prettier");
+  // Write needs BOTH purposes: it gets the combined command on its own matcher.
+  const writeEntry = entries.find((e) => (e.matcher || "") === "Write");
+  assert.ok(writeEntry, "Write scaffolded (needs both purposes)");
+  const writeCmds = (writeEntry.hooks || []).map((h) => h?.command || "").join(" ");
+  assert.ok(/prettier/.test(writeCmds) && /eslint/.test(writeCmds), "Write gets the combined prettier&&eslint command");
+});
+
 test("Agent hooks N/A (not MISS) when formatters live only in a git submodule: deps don't hoist, hooks scaffolded at the root can't resolve them (Codex P2)", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-fmt-roots-"));
   fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
