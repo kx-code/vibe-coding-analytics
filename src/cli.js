@@ -510,7 +510,12 @@ function collectAllScripts(cwd, allFiles) {
   if (rootPkg && rootPkg.scripts) {
     Object.assign(flat, rootPkg.scripts);
     Object.assign(all, rootPkg.scripts); // root last: wins the inventory merge
-    if (typeof rootPkg.name === "string" && rootPkg.name) byName[rootPkg.name] = rootPkg.scripts;
+    // The root package is NOT a selectable npm workspace member: `--workspace
+    // <root-name>` errors "No workspaces found" (root access uses the separate
+    // `--include-workspace-root` option; npm run --help). Registering the root
+    // name here made such a hook resolve to the root script and false-PASS the
+    // Agent-hooks check. Unscoped `npm run <script>` still resolves via `flat`.
+    // (Codex P2 #3660714234)
   }
   for (const { dir, pkg } of readDeclaredWorkspaceMembers(cwd, rootPkg)) {
     if (!pkg.scripts) continue;
@@ -2322,7 +2327,7 @@ function hasEslintConfig(report) {
 function claudeHooksSettings(report) {
   const roots = report.roots;
   if (!hasNodeFormattersAnywhere(roots)) return null;
-  const { postToolUseLint, postToolUseFormat, editLint, writeLint, editFormat, writeFormat } = detectHooksConfig(roots, report.scripts, report.workspaceScripts);
+  const { postToolUseLint, postToolUseFormat, editLint, writeLint, editFormat, writeFormat } = detectHooksConfig(roots, report.scripts, report.workspaceScripts, report.dirScripts);
   if (postToolUseLint && postToolUseFormat) return null;
   const exec = packageManagerExecutor(detectPackageManager(report.cwd, report.packageJson));
   // Emit only the formatter purpose(s) not already satisfied in EITHER settings

@@ -4908,3 +4908,69 @@ test("Agent hooks MISS for `npm --workspace <non-member> run format` stays fail-
   const hooks = r.checks.find((c) => c.area === "Agent hooks");
   assert.equal(hooks.ok, false, "`npm --workspace <unknown> run format` must stay fail-closed MISS (npm errors at runtime)");
 });
+
+test("Agent hooks MISS for `npm --workspace <root-name> run format`: npm rejects selecting the root (Codex P2 #3660714234)", () => {
+  // npm `--workspace` selects ONLY declared workspace members; the root package
+  // is NOT selectable via `--workspace` (npm prints "No workspaces found" — root
+  // access uses the separate `--include-workspace-root` option; see `npm run --help`).
+  // Registering the root's `name` in the workspace map made `npm --workspace
+  // <root-name> run format` resolve to the root script and false-PASS the hooks
+  // check, hiding a broken hook from scan and skipping init/evolve repair.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-workspace-rootname-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({
+    name: "root-x",
+    workspaces: ["packages/*"],
+    scripts: { format: "prettier --write ." },
+    devDependencies: { prettier: "*", eslint: "*" },
+  }));
+  fs.mkdirSync(path.join(dir, "packages", "a"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "packages", "a", "package.json"), JSON.stringify({
+    name: "a", scripts: {},
+  }));
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({
+    hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [
+      { type: "command", command: "npx eslint --no-warn-ignored {}" },
+      { type: "command", command: "npm --workspace root-x run format" },
+    ] }] },
+  }));
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  assert.equal(hooks.ok, false, "`npm --workspace <root-name>` must MISS: npm rejects selecting the root via --workspace");
+});
+
+test("init --write skips the format hook when an existing `npm --prefix <dir> run <formatter>` in settings.local.json already covers it (Codex P2 #3660714238)", async () => {
+  // The scaffold path (claudeHooksSettings) must pass dirScripts to
+  // detectHooksConfig, matching the main analyzer. Without it, a hook in
+  // settings.local.json like `npm --prefix tools/a run style` (tools/a a
+  // non-member whose `style` body is `prettier --write`) resolves to opaque, its
+  // format purpose is missed, and init emits a SECOND prettier hook — so two
+  // formatters run on every edit. Passing dirScripts lets the scaffold resolve
+  // the prefix target's body and recognize format as already covered.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-scaffold-dirscripts-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({
+    name: "root", scripts: {},
+    devDependencies: { prettier: "*", eslint: "*" },
+  }));
+  fs.writeFileSync(path.join(dir, "eslint.config.mjs"), "export default [];\n");
+  fs.mkdirSync(path.join(dir, "tools", "a"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "tools", "a", "package.json"), JSON.stringify({
+    name: "tools-a", scripts: { style: "prettier --write ." },
+  }));
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  // Existing hooks live in settings.local.json; settings.json does NOT exist yet.
+  fs.writeFileSync(path.join(dir, ".claude", "settings.local.json"), JSON.stringify({
+    hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [
+      { type: "command", command: "npx eslint --no-warn-ignored {}" },
+      { type: "command", command: "npm --prefix tools/a run style" },
+    ] }] },
+  }));
+  await runCli(["init", "--cwd", dir, "--write"]);
+  // lint (npx eslint) + format (resolved prefix body = prettier --write) already
+  // covered in settings.local.json -> claudeHooksSettings returns null -> no
+  // settings.json scaffolded, so no duplicate prettier hook runs on every edit.
+  const settingsPath = path.join(dir, ".claude", "settings.json");
+  assert.ok(!fs.existsSync(settingsPath), "no settings.json scaffolded: dirScripts passed to scaffold detectHooksConfig -> existing prefix-format hook recognized");
+});
