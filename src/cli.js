@@ -761,8 +761,13 @@ function readJson(filePath) {
 const DANGEROUS_CMD_RE = new RegExp(
   "^(?:" +
     [
-      "rm\\s+-[frRivIdP]*[rR][frRivIdP]*(?:\\s|$)",
-      "rm\\s+--recursive\\b.*?(?:--force\\b|-f(?:\\s|$))",
+      // rm with a RECURSIVE flag is irreversible (force only suppresses the
+      // prompt), so any recursive form counts. `.*?` lets the recursive flag
+      // appear after preceding flags (`rm -f -r`, `rm --force --recursive`),
+      // not only as the first cluster. Token-bounded so `rm -readme` (the -r
+      // is a prefix of the longer token -readme, not a flag) does not match.
+      "rm\\s+.*?-[frRivIdP]*[rR][frRivIdP]*(?=\\s|$)",
+      "rm\\s+.*?--recursive\\b",
       "git\\s+push\\b.*?\\s(?:--force|-f)(?:\\s|$)",
       "git\\s+reset\\b.*?\\s--hard(?:\\s|$)",
       // git clean needs a FORCE flag to actually delete (without -f git refuses;
@@ -885,21 +890,36 @@ function matcherIsEditWriteEntry(matcher) {
 // report the agent-hooks check as PASS, skipping the scaffold.
 const LINT_CMD_RE = /\beslint\b|\blint\b/i;
 const FORMAT_CMD_RE = /\bprettier\b|\bformat\b|\bfmt\b/i;
+// A formatter in CHECK mode reports drift but does not rewrite the file, so it
+// does not satisfy the "format-on-save" promise the Agent-hooks check advertises.
+// `:check` covers script names like `npm run format:check`. FORMAT_WRITE_RE
+// distinguishes `--write` (rewrite) from `--no-write` (the --write regex needs a
+// double dash, which is NOT present in the single-dash `--no-write`).
+const FORMAT_CHECK_RE = /(?:--check|--list-different|--no-write|:check)\b/;
+const FORMAT_WRITE_RE = /(?:--write|--fix)\b/;
 function commandPurposes(cmd) {
-  // Strip quoted string literals first: an echo/printf argument like
-  // "lint and format complete" is human-readable text, not a tool invocation.
-  // Stripping single + double quotes leaves real command tokens (npx, eslint,
-  // the piped prettier mid-pipeline, etc.) intact for the word-boundary test.
-  const c = String(cmd || "")
-    .replace(/'(?:[^'\\]|\\.)*'/g, "")
-    .replace(/"(?:[^"\\]|\\.)*"/g, "");
+  let c = String(cmd || "");
+  // First drop human-text arguments to echo/printf (status strings such as
+  // 'lint and format complete') — their words must not masquerade as tool
+  // invocations. One or more quoted args are consumed so `echo 'a' 'b'` is
+  // fully removed.
+  c = c
+    .replace(/\b(?:echo|printf)\b(?:\s+'(?:[^'\\]|\\.)*')+\s*/g, " ")
+    .replace(/\b(?:echo|printf)\b(?:\s+"(?:[^"\\]|\\.)*")+\s*/g, " ");
+  // For OTHER quoted strings — typically a script passed to a shell wrapper like
+  // `bash -lc "npm run lint && npm run format"` — the quoted CONTENT is real
+  // commands, so strip only the quote characters (keep the content) for scanning
+  // rather than discarding it.
+  c = c.replace(/['"]/g, " ");
   // Return ALL matched purposes, not just the first: a combined command such as
   // `npm run lint && npm run format` performs both jobs, so both flags must be
   // set. Returning a single value left format undetected, and init/evolve then
   // appended a redundant prettier hook that ran the formatter twice per edit.
   const purposes = [];
   if (LINT_CMD_RE.test(c)) purposes.push("lint");
-  if (FORMAT_CMD_RE.test(c)) purposes.push("format");
+  const hasFormat = FORMAT_CMD_RE.test(c);
+  const checkOnly = hasFormat && FORMAT_CHECK_RE.test(c) && !FORMAT_WRITE_RE.test(c);
+  if (hasFormat && !checkOnly) purposes.push("format");
   return purposes;
 }
 
@@ -1150,10 +1170,24 @@ function isDbProject(report) {
  *  Bash(...) patterns follow Claude Code permission syntax. */
 function defaultDenyList(report) {
   const deny = [
+    // rm with a recursive flag is irreversible whether or not -f is present
+    // (force only suppresses the prompt), so block EVERY recursive form.
+    // Claude Code deny patterns are literal-prefix + `*`-glob with NO regex, so
+    // clustered (`-rf`), whitespace-separated (`-r -f`), and recursive-first vs
+    // force-first orderings each need their own entry: `rm -rf X` does not start
+    // with the literal `rm -r ` (no space before the f), and `rm -f -r X` does
+    // not start with `rm -r `. Enumerating the common forms keeps the guard from
+    // being bypassed by simply separating or reordering the flags.
     "Bash(rm -rf:*)",
     "Bash(rm -fr:*)",
     "Bash(rm -Rf:*)",
-    "Bash(rm --recursive --force:*)",
+    "Bash(rm -r *)",
+    "Bash(rm -R *)",
+    "Bash(rm --recursive *)",
+    "Bash(rm -f -r *)",
+    "Bash(rm -f -R *)",
+    "Bash(rm --force --recursive *)",
+    "Bash(rm --force -r *)",
     "Bash(rm -r /)",
     "Bash(git push --force:*)",
     "Bash(git push -f:*)",

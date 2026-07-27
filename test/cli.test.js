@@ -2271,13 +2271,28 @@ test("evolve --write keeps a BROADER-than-edit PostToolUse matcher scoped away f
   }
 });
 
-test("Dangerous-command guard recognizes rm long-form and reordered flag spellings (Codex P1)", async () => {
-  // The short-flag cluster regex `rm\s+-[frRivIdP]*[rR][frRivIdP]*` only sees
-  // SINGLE-DASH short flags drawn from rm's flag alphabet. `rm --recursive
-  // --force` (long form) slipped past it. Each variant must satisfy the guard
-  // AND be scaffolded, because Claude Code prefix-matches the literal spelling:
-  // `Bash(rm -rf:*)` does not block `rm -fr` / `rm -Rf` / `rm --recursive --force`.
-  for (const variant of ["Bash(rm -fr:*)", "Bash(rm -Rf:*)", "Bash(rm --recursive --force:*)"]) {
+test("Dangerous-command guard recognizes rm long-form and reordered flag spellings (Codex P1, Round 18)", async () => {
+  // The short-flag cluster regex `rm\s+.*?-[frRivIdP]*[rR][frRivIdP]*` only sees
+  // SINGLE-DASH short flags drawn from rm's flag alphabet, and the `.*?` lets the
+  // recursive flag sit AFTER preceding flags. Each variant below must satisfy the
+  // guard AND be scaffolded, because Claude Code prefix-matches the literal
+  // spelling: `Bash(rm -rf:*)` does not block `rm -fr` / `rm -r -f` / `rm
+  // --force --recursive`. Covered spellings:
+  //   - clustered short flags in any order: -rf / -fr / -Rf / -fR
+  //   - separated short flags: `rm -r -f` / `rm -f -r` (recursive flag not first)
+  //   - long-form recursive: `rm --recursive` / `rm --force --recursive`
+  for (const variant of [
+    "Bash(rm -rf:*)",
+    "Bash(rm -fr:*)",
+    "Bash(rm -Rf:*)",
+    "Bash(rm -fR:*)",
+    "Bash(rm -r -f:*)",
+    "Bash(rm -f -r:*)",
+    "Bash(rm -f -R:*)",
+    "Bash(rm --recursive:*)",
+    "Bash(rm --recursive --force:*)",
+    "Bash(rm --force --recursive:*)",
+  ]) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-deny-rm-var-"));
     fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
     fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
@@ -2293,7 +2308,9 @@ test("Dangerous-command guard recognizes rm long-form and reordered flag spellin
   const local = fs.readFileSync(path.join(dir, ".claude", "settings.local.json"), "utf8");
   assert.ok(/Bash\(rm -fr:\*\)/.test(local), "rm -fr variant scaffolded");
   assert.ok(/Bash\(rm -Rf:\*\)/.test(local), "rm -Rf variant scaffolded");
-  assert.ok(/Bash\(rm --recursive --force:\*\)/.test(local), "rm long-form variant scaffolded");
+  assert.ok(/Bash\(rm --recursive \*\)/.test(local), "rm --recursive variant scaffolded");
+  assert.ok(/Bash\(rm --force --recursive \*\)/.test(local), "rm --force --recursive variant scaffolded");
+  assert.ok(/Bash\(rm -f -r \*\)/.test(local), "rm -f -r separated variant scaffolded");
 });
 
 test("Dangerous-command guard recognizes SQL client / migration reset commands and scaffolds them for DB projects only (Codex P1)", async () => {
@@ -2462,4 +2479,75 @@ test("evolve --write does not append a redundant formatter hook when an existing
   const entry = (merged.hooks?.PostToolUse || []).find((e) => String(e.matcher ?? "").trim() === "Edit|Write");
   const cmds = (entry?.hooks || []).map((h) => h.command);
   assert.deepEqual(cmds, ["npm run lint && npm run format"], "no redundant eslint/prettier appended when both purposes already covered");
+});
+
+test("Agent hooks PASS when lint and format run inside a shell-wrapper quoted script (Codex P2)", () => {
+  // commandPurposes must distinguish human-text echo/printf args (stripped) from
+  // a real script passed to a shell wrapper like `bash -lc "..."`. Round 16 stripped
+  // ALL quoted strings, which DISCARDED the lint/format commands hidden inside the
+  // wrapper script — `bash -lc "npm run lint && npm run format"` then looked empty
+  // and false-FAILED the Agent-hooks check (init would append a redundant hook).
+  // The fix strips only echo/printf quoted ARGS; for other quoted strings it keeps
+  // the content (removing just the quote chars) so the wrapped commands are scanned.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-hooks-wrapper-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {}, devDependencies: { prettier: "*", eslint: "*" } }));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, ".claude", "settings.json"),
+    JSON.stringify({
+      hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [{ type: "command", command: 'bash -lc "npm run lint && npm run format"' }] }] },
+    }),
+  );
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  assert.ok(hooks && hooks.ok, "a shell-wrapper script running lint+format must satisfy BOTH purposes");
+});
+
+test("Agent hooks MISS format when the formatter runs in check-only mode (Codex P2)", () => {
+  // A check-mode formatter (`prettier --check`, `npm run format:check`) reports
+  // drift but does NOT rewrite the file, so it does not honor the format-on-save
+  // promise the Agent-hooks check advertises. commandPurposes must skip "format"
+  // when check-mode is detected AND no --write/--fix is present. A lint-only hook
+  // leaves format uncovered → the check must fail so init/evolve scaffold a real
+  // `prettier --write` hook rather than trusting a CI-style check command.
+  for (const checkCmd of [
+    "prettier --check .",
+    'node -e "process.exit(0)" | xargs -0 -I{} prettier --check {}',
+    "npm run format:check",
+    "prettier --list-different .",
+    "prettier --no-write .",
+  ]) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-hooks-format-check-"));
+    fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {}, devDependencies: { prettier: "*", eslint: "*" } }));
+    fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
+    fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, ".claude", "settings.json"),
+      JSON.stringify({
+        hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [{ type: "command", command: "npx eslint --fix ." }, { type: "command", command: checkCmd }] }] },
+      }),
+    );
+    const r = analyzeForTest(dir);
+    const hooks = r.checks.find((c) => c.area === "Agent hooks");
+    assert.ok(hooks && !hooks.ok, `check-only formatter "${checkCmd}" must NOT satisfy the format purpose`);
+  }
+  // Sanity: an explicit --write alongside --check DOES rewrite (check flag ignored).
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-hooks-format-write-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {}, devDependencies: { prettier: "*", eslint: "*" } }));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, ".claude", "settings.json"),
+    JSON.stringify({
+      hooks: {
+        PostToolUse: [
+          { matcher: "Edit|Write", hooks: [{ type: "command", command: "prettier --check --write ." }, { type: "command", command: "eslint --fix ." }] },
+        ],
+      },
+    }),
+  );
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  assert.ok(hooks && hooks.ok, "--write present must count as format even when --check also appears");
 });
