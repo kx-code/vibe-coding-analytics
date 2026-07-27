@@ -1968,33 +1968,49 @@ function defaultDenyList(report) {
   ];
   if (isDbProject(report)) {
     deny.push(
+      // Destructive SQL KEYWORDS and an unambiguous reset command are HARD-denied:
+      // they exist only to discard data. The bare-keyword entries are also what the
+      // dangerous-command detector keys on (denyEntryBlocksDangerousCommand), so the
+      // guard stays satisfied. (Broad SQL-CLIENT invocations that run arbitrary SQL
+      // — psql -c/-f, mysql -e — are routed through `ask` instead; see
+      // defaultAskList. Codex P2 #3659221996 / #3656905061.)
       "Bash(DROP TABLE:*)",
       "Bash(DROP DATABASE:*)",
       "Bash(TRUNCATE TABLE:*)",
-      // SQL reaches the DB through a client / migration tool, not as a bare
-      // command. psql -c / -f and mysql -e run arbitrary SQL; prisma migrate
-      // reset drops & recreates the dev database irreversibly.
-      "Bash(psql -c:*)",
-      "Bash(psql -f:*)",
-      "Bash(mysql -e:*)",
-      // An execute flag placed AFTER connection options — `psql -d prod -c
-      // 'DROP TABLE users'`, `mysql -h host -e 'TRUNCATE TABLE users'` — is
-      // NOT caught by the prefix-only entries above: Claude Code matches
-      // `Bash(psql -c:*)` as a literal prefix, so a -c/-f/-e that follows
-      // -d/-h/-U/-p/etc. slips past the guard, yet detection still reports
-      // the guard installed (the detector regex allows the flag anywhere, so
-      // the existing entry already satisfies it). A lone `*` spans the
-      // preceding arguments — the same mechanism `git push * --force` uses to
-      // catch a flag placed after the refspec — so these catch the execute
-      // flag in either position (flag-first OR flag-after-options).
-      "Bash(psql * -c:*)",
-      "Bash(psql * -f:*)",
-      "Bash(mysql * -e:*)",
+      // prisma migrate reset drops & recreates the dev database irreversibly — a
+      // single, unambiguous destructive command, so it is hard-denied.
       "Bash(prisma migrate reset:*)",
       "Bash(npx prisma migrate reset:*)",
     );
   }
   return deny;
+}
+
+/** Broad SQL-CLIENT invocations (psql -c/-f, mysql -e) run ARBITRARY SQL — a safe
+ *  `psql -c 'SELECT 1'` and a destructive `psql -c 'DROP TABLE users'` are
+ *  indistinguishable to a prefix matcher — so hard-denying them (as vca
+ *  previously did) blocked routine inspection and non-destructive scripts after
+ *  init/evolve, contradicting the guard's "irreversible commands" framing. Route
+ *  them through `ask` instead: Claude Code prompts before running them, so safe
+ *  queries proceed (user approves) while destructive SQL surfaces for an explicit
+ *  decision. Emitted ONLY for detected database projects, alongside the
+ *  destructive-keyword denies. (Codex P2 #3659221996 / #3656905061) */
+function defaultAskList(report) {
+  if (!isDbProject(report)) return [];
+  return [
+    "Bash(psql -c:*)",
+    "Bash(psql -f:*)",
+    "Bash(mysql -e:*)",
+    // An execute flag placed AFTER connection options — `psql -d prod -c '...'`,
+    // `mysql -h host -e '...'` — is not caught by the prefix-only entries above
+    // (Claude Code matches `Bash(psql -c:*)` as a literal prefix), so the
+    // after-options form is emitted too. A lone `*` spans the preceding arguments
+    // (same mechanism as `git push * --force`), prompting on the execute flag in
+    // either position.
+    "Bash(psql * -c:*)",
+    "Bash(psql * -f:*)",
+    "Bash(mysql * -e:*)",
+  ];
 }
 
 /** Read the edited file path from the hook's stdin JSON payload using the Node
@@ -2121,9 +2137,11 @@ function claudeHooksSettings(report) {
   return `${JSON.stringify(config, null, 2)}\n`;
 }
 
-/** Claude Code settings.local.json with a deny list of irreversible commands. */
+/** Claude Code settings.local.json with a deny list of irreversible commands and
+ *  an `ask` list of broad invocations that MIGHT be destructive (prompt rather
+ *  than hard-block). */
 function claudePermissionsLocal(report) {
-  const config = { permissions: { allow: [], ask: [], deny: defaultDenyList(report) } };
+  const config = { permissions: { allow: [], ask: defaultAskList(report), deny: defaultDenyList(report) } };
   return `${JSON.stringify(config, null, 2)}\n`;
 }
 
@@ -2466,8 +2484,9 @@ function mergeHooksSettings(existingContent, incomingContent, scripts, workspace
   return `${JSON.stringify(existing, null, 2)}\n`;
 }
 
-/** Merge the deny list into an existing settings.local.json without clobbering
- *  existing allow/ask entries. Unions deny arrays, dedupes entries. */
+/** Merge the deny/ask lists into an existing settings.local.json without
+ *  clobbering existing allow entries. Unions the deny AND ask arrays (preserving
+ *  any user-authored rules in both), dedupes entries. */
 function mergePermissionsLocal(existingContent, incomingContent) {
   const existing = JSON.parse(existingContent);
   const incoming = JSON.parse(incomingContent);
@@ -2476,6 +2495,13 @@ function mergePermissionsLocal(existingContent, incomingContent) {
   const set = new Set(existing.permissions.deny);
   for (const d of incoming.permissions?.deny || []) set.add(d);
   existing.permissions.deny = [...set];
+  // Union `ask` entries (broad SQL-client prompts) the same way, so evolve keeps
+  // them alongside the deny list without dropping user-authored ask rules.
+  // (Codex P2 #3659221996)
+  existing.permissions.ask ??= [];
+  const askSet = new Set(existing.permissions.ask);
+  for (const a of incoming.permissions?.ask || []) askSet.add(a);
+  existing.permissions.ask = [...askSet];
   return `${JSON.stringify(existing, null, 2)}\n`;
 }
 

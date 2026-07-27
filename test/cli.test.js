@@ -2801,7 +2801,8 @@ test("Dangerous-command guard recognizes SQL client / migration reset commands a
   // Execute flag AFTER connection options must also be scaffolded: a prefix-only
   // `psql -c:*` misses `psql -d prod -c 'DROP TABLE users'` (Claude Code matches
   // it as a literal prefix), so the after-options form is required to actually
-  // block the destructive command at runtime.
+  // PROMPT on the destructive command at runtime (these SQL-client entries are
+  // routed through `ask`, not hard-denied — see the routing test below).
   assert.ok(/Bash\(psql \* -c:\*\)/.test(dbLocal), "psql * -c (flag after options) scaffolded for DB project");
   assert.ok(/Bash\(psql \* -f:\*\)/.test(dbLocal), "psql * -f (flag after options) scaffolded for DB project");
   assert.ok(/Bash\(mysql \* -e:\*\)/.test(dbLocal), "mysql * -e (flag after options) scaffolded for DB project");
@@ -2813,6 +2814,61 @@ test("Dangerous-command guard recognizes SQL client / migration reset commands a
   const webLocal = fs.readFileSync(path.join(webDir, ".claude", "settings.local.json"), "utf8");
   assert.ok(!/Bash\(psql -c:\*\)/.test(webLocal), "psql -c NOT scaffolded for non-DB project");
   assert.ok(!/prisma migrate reset/.test(webLocal), "prisma migrate reset NOT scaffolded for non-DB project");
+});
+
+test("init routes broad SQL-client invocations through `ask`, hard-denying only destructive keywords (Codex P2 #3659221996)", async () => {
+  // psql -c / -f and mysql -e run ARBITRARY SQL: a safe `psql -c 'SELECT 1'` and
+  // a destructive `psql -c 'DROP TABLE users'` are indistinguishable to a prefix
+  // matcher, so hard-denying them (the old behavior) blocked routine inspection
+  // and non-destructive scripts after init/evolve. They must land in `ask`
+  // (prompt) while unambiguous destructive entries (DROP/TRUNCATE keywords,
+  // prisma migrate reset) stay in `deny`. Verified structurally (parsed JSON
+  // arrays), not just by string presence.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-sql-ask-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", dependencies: { prisma: "*" } }));
+  await runCli(["init", "--cwd", dir, "--write"]);
+  const local = JSON.parse(fs.readFileSync(path.join(dir, ".claude", "settings.local.json"), "utf8"));
+  const ask = local.permissions?.ask || [];
+  const deny = local.permissions?.deny || [];
+  // Broad client invocations -> `ask` (prompt), NOT hard-denied.
+  for (const broad of ["Bash(psql -c:*)", "Bash(psql -f:*)", "Bash(mysql -e:*)", "Bash(psql * -c:*)", "Bash(psql * -f:*)", "Bash(mysql * -e:*)"]) {
+    assert.ok(ask.includes(broad), `${broad} routed through ask (prompt), not hard-denied`);
+    assert.ok(!deny.includes(broad), `${broad} must NOT be hard-denied (would block safe SELECT/migration runs)`);
+  }
+  // Destructive keywords + unambiguous reset stay hard-denied.
+  assert.ok(deny.includes("Bash(DROP TABLE:*)"), "DROP TABLE stays hard-denied");
+  assert.ok(deny.includes("Bash(TRUNCATE TABLE:*)"), "TRUNCATE TABLE stays hard-denied");
+  assert.ok(deny.includes("Bash(prisma migrate reset:*)"), "prisma migrate reset stays hard-denied");
+  // Non-DB project: no SQL-client ask entries at all.
+  const webDir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-sql-ask-web-"));
+  fs.writeFileSync(path.join(webDir, "CLAUDE.md"), "# x\n");
+  fs.writeFileSync(path.join(webDir, "package.json"), JSON.stringify({ name: "web", dependencies: { react: "*" } }));
+  await runCli(["init", "--cwd", webDir, "--write"]);
+  const webLocal = JSON.parse(fs.readFileSync(path.join(webDir, ".claude", "settings.local.json"), "utf8"));
+  assert.deepEqual(webLocal.permissions?.ask || [], [], "non-DB project has no SQL-client ask entries");
+});
+
+test("evolve unions `ask` entries into an existing settings.local.json without dropping user rules (Codex P2 #3659221996)", async () => {
+  // evolve backfills settings.local.json only when NO dangerous-command guard is
+  // detected yet (permissionsDeny === false); in that case it must MERGE the ask
+  // list (like deny) so the SQL-client prompts are added while a user-authored
+  // ask rule is preserved. (An existing deny guard makes evolve skip the file, so
+  // the scenario is an unguarded project with a custom ask rule.)
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-sql-ask-evolve-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", dependencies: { prisma: "*" } }));
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, ".claude", "settings.local.json"),
+    JSON.stringify({ permissions: { allow: [], ask: ["Bash(my-tool:*)"] } }),
+  );
+  await runCli(["evolve", "--cwd", dir, "--write"]);
+  const local = JSON.parse(fs.readFileSync(path.join(dir, ".claude", "settings.local.json"), "utf8"));
+  const ask = local.permissions?.ask || [];
+  assert.ok(ask.includes("Bash(my-tool:*)"), "user-authored ask rule preserved");
+  assert.ok(ask.includes("Bash(psql -c:*)"), "psql -c ask entry merged in by evolve");
+  assert.ok(local.permissions?.deny?.includes("Bash(DROP TABLE:*)"), "destructive-keyword deny merged in by evolve");
 });
 
 test("Agent hooks MISS when a PostToolUse hook only echoes a lint/format status string (Codex P2)", () => {
