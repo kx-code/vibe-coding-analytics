@@ -925,9 +925,20 @@ function commandPurposes(cmd) {
   // appended a redundant prettier hook that ran the formatter twice per edit.
   const purposes = [];
   if (LINT_CMD_RE.test(c)) purposes.push("lint");
-  const hasFormat = FORMAT_CMD_RE.test(c);
-  const checkOnly = hasFormat && FORMAT_CHECK_RE.test(c) && !FORMAT_WRITE_RE.test(c);
-  if (hasFormat && !checkOnly) purposes.push("format");
+  // Determine the format purpose from the FORMATTER segment(s) only. A combined
+  // command such as `eslint --fix . && prettier --check .` attaches --fix to the
+  // LINTER; testing FORMAT_WRITE_RE against the whole string saw eslint's --fix
+  // and treated prettier --check as write-enabled, false-PASSing the Agent-hooks
+  // check (Prettier never rewrote the file). Split on shell conjunctions and
+  // inspect each formatter segment's OWN flags: format counts when at least one
+  // formatter segment is not check-only.
+  const segments = c.split(/\s*(?:&&|\|\||\||;)\s*/);
+  const formatSatisfied = segments.some((seg) => {
+    if (!FORMAT_CMD_RE.test(seg)) return false;
+    const checkOnly = FORMAT_CHECK_RE.test(seg) && !FORMAT_WRITE_RE.test(seg);
+    return !checkOnly;
+  });
+  if (formatSatisfied) purposes.push("format");
   return purposes;
 }
 
