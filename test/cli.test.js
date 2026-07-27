@@ -1513,6 +1513,54 @@ test("init on a non-Claude project does not flip Claude detection on the next sc
   assert.ok(guard && guard.ok, "Dangerous-command guard N/A — commands-only .claude/ is not a Claude project");
 });
 
+test("Dangerous-command guard NOT N/A when .claude/agents/ exists without CLAUDE.md or settings (Codex P2)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-claude-agents-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {} }));
+  // No CLAUDE.md / settings.json — only a user-authored agent definition. The
+  // guard's N/A flag mirrors isClaudeCodeProject directly (no formatter confound),
+  // so it is the cleanest signal for the detection fix.
+  fs.mkdirSync(path.join(dir, ".claude", "agents"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".claude", "agents", "reviewer.md"), "# reviewer agent");
+  const r = analyzeForTest(dir);
+  const guard = r.checks.find((c) => c.area === "Dangerous-command guard");
+  assert.equal(guard.na, false, ".claude/agents/ alone is a Claude Code project -> guard NOT N/A");
+});
+
+test("Dangerous-command guard NOT N/A when a user-authored .claude/skills/ entry exists without CLAUDE.md (Codex P2)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-claude-skill-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {} }));
+  fs.mkdirSync(path.join(dir, ".claude", "skills", "deploy"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".claude", "skills", "deploy", "SKILL.md"), "# deploy skill");
+  const r = analyzeForTest(dir);
+  const guard = r.checks.find((c) => c.area === "Dangerous-command guard");
+  assert.equal(guard.na, false, "user-authored .claude/skills/ -> guard NOT N/A");
+});
+
+test("Dangerous-command guard stays N/A when only the generated project-evolution skill exists (Codex P2 regression guard)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-claude-evoskill-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {} }));
+  // evolve --write scaffolds this one skill for ANY stack (not gated on Claude
+  // detection). Counting it would misread a freshly-evolved non-Claude baseline
+  // as a Claude project and fail its own absent hook checks on the next scan.
+  fs.mkdirSync(path.join(dir, ".claude", "skills", "project-evolution"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".claude", "skills", "project-evolution", "SKILL.md"), "# generated");
+  const r = analyzeForTest(dir);
+  const guard = r.checks.find((c) => c.area === "Dangerous-command guard");
+  assert.ok(guard && guard.ok, "lone project-evolution skill is generated, not a Claude project -> N/A");
+});
+
+test("init --write scaffolds the deny list when .claude/agents/ marks a Claude project without CLAUDE.md (Codex P2)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-claude-agents-init-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {} }));
+  fs.mkdirSync(path.join(dir, ".claude", "agents"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".claude", "agents", "reviewer.md"), "# reviewer agent");
+  await runCli(["init", "--cwd", dir, "--write"]);
+  // The deny list (settings.local.json) is tool-agnostic and is scaffolded for
+  // any Claude project; it was previously skipped because the agents dir alone
+  // did not register as a Claude project.
+  assert.equal(fs.existsSync(path.join(dir, ".claude", "settings.local.json")), true, "init scaffolds deny list for an agents-only Claude project");
+});
+
 // ---- Codex round 3: hook-merge preservation, N/A scoring, shared deny, matcher coverage ----
 
 test("evolve --write merge preserves existing hook objects (timeout/prompt), only appends new command hooks (Codex P1)", async () => {

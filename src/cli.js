@@ -1004,19 +1004,38 @@ function detectHooksConfig(roots) {
   return { postToolUseLint, postToolUseFormat, permissionsDeny };
 }
 
-/** A project is "Claude Code" when it ships CLAUDE.md or a .claude/settings*.json
- *  file ANYWHERE in the tree — including an npm workspace member such as
+/** A user-authored Claude skill: a path under .claude/skills/ that names a
+ *  skill OTHER than `project-evolution` (the ONE skill `evolve --write`
+ *  scaffolds for every stack, not gated on Claude detection). Requires at least
+ *  one path segment after .claude/skills/ so the bare directory entry that the
+ *  generated skill creates does not itself flip detection — otherwise a
+ *  freshly-evolved non-Claude baseline would be misread as a Claude project and
+ *  fail its own (absent) hook checks on the next scan, the same regression
+ *  `.claude/commands/` already guards against. */
+function isUserAuthoredSkillPath(f) {
+  return /(?:^|\/)\.claude\/skills\/(?!project-evolution(?:\/|$))[^/]+/.test(f);
+}
+
+/** A project is "Claude Code" when it ships CLAUDE.md, a .claude/settings*.json
+ *  file, or user-authored Claude Code extensions (.claude/agents/, .claude/skills/)
+ *  ANYWHERE in the tree — including an npm workspace member such as
  *  apps/web/CLAUDE.md, which is the sole Claude config in many monorepos. We scan
  *  the full file inventory (not just roots[0] + git submodules) so a member-only
- *  Claude setup still makes the hooks + deny-list checks applicable. A bare
- *  `.claude/commands/` dir is NOT enough — `vca init` scaffolds those slash
- *  commands for any stack, so counting them would make a fresh non-Claude
- *  baseline fail its own newly-added hook checks on the next scan. */
+ *  Claude setup still makes the hooks + deny-list checks applicable.
+ *
+ *  `vca init` writes .claude/commands/ for any stack and `evolve` writes a single
+ *  project-evolution skill, so those generated artifacts are excluded: counting
+ *  them would make a fresh non-Claude baseline fail its own newly-added hook
+ *  checks on the next scan. .claude/agents/ is never generated and any
+ *  .claude/skills/ entry besides project-evolution is user-authored, so both
+ *  remain reliable signals. */
 function isClaudeCodeProject(allFiles) {
   for (const f of allFiles) {
     if (f === "CLAUDE.md" || f.endsWith("/CLAUDE.md")) return true;
     if (f === ".claude/settings.json" || f.endsWith("/.claude/settings.json")) return true;
     if (f === ".claude/settings.local.json" || f.endsWith("/.claude/settings.local.json")) return true;
+    if (f.startsWith(".claude/agents/") || f.includes("/.claude/agents/")) return true;
+    if (isUserAuthoredSkillPath(f)) return true;
   }
   return false;
 }
