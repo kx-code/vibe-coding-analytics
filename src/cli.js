@@ -1398,7 +1398,7 @@ function detectHooksConfig(roots, scripts, workspaceScripts) {
       permissionsDeny = true;
     }
   }
-  return { postToolUseLint, postToolUseFormat, permissionsDeny };
+  return { postToolUseLint, postToolUseFormat, editLint, writeLint, editFormat, writeFormat, permissionsDeny };
 }
 
 /** A user-authored Claude skill: a path under .claude/skills/ that names a
@@ -1886,7 +1886,7 @@ function packageManagerExecutor(pm) {
 function claudeHooksSettings(report) {
   const roots = report.roots;
   if (!hasNodeFormattersAnywhere(roots)) return null;
-  const { postToolUseLint, postToolUseFormat } = detectHooksConfig(roots, report.scripts, report.workspaceScripts);
+  const { postToolUseLint, postToolUseFormat, editLint, writeLint, editFormat, writeFormat } = detectHooksConfig(roots, report.scripts, report.workspaceScripts);
   if (postToolUseLint && postToolUseFormat) return null;
   const exec = packageManagerExecutor(detectPackageManager(report.cwd, report.packageJson));
   // Emit only the formatter purpose(s) not already satisfied in EITHER settings
@@ -1919,17 +1919,40 @@ function claudeHooksSettings(report) {
   // becomes $1 — so paths with spaces/apostrophes/backslashes are never
   // re-parsed by a shell.
   const hooks = [];
+  // Which tools still need each emitted purpose. A backfilled hook must fire ONLY
+  // on the tools MISSING that purpose: scoping it to Edit|Write when, say, Edit
+  // already runs prettier (Write does not) would run the formatter TWICE on every
+  // Edit — once from the existing entry, once from this one — and the two matching
+  // hooks run in parallel, racing on the same file. The matcher is built from the
+  // per-tool gaps (exposed by detectHooksConfig) so an already-covered tool is left
+  // untouched; the common fresh-setup case (neither tool has either purpose) still
+  // yields Edit|Write. (Codex P2 #3656905057)
+  let editNeeds = false, writeNeeds = false;
   if (!postToolUseFormat && !postToolUseLint) {
     hooks.push({ type: "command", command: `${HOOK_READ_PATH} | xargs -0 -I{} sh -c '${exec} prettier --write --ignore-unknown "$1" && ${exec} eslint --no-warn-ignored "$1" 1>&2' _ {} || exit 2` });
+    editNeeds = !editFormat || !editLint;
+    writeNeeds = !writeFormat || !writeLint;
   } else if (!postToolUseFormat) {
     hooks.push({ type: "command", command: `${HOOK_READ_PATH} | xargs -0 -I{} ${exec} prettier --write --ignore-unknown {}` });
+    editNeeds = !editFormat;
+    writeNeeds = !writeFormat;
   } else if (!postToolUseLint) {
     hooks.push({ type: "command", command: `${HOOK_READ_PATH} | xargs -0 -I{} ${exec} eslint --no-warn-ignored {} 1>&2 || exit 2` });
+    editNeeds = !editLint;
+    writeNeeds = !writeLint;
   }
+  const tools = [];
+  if (editNeeds) tools.push("Edit");
+  if (writeNeeds) tools.push("Write");
+  // A taken branch always has at least one tool needing the purpose (its
+  // postToolUse flag is false), so `tools` is never empty. Guard regardless: an
+  // empty matcher is a CATCH-ALL in Claude Code and would fire after Read/Bash/
+  // etc. (whose payload carries no file_path), so fall back to Edit|Write.
+  const matcher = tools.length ? tools.join("|") : "Edit|Write";
   const config = {
     hooks: {
       PostToolUse: [
-        { matcher: "Edit|Write", hooks },
+        { matcher, hooks },
       ],
     },
   };

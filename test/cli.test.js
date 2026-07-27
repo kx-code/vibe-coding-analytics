@@ -1816,6 +1816,46 @@ test("evolve --write merges into a semantically-equivalent matcher (Write|Edit),
   assert.equal(entries[0].matcher, "Write|Edit", "original matcher preserved on merge");
 });
 
+test("evolve --write scopes the backfilled formatter to only the tool missing it (Codex P2 #3656905057)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-hooks-scope-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "x", scripts: {}, devDependencies: { prettier: "*", eslint: "*" } }));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  // Edit already runs BOTH prettier and eslint; Write runs only eslint. Format is
+  // therefore missing on Write ONLY. The scaffolded formatter must target Write
+  // (NOT Edit|Write) so Edit is not handed a redundant second prettier that would
+  // run in parallel with its existing one on every edit.
+  fs.writeFileSync(
+    path.join(dir, ".claude", "settings.json"),
+    JSON.stringify({
+      hooks: { PostToolUse: [
+        { matcher: "Edit", hooks: [
+          { type: "command", command: "npx prettier --write" },
+          { type: "command", command: "npx eslint" },
+        ] },
+        { matcher: "Write", hooks: [
+          { type: "command", command: "npx eslint" },
+        ] },
+      ] },
+    }),
+  );
+  await runCli(["evolve", "--cwd", dir, "--write"]);
+  const merged = JSON.parse(fs.readFileSync(path.join(dir, ".claude", "settings.json"), "utf8"));
+  const entries = merged.hooks?.PostToolUse || [];
+  // The Edit entry must be UNTOUCHED: still exactly its own prettier + eslint,
+  // with no redundant scaffolded hook appended.
+  const editEntry = entries.find((e) => (e.matcher || "") === "Edit");
+  assert.ok(editEntry, "Edit entry preserved");
+  assert.equal((editEntry.hooks || []).length, 2, "Edit entry gets no redundant extra hook");
+  // The scaffolded formatter must be scoped to Write (not Edit|Write), so it does
+  // not fire on the already-covered Edit tool.
+  const fmtMatchers = entries
+    .filter((e) => (e.hooks || []).some((h) => /prettier/.test(h?.command || "")))
+    .map((e) => e.matcher);
+  assert.ok(!fmtMatchers.includes("Edit|Write"), "no Edit|Write formatter (would double-run on Edit)");
+  assert.ok(fmtMatchers.includes("Write"), "scaffolded formatter scoped to Write only");
+});
+
 test("Agent hooks N/A (not MISS) when formatters live only in a git submodule: deps don't hoist, hooks scaffolded at the root can't resolve them (Codex P2)", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-fmt-roots-"));
   fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
