@@ -452,23 +452,36 @@ function detectShape(cwd, packageJson) {
 }
 
 /** Merge scripts from every package.json in the tree (root + nested subpackages).
- *  Returns the flat merged `scripts` map (last-write-wins across packages) AND a
- *  `byName` map keyed by each package's `name` — the identity `npm run
- *  --workspace <name>` uses to select a specific package, so a workspace-scoped
- *  script invocation can be resolved against THAT package's scripts rather than
- *  the flattened value (which belongs to whichever manifest was visited last). */
+ *  Returns the flat merged `scripts` map AND a `byName` map keyed by each
+ *  package's `name` — the identity `npm run --workspace <name>` uses to select a
+ *  specific package, so a workspace-scoped script invocation can be resolved
+ *  against THAT package's scripts rather than the flattened value.
+ *
+ *  The ROOT manifest is merged LAST so it wins the last-write-wins merge. An
+ *  unscoped `npm run X` runs the ROOT package's script (npm run --help: `npm run
+ *  <command>` with no --workspace selector runs in the current package), so the
+ *  flattened value for an unscoped invocation must be the ROOT body — not a
+ *  member's that shadows it. Otherwise a root `prettier --check .` shadowed by a
+ *  member's `prettier --write .` false-PASSes the Agent-hooks check and blocks
+ *  format-on-save scaffolding. Scoped lookups use `byName` and are unaffected. */
 function collectAllScripts(cwd, allFiles) {
   const flat = {};
   const byName = {};
+  const rootPkg = readJson(path.join(cwd, "package.json"));
   for (const file of allFiles) {
     if (file.includes("node_modules/")) continue;
     if (file === "package.json" || file.endsWith("/package.json")) {
+      if (file === "package.json") continue; // root merged last, below
       const pkg = readJson(path.join(cwd, file));
       if (pkg && pkg.scripts) {
         Object.assign(flat, pkg.scripts);
         if (typeof pkg.name === "string" && pkg.name) byName[pkg.name] = pkg.scripts;
       }
     }
+  }
+  if (rootPkg && rootPkg.scripts) {
+    Object.assign(flat, rootPkg.scripts);
+    if (typeof rootPkg.name === "string" && rootPkg.name) byName[rootPkg.name] = rootPkg.scripts;
   }
   return { flat, byName };
 }
@@ -1069,25 +1082,27 @@ function commandPurposes(cmd, scripts, workspaceScripts) {
   // OWN flags: format counts when at least one formatter segment is not
   // check-only.
   const formatSatisfied = segments.some((seg) => {
-    if (!FORMAT_CMD_RE.test(seg)) return false;
     if (PM_SCRIPT_RE.test(seg)) {
       // Package-manager script invocation (`npm/pnpm/yarn/bun [run] <script>`).
-      // Resolve the script BODY from the merged package.json scripts map and
-      // classify THAT: `npm run format` whose body is `prettier --check .` is
-      // check-only (prettier --check reports drift but never rewrites), so it must
-      // NOT credit format-on-save — even though the invocation line carries no
-      // check flag. Only when the body is unknown (script absent from every
-      // package.json we saw) do we fall back to the opaque-trust heuristic: trust
-      // it writes unless the invocation line itself signals check-only by name
-      // (`format:check`) or flag. The body is classified recursively so a script
+      // Resolve the BODY and classify THAT before requiring the invocation name
+      // to look like a formatter: an arbitrarily named script (`npm run style`
+      // whose body is `prettier --write .`) must still credit format, or the
+      // Agent-hooks check false-MISSes and init/evolve append a duplicate hook.
+      // `npm run format` whose body is `prettier --check .` is check-only
+      // (prettier --check reports drift but never rewrites), so it must NOT
+      // credit format-on-save. The body is classified recursively so a script
       // that chains to prettier --write (or --check) is followed all the way down.
       const body = resolveScriptBody(seg, scripts || {}, new Set(), workspaceScripts);
       if (body != null) return commandPurposes(body, scripts, workspaceScripts).includes("format");
-      return !(FORMAT_CHECK_RE.test(seg) && !FORMAT_WRITE_RE.test(seg));
+      // Opaque (body unresolvable): trust only when the invocation name itself
+      // looks like a formatter, and then credit write unless it signals check-only
+      // by name (`format:check`) or flag.
+      return FORMAT_CMD_RE.test(seg) && !(FORMAT_CHECK_RE.test(seg) && !FORMAT_WRITE_RE.test(seg));
     }
-    // Direct binary call: require an explicit write flag. prettier writes to
-    // stdout by default, so a flag-less `prettier {}` leaves the file untouched
-    // and must not satisfy the format-on-save promise.
+    // Direct binary call: must be a formatter AND carry a write flag. prettier
+    // writes to stdout by default, so a flag-less `prettier {}` leaves the file
+    // untouched and must not satisfy the format-on-save promise.
+    if (!FORMAT_CMD_RE.test(seg)) return false;
     return FORMAT_WRITE_RE.test(seg) || SHORT_WRITE_FLAG_RE.test(seg);
   });
   if (formatSatisfied) purposes.push("format");

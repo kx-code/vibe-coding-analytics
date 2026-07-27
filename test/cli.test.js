@@ -3267,6 +3267,62 @@ test("evolve --write does NOT merge hooks into a matcher that also fires on a no
   }
 });
 
+test("Agent hooks PASS when an arbitrarily named script resolves to a writing formatter body (Codex P2)", () => {
+  // `npm run style` carries no formatter keyword, so the old early FORMAT_CMD_RE
+  // name-gate returned false BEFORE resolveScriptBody could inspect the body
+  // `prettier --write .` — Agent hooks false-MISSed and init/evolve appended a
+  // duplicate prettier. Resolve the body first (npm run <command> runs arbitrary
+  // package scripts), mirroring the lint path.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-scripts-fmt-named-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({
+    name: "demo",
+    scripts: { style: "prettier --write ." },
+    devDependencies: { prettier: "*", eslint: "*" },
+  }));
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({
+    hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [
+      { type: "command", command: "npm run style" },
+      { type: "command", command: "npx eslint --no-warn-ignored {}" },
+    ] }] },
+  }));
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  assert.ok(hooks && hooks.ok, "`npm run style` -> prettier --write credits format (body resolved before the name filter)");
+});
+
+test("Agent hooks resolve an unscoped hook from the ROOT package, not a shadowing member (Codex P2)", () => {
+  // Root and a workspace member both define `format`; root body is check-only
+  // (`prettier --check .`), member body writes (`prettier --write .`). An
+  // UNSCOPED `npm run format` runs the ROOT script, so it must resolve to the
+  // root's check-only body -> format MISS -> Agent hooks FAIL. Was a false PASS
+  // when the member's write won the last-write-wins merge.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-scripts-root-wins-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({
+    name: "root",
+    scripts: { format: "prettier --check ." },
+    workspaces: ["packages/*"],
+    devDependencies: { prettier: "*", eslint: "*" },
+  }));
+  fs.mkdirSync(path.join(dir, "packages", "member"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "packages", "member", "package.json"), JSON.stringify({
+    name: "member",
+    scripts: { format: "prettier --write ." },
+  }));
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({
+    hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [
+      { type: "command", command: "npm run format" },
+      { type: "command", command: "npx eslint --no-warn-ignored {}" },
+    ] }] },
+  }));
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  assert.equal(hooks.ok, false, "unscoped `npm run format` resolves to ROOT's prettier --check (check-only) -> format MISS");
+});
+
 // ---- Codex round 14: destructive dd output operand, hard-reset flag order, workspace script scope (PR #16) ----
 
 test("Dangerous-command guard recognizes dd writing to a block device, and no longer accepts the read-only if= form (Codex P1)", () => {
