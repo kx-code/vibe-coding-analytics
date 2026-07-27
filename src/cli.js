@@ -1176,10 +1176,20 @@ function hasNodeFormattersAnywhere(roots) {
   const pm = detectPackageManager(primary, pkg);
   if (pm === "pnpm") return false;
   if (pm === "yarn" && isYarnBerry(primary, pkg)) return false;
-  for (const memberPkg of readWorkspaceMemberPackages(primary, pkg)) {
-    if (hasNodeFormatters(memberPkg)) return true;
-  }
-  return false;
+  // npm (and Yarn Classic) hoist member deps into the primary node_modules, so
+  // `npx` at the primary resolves them regardless of which manifest declares
+  // them. Aggregate dependency names across the root and every member, then
+  // require both tools in the union: checking each manifest individually with
+  // hasNodeFormatters misses the split case (prettier in the root + eslint in a
+  // member, or split across members), wrongly marking hooks N/A.
+  const depNames = new Set();
+  const collectDeps = (p) => {
+    const deps = { ...p?.dependencies, ...p?.devDependencies };
+    for (const name of Object.keys(deps || {})) depNames.add(name);
+  };
+  collectDeps(pkg);
+  for (const memberPkg of readWorkspaceMemberPackages(primary, pkg)) collectDeps(memberPkg);
+  return depNames.has("prettier") && depNames.has("eslint");
 }
 
 /** DB projects get extra deny guards (DROP/TRUNCATE) since those are

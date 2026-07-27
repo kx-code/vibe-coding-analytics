@@ -1802,6 +1802,27 @@ test("Agent hooks detected when formatters live in an EXPLICIT (non-glob) worksp
   assert.equal(hooks.na, false, "explicit workspace member with formatters -> NOT N/A");
 });
 
+test("Agent hooks detected when prettier and eslint are SPLIT across root and a workspace member (Codex P2)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-fmt-ws-split-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  // Root declares only prettier; the member declares only eslint. npm hoists
+  // the member dep into the primary node_modules, so `npx` at the root resolves
+  // both — but each manifest has only one tool, so a per-manifest hasNodeFormatters
+  // check returns false for both and hooks were wrongly marked N/A.
+  fs.writeFileSync(
+    path.join(dir, "package.json"),
+    JSON.stringify({ name: "root", scripts: {}, workspaces: ["packages/*"], devDependencies: { prettier: "*" } }),
+  );
+  fs.mkdirSync(path.join(dir, "packages", "api"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, "packages", "api", "package.json"),
+    JSON.stringify({ name: "api", devDependencies: { eslint: "*" } }),
+  );
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  assert.equal(hooks.na, false, "prettier+eslint split across root+member (npm hoists both) -> NOT N/A");
+});
+
 test("evolve --write does not duplicate formatter hooks already covered by custom commands (Codex P2)", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-merge-purpose-"));
   fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {}, devDependencies: { prettier: "*", eslint: "*" } }));
