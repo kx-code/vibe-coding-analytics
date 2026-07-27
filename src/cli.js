@@ -1088,9 +1088,9 @@ function extractScriptName(invocation) {
     // and false-PASSes a check-only formatter. Yarn's `workspace` keyword is
     // honored only under yarn so a script literally named "workspace" under
     // npm/pnpm/bun is not misread as a selector.
-    if (t === "--workspace" || t === "-w" || t === "--filter") { i += 2; continue; }
+    if (t === "--workspace" || t === "-w" || t === "--filter" || t === "--prefix") { i += 2; continue; }
     if (isYarn && t === "workspace") { i += 2; continue; }
-    if (/^(?:--workspace|-w|--filter)=/.test(t)) { i++; continue; } // inline value (--filter=a)
+    if (/^(?:--workspace|-w|--filter|--prefix)=/.test(t)) { i++; continue; } // inline value (--filter=a, --prefix=a)
     if (t.startsWith("-")) { i++; continue; }                        // boolean option
     return t;                                                         // first bare token = script name
   }
@@ -1122,7 +1122,7 @@ function resolveScriptBody(invocation, scripts, seen, workspaceScripts) {
   // the runner is yarn (pm-keyword check) so a non-yarn `run workspace` script
   // name is not eaten as a selector value.
   const pmOf = s.match(/\b(npm|pnpm|yarn|bun)\b/);
-  const wsFlag = s.match(/(?:^|\s)(?:--workspace|-w|--filter)[ =](\S+)/);
+  const wsFlag = s.match(/(?:^|\s)(?:--workspace|-w|--filter|--prefix)[ =](\S+)/);
   const wsYarn = pmOf && pmOf[1] === "yarn" ? s.match(/(?:^|\s)workspace\s+(\S+)/) : null;
   const wsName = wsFlag ? normalizeWorkspaceKey(wsFlag[1])
     : wsYarn ? normalizeWorkspaceKey(wsYarn[1]) : null;

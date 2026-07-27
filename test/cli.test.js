@@ -3182,7 +3182,7 @@ test("Agent hooks: --workspace <member-path> resolves that member's script (Code
   assert.equal(hooks.ok, false, "--workspace packages/a resolves to a's check-only formatter, not flat-fallback to the root writer");
 });
 
-test("Agent hooks: yarn `workspace <name>` + pnpm `--filter <name>` selectors resolve that member (Codex P2 #3656097552)", () => {
+test("Agent hooks: workspace/package selectors (yarn workspace, pnpm --filter, npm --prefix) resolve that member (Codex P2 #3656097552/#3656522666)", () => {
   // npm's --workspace flag is one of THREE workspace-selector spellings; the
   // other two were NOT parsed by extractScriptName/resolveScriptBody, so the
   // member selection was lost and resolution went opaque:
@@ -3197,6 +3197,7 @@ test("Agent hooks: yarn `workspace <name>` + pnpm `--filter <name>` selectors re
     "yarn workspace a run format",           // yarn classic positional
     "pnpm --filter a run format",            // pnpm --filter (name form)
     "pnpm --filter ./packages/a run format", // pnpm --filter (path form, normalized to directory key)
+    "npm --prefix packages/a run format",    // npm --prefix (directory form, Codex P2 #3656522666)
   ]) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-ws-selector-"));
     fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
