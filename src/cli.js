@@ -899,13 +899,17 @@ const FORMAT_CHECK_RE = /(?:--check|--list-different|--no-write|:check)\b/;
 const FORMAT_WRITE_RE = /(?:--write|--fix)\b/;
 function commandPurposes(cmd) {
   let c = String(cmd || "");
-  // First drop human-text arguments to echo/printf (status strings such as
-  // 'lint and format complete') — their words must not masquerade as tool
-  // invocations. One or more quoted args are consumed so `echo 'a' 'b'` is
-  // fully removed.
-  c = c
-    .replace(/\b(?:echo|printf)\b(?:\s+'(?:[^'\\]|\\.)*')+\s*/g, " ")
-    .replace(/\b(?:echo|printf)\b(?:\s+"(?:[^"\\]|\\.)*")+\s*/g, " ");
+  // Drop the FULL argument list of echo/printf — status text such as
+  // 'lint and format complete' OR unquoted `echo lint && echo format`. Their
+  // words must not masquerade as tool invocations. A single pass consumes any
+  // mix of quoted and unquoted args, stopping at the next shell operator
+  // (&&, ||, ;, |, >) or end of string, so it also strips a bare `echo lint`
+  // that the quoted-only replacements missed (the bare word "lint" then matched
+  // LINT_CMD_RE and false-PASSed the Agent-hooks check).
+  c = c.replace(
+    /\b(?:echo|printf)\b(?:(?:\s+(?:'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"|[^;&|>\s]+))*)/g,
+    " "
+  );
   // For OTHER quoted strings — typically a script passed to a shell wrapper like
   // `bash -lc "npm run lint && npm run format"` — the quoted CONTENT is real
   // commands, so strip only the quote characters (keep the content) for scanning
@@ -1198,7 +1202,15 @@ function defaultDenyList(report) {
     "Bash(git push * --force)",
     "Bash(git push * -f)",
     "Bash(git reset --hard:*)",
+    // git clean needs only -f to delete untracked files irreversibly (git refuses
+    // without it; -d merely adds directories). Claude Code prefix-matches the
+    // LITERAL spelling, so every force spelling must be scaffolded — `git clean
+    // -f` (plain) is destructive on its own and was missing, leaving the analyzer
+    // reporting protection the deny list did not actually provide.
+    "Bash(git clean -f:*)",
     "Bash(git clean -fd:*)",
+    "Bash(git clean -df:*)",
+    "Bash(git clean --force:*)",
     "Bash(sudo rm:*)",
     "Bash(mkfs:*)",
     "Bash(dd if=:*)",

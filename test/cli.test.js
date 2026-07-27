@@ -2380,6 +2380,47 @@ test("Agent hooks MISS when a PostToolUse hook only echoes a lint/format status 
   assert.ok(hooks && !hooks.ok, "a status-echo hook must NOT satisfy the Agent-hooks check");
 });
 
+test("Agent hooks MISS when a hook only echoes UNQUOTED lint/format words (Codex P2, Round 18)", () => {
+  // commandPurposes previously stripped only QUOTED echo/printf args, so unquoted
+  // status output like `echo lint && echo format` left the bare words "lint" /
+  // "format" to match LINT_CMD_RE / FORMAT_CMD_RE — false-PASSing the Agent-hooks
+  // check. The unified echo/printf stripper must consume unquoted args too.
+  for (const cmd of [
+    "echo lint && echo format",
+    "echo formatting files && echo linting files",
+    'echo "lint" && echo "format"',
+    "printf lint done",
+  ]) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-hooks-echo-unq-"));
+    fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {}, devDependencies: { prettier: "*", eslint: "*" } }));
+    fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
+    fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, ".claude", "settings.json"),
+      JSON.stringify({
+        hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [{ type: "command", command: cmd }] }] },
+      }),
+    );
+    const r = analyzeForTest(dir);
+    const hooks = r.checks.find((c) => c.area === "Agent hooks");
+    assert.ok(hooks && !hooks.ok, `unquoted echo status "${cmd}" must NOT satisfy the Agent-hooks check`);
+  }
+  // Sanity: an echo followed by a REAL formatter still counts (echo stripped, formatter kept).
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-hooks-echo-real-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {}, devDependencies: { prettier: "*", eslint: "*" } }));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, ".claude", "settings.json"),
+    JSON.stringify({
+      hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [{ type: "command", command: "echo done && eslint --fix ." }, { type: "command", command: "echo done && prettier --write ." }] }] },
+    }),
+  );
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  assert.ok(hooks && hooks.ok, "echo before a real eslint+prettier must still satisfy BOTH purposes");
+});
+
 test("Agent hooks PASS when PostToolUse hooks run real eslint + prettier via a pipeline (Codex P2)", () => {
   // The scaffolded hook command is a pipeline: `node -e "..." | ... npx
   // prettier` and `... | ... npx eslint`. commandPurposes must still classify
@@ -2434,6 +2475,22 @@ test("Dangerous-command guard requires a destructive git clean flag, not a dry-r
     const guard = r.checks.find((c) => c.area === "Dangerous-command guard");
     assert.ok(guard && guard.ok, `${dangerous} must satisfy the guard (has force flag)`);
   }
+});
+
+test("init scaffolds every git clean force spelling so the deny list matches the analyzer (Codex P1, Round 18)", async () => {
+  // The analyzer flags `git clean -f` (plain, no -d) as dangerous, but the
+  // scaffolded deny list only had `git clean -fd`. Claude Code prefix-matches
+  // the literal spelling, so `git clean -f` ran unblocked despite the guard
+  // reporting protection. Every force spelling the analyzer accepts must also be
+  // scaffolded: plain -f, clustered -fd/-df (either order), and long --force.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-deny-clean-scaffold-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  await runCli(["init", "--cwd", dir, "--write"]);
+  const local = fs.readFileSync(path.join(dir, ".claude", "settings.local.json"), "utf8");
+  assert.ok(/Bash\(git clean -f:\*\)/.test(local), "git clean -f scaffolded (plain force, destructive without -d)");
+  assert.ok(/Bash\(git clean -fd:\*\)/.test(local), "git clean -fd scaffolded");
+  assert.ok(/Bash\(git clean -df:\*\)/.test(local), "git clean -df scaffolded (reorder cluster)");
+  assert.ok(/Bash\(git clean --force:\*\)/.test(local), "git clean --force scaffolded (long form)");
 });
 
 test("Agent hooks PASS when a single combined command runs both lint and format (Codex P2)", () => {
