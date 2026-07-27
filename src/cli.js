@@ -100,7 +100,7 @@ function analyzeProject(cwd) {
 
   const numberedRules = countNumberedRules(roots);
   const ruleTrace = analyzeRuleTraceability(roots, allFiles, cwd);
-  const hooks = detectHooksConfig(roots);
+  const hooks = detectHooksConfig(roots, scripts);
   const isClaude = isClaudeCodeProject(allFiles);
   const hasFormatters = hasNodeFormattersAnywhere(roots);
   // N/A semantics: a check that does not apply to this project should neither
@@ -918,8 +918,12 @@ const FORMAT_CMD_RE = /\bprettier\b|\bformat\b|\bfmt\b/i;
 const FORMAT_CHECK_RE = /(?:--check|--list-different|--no-write|:check)\b/;
 const FORMAT_WRITE_RE = /(?:--write|--fix)\b/;
 // A package-manager script invocation (`npm/pnpm/yarn/bun [run] <script>`) hides
-// the script body, so its formatter — if any — is trusted as-is: we cannot see
-// whether it passes a write flag. A DIRECT prettier call is different: prettier
+// the script body, so the script NAME is captured (group 1) and resolved against
+// the merged package.json scripts map in commandPurposes: `npm run format` whose
+// body is `prettier --check .` is check-only and must NOT credit format-on-save,
+// even though the invocation line shows no check flag. Only when the body is
+// unknown (script absent from every package.json we saw) do we fall back to the
+// opaque-trust heuristic below. A DIRECT prettier call is different: prettier
 // prints to stdout by default and only rewrites in place with --write/-w, so a
 // bare `prettier {}` does NOT satisfy format-on-save and must not false-PASS.
 // `npx`/`bunx` are NOT matched here — they execute the binary directly, so a
@@ -927,14 +931,36 @@ const FORMAT_WRITE_RE = /(?:--write|--fix)\b/;
 // true of the PM direct-execution subcommands `exec` (`npm/pnpm/yarn exec
 // prettier`) and `dlx` (`bun dlx prettier`): they run the binary transparently,
 // so a flag-less `yarn exec prettier {}` is direct, NOT an opaque script. The
-// negative lookahead excludes those subcommands so the opaque-trust branch only
-// fires for genuine `[run] <script>` invocations.
-const PM_SCRIPT_RE = /\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?!exec\b|dlx\b)\S/;
+// negative lookahead excludes those subcommands so the script-resolution branch
+// only fires for genuine `[run] <script>` invocations. `([^\s]+)` captures the
+// first token as the script name (flags like `--silent` that follow are ignored).
+const PM_SCRIPT_RE = /\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?!exec\b|dlx\b)([^\s]+)/;
 // `-w` is prettier's short write flag. Matched as a standalone token (bounded by
 // whitespace or string end) so it does NOT fire inside `--no-write`, whose `-w`
 // sits mid-token after `o` (no preceding boundary).
 const SHORT_WRITE_FLAG_RE = /(?:^|\s)-w(?=\s|$)/;
-function commandPurposes(cmd) {
+
+/** Resolve a package-manager script invocation to its terminal body from the
+ *  merged scripts map (root + nested package.json scripts). `npm run format` ->
+ *  the body of the "format" script. Follows a chain when the body is itself a
+ *  PM script (`"format": "npm run _fmt"`, `"_fmt": "prettier --write ."`) and
+ *  stops at the first body that is NOT a PM-script invocation, so a check-only
+ *  flag buried one indirection down is still seen. A `seen` set guards against
+ *  cycles (`"a": "npm run b"`, `"b": "npm run a"`). Returns null when the script
+ *  name is absent from the map (body opaque/unknown) — callers then fall back to
+ *  the opaque-trust heuristic rather than guessing. */
+function resolveScriptBody(invocation, scripts, seen) {
+  const m = PM_SCRIPT_RE.exec(String(invocation || ""));
+  if (!m) return null;
+  const name = m[1];
+  if (!name || seen.has(name)) return null;
+  const body = scripts ? scripts[name] : undefined;
+  if (typeof body !== "string" || body.trim() === "") return null;
+  seen.add(name);
+  return PM_SCRIPT_RE.test(body) ? resolveScriptBody(body, scripts, seen) : body;
+}
+
+function commandPurposes(cmd, scripts) {
   let c = String(cmd || "");
   // Drop the FULL argument list of echo/printf — status text such as
   // 'lint and format complete' OR unquoted `echo lint && echo format`. Their
@@ -969,9 +995,18 @@ function commandPurposes(cmd) {
   const formatSatisfied = segments.some((seg) => {
     if (!FORMAT_CMD_RE.test(seg)) return false;
     if (PM_SCRIPT_RE.test(seg)) {
-      // Opaque package script: trust it writes unless the name signals check-only
-      // (`format:check`) — the script body is invisible, so we can't apply
-      // prettier's defaults-to-stdout rule to it.
+      // Package-manager script invocation (`npm/pnpm/yarn/bun [run] <script>`).
+      // Resolve the script BODY from the merged package.json scripts map and
+      // classify THAT: `npm run format` whose body is `prettier --check .` is
+      // check-only (prettier --check reports drift but never rewrites), so it must
+      // NOT credit format-on-save — even though the invocation line carries no
+      // check flag. Only when the body is unknown (script absent from every
+      // package.json we saw) do we fall back to the opaque-trust heuristic: trust
+      // it writes unless the invocation line itself signals check-only by name
+      // (`format:check`) or flag. The body is classified recursively so a script
+      // that chains to prettier --write (or --check) is followed all the way down.
+      const body = resolveScriptBody(seg, scripts || {}, new Set());
+      if (body != null) return commandPurposes(body, scripts).includes("format");
       return !(FORMAT_CHECK_RE.test(seg) && !FORMAT_WRITE_RE.test(seg));
     }
     // Direct binary call: require an explicit write flag. prettier writes to
@@ -997,7 +1032,7 @@ function commandPurposes(cmd) {
  *  could not repair either half. Scoping to the primary keeps the check honest
  *  (split coverage reports MISS) and the repair working (the missing purpose is
  *  scaffolded at the primary). */
-function detectHooksConfig(roots) {
+function detectHooksConfig(roots, scripts) {
   const primary = roots?.[0];
   const settings = primary ? readJson(path.join(primary, ".claude", "settings.json")) : null;
   const local = primary ? readJson(path.join(primary, ".claude", "settings.local.json")) : null;
@@ -1022,7 +1057,7 @@ function detectHooksConfig(roots) {
       // wide matcher entry may carry a lint hook AND a format hook, and a
       // quoted status echo inside one command must not flip the other purpose.
       for (const h of entry.hooks || []) {
-        for (const purpose of commandPurposes(h?.command)) {
+        for (const purpose of commandPurposes(h?.command, scripts)) {
           if (purpose === "lint") postToolUseLint = true;
           else if (purpose === "format") postToolUseFormat = true;
         }
@@ -1436,7 +1471,7 @@ function packageManagerExecutor(pm) {
 function claudeHooksSettings(report) {
   const roots = report.roots;
   if (!hasNodeFormattersAnywhere(roots)) return null;
-  const { postToolUseLint, postToolUseFormat } = detectHooksConfig(roots);
+  const { postToolUseLint, postToolUseFormat } = detectHooksConfig(roots, report.scripts);
   if (postToolUseLint && postToolUseFormat) return null;
   const exec = packageManagerExecutor(detectPackageManager(report.cwd, report.packageJson));
   // Emit only the formatter purpose(s) not already satisfied in EITHER settings
@@ -1622,7 +1657,7 @@ function buildInitFiles(report) {
       files.push(file(".claude/settings.local.json", claudePermissionsLocal(report), mergePermissionsLocal));
     }
     const hooksContent = claudeHooksSettings(report);
-    if (hooksContent) files.push(file(".claude/settings.json", hooksContent, mergeHooksSettings));
+    if (hooksContent) files.push(file(".claude/settings.json", hooksContent, (existing, incoming) => mergeHooksSettings(existing, incoming, report.scripts)));
   }
   return files;
 }
@@ -1748,7 +1783,7 @@ function buildEvolutionFiles(report, plan) {
       files.push(file(".claude/settings.local.json", claudePermissionsLocal(report), mergePermissionsLocal));
     }
     const hooksContent = claudeHooksSettings(report);
-    if (hooksContent) files.push(file(".claude/settings.json", hooksContent, mergeHooksSettings));
+    if (hooksContent) files.push(file(".claude/settings.json", hooksContent, (existing, incoming) => mergeHooksSettings(existing, incoming, report.scripts)));
   }
   return files;
 }
@@ -1761,7 +1796,7 @@ function file(relativePath, content, merge) {
  *  unrelated user settings. Dedupes commands within the Edit|Write matcher.
  *  Used as the `merge` strategy so `evolve --write` backfills hooks even when
  *  settings.json already exists with user content. */
-function mergeHooksSettings(existingContent, incomingContent) {
+function mergeHooksSettings(existingContent, incomingContent, scripts) {
   const existing = JSON.parse(existingContent);
   const incoming = JSON.parse(incomingContent);
   existing.hooks ??= {};
@@ -1797,14 +1832,14 @@ function mergeHooksSettings(existingContent, incomingContent) {
       // detection" and "already merged" stay consistent.
       const coveredPurposes = new Set();
       for (const h of existingEntry.hooks) {
-        for (const purpose of commandPurposes(h?.command)) coveredPurposes.add(purpose);
+        for (const purpose of commandPurposes(h?.command, scripts)) coveredPurposes.add(purpose);
       }
       for (const h of entry.hooks || []) {
         if (!h?.command || knownCmds.has(h.command)) continue;
         // A combined command (e.g. `npm run lint && npm run format`) carries
         // multiple purposes; only skip it when EVERY purpose it serves is
         // already covered, otherwise an uncovered purpose would go unscaffolded.
-        const purposes = commandPurposes(h.command);
+        const purposes = commandPurposes(h.command, scripts);
         if (purposes.length && purposes.every((p) => coveredPurposes.has(p))) continue;
         existingEntry.hooks.push(h);
         knownCmds.add(h.command);

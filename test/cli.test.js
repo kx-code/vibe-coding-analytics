@@ -3044,3 +3044,147 @@ test("combined hook's sh -c placeholder passes a tricky path byte-for-byte as $1
   const out = execFileSync("xargs", ["-0", "-I{}", "sh", "-c", 'printf "%s\\n" "$1"', "_", "{}"], { input: pathPlusNul, encoding: "utf8" });
   assert.equal(out.trim(), tricky, "apostrophe+space+backslash path reaches $1 byte-for-byte");
 });
+
+// ---- Codex round 13: resolve package scripts before crediting format-on-save (PR #16) ----
+
+test("Agent hooks MISS format when `npm run format` resolves to a check-only script body (Codex P2)", () => {
+  // The hook line `npm run format` carries no check flag, so the old opaque-trust
+  // heuristic credited format-on-save. But package.json defines format as
+  // `prettier --check .` (report-only, never rewrites), so the scan falsely PASSed
+  // and init/evolve skipped scaffolding a real writing formatter. Resolve the
+  // script body and classify THAT.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-scripts-checkonly-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({
+    name: "demo",
+    scripts: { format: "prettier --check ." },
+    devDependencies: { prettier: "*", eslint: "*" },
+  }));
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({
+    hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [
+      { type: "command", command: "npm run format" },
+      { type: "command", command: "npx eslint --no-warn-ignored {}" },
+    ] }] },
+  }));
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  assert.equal(hooks.ok, false, "`npm run format` -> prettier --check is check-only -> format MISS (was falsely PASS)");
+});
+
+test("Agent hooks PASS when `npm run format` resolves to a writing script body (Codex P2)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-scripts-write-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({
+    name: "demo",
+    scripts: { format: "prettier --write ." },
+    devDependencies: { prettier: "*", eslint: "*" },
+  }));
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({
+    hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [
+      { type: "command", command: "npm run format" },
+      { type: "command", command: "npx eslint --no-warn-ignored {}" },
+    ] }] },
+  }));
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  assert.ok(hooks && hooks.ok, "`npm run format` -> prettier --write credits format-on-save");
+});
+
+test("Agent hooks follow a package-script chain to classify format-on-save (Codex P2)", () => {
+  // `format` -> `_fmt` -> prettier --write . : the write flag sits one indirection
+  // down, so the resolver must follow PM-script bodies recursively (not stop at
+  // the first body, which is itself an `npm run` and carries no write flag).
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-scripts-chain-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({
+    name: "demo",
+    scripts: { format: "npm run _fmt", _fmt: "prettier --write ." },
+    devDependencies: { prettier: "*", eslint: "*" },
+  }));
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({
+    hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [
+      { type: "command", command: "npm run format" },
+      { type: "command", command: "npx eslint --no-warn-ignored {}" },
+    ] }] },
+  }));
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  assert.ok(hooks && hooks.ok, "format -> _fmt -> prettier --write credits format-on-save (chain followed)");
+});
+
+test("Agent hooks fall back to opaque-trust for an unresolvable/cyclic script (Codex P2)", () => {
+  // Two cases must NOT hang or false-MISS:
+  //  (a) `npm run format` whose body is absent from every package.json — we cannot
+  //      see the body, so trust the script name (opaque-trust), same as before.
+  //  (b) a cycle `a -> b -> a` — resolveScriptBody's seen-set must terminate it.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-scripts-cycle-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({
+    name: "demo",
+    scripts: { a: "npm run b", b: "npm run a" },
+    devDependencies: { prettier: "*", eslint: "*" },
+  }));
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({
+    hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [
+      { type: "command", command: "npm run format" },
+      { type: "command", command: "npm run a" },
+      { type: "command", command: "npx eslint --no-warn-ignored {}" },
+    ] }] },
+  }));
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  assert.ok(hooks && hooks.ok, "unresolvable `npm run format` + cyclic `npm run a` fall back to opaque-trust (no hang, no false MISS)");
+});
+
+test("init --write scaffolds a writing formatter when `npm run format` is check-only (Codex P2)", async () => {
+  // Practical outcome: because format is now correctly detected as MISSING, init
+  // must scaffold a real writing prettier hook instead of skipping it.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-scripts-init-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({
+    name: "demo",
+    scripts: { format: "prettier --check ." },
+    devDependencies: { prettier: "*", eslint: "*" },
+  }));
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({
+    hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [
+      { type: "command", command: "npm run format" },
+      { type: "command", command: "npx eslint --no-warn-ignored {}" },
+    ] }] },
+  }));
+  await runCli(["init", "--cwd", dir, "--write"]);
+  const settings = JSON.parse(fs.readFileSync(path.join(dir, ".claude", "settings.json"), "utf8"));
+  const cmds = (settings.hooks?.PostToolUse || []).flatMap((e) => (e.hooks || []).map((h) => h.command));
+  assert.ok(cmds.some((c) => /prettier --write/.test(c)), "init scaffolds a WRITING prettier (the check-only `npm run format` did not cover format)");
+});
+
+test("evolve --write does not append a redundant formatter when an existing `npm run format` resolves to write (Codex P2)", async () => {
+  // Merge/detection consistency (the documented invariant at mergeHooksSettings):
+  // an existing `npm run format` whose body is `prettier --write .` already
+  // satisfies format, so evolve must NOT append the scaffold's prettier (which
+  // would run the formatter twice per edit).
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-scripts-merge-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({
+    name: "demo",
+    scripts: { format: "prettier --write ." },
+    devDependencies: { prettier: "*", eslint: "*" },
+  }));
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({
+    hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [
+      { type: "command", command: "npm run format" },
+      { type: "command", command: "npx eslint --no-warn-ignored {}" },
+    ] }] },
+  }));
+  await runCli(["evolve", "--cwd", dir, "--write"]);
+  const merged = JSON.parse(fs.readFileSync(path.join(dir, ".claude", "settings.json"), "utf8"));
+  const entry = (merged.hooks?.PostToolUse || []).find((e) => e.matcher === "Edit|Write");
+  const cmds = (entry.hooks || []).map((h) => h.command);
+  assert.ok(!cmds.some((c) => /prettier --write --ignore-unknown/.test(c)), "no scaffold prettier appended (`npm run format` -> prettier --write already covers format)");
+});
