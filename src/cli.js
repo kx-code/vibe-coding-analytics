@@ -1022,9 +1022,22 @@ const FORMAT_WRITE_RE = /(?:--write|--fix)\b/;
 // prettier`) and `dlx` (`bun dlx prettier`): they run the binary transparently,
 // so a flag-less `yarn exec prettier {}` is direct, NOT an opaque script. The
 // negative lookahead excludes those subcommands so the script-resolution branch
-// only fires for genuine `[run] <script>` invocations. `([^\s]+)` captures the
-// first token as the script name (flags like `--silent` that follow are ignored).
-const PM_SCRIPT_RE = /\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?!exec\b|dlx\b)([^\s]+)/;
+// only fires for genuine `[run] <script>` invocations. A global option may
+// PRECEDE the subcommand (`npm --silent exec prettier .`), and the lookahead
+// only sees the IMMEDIATELY following token — so without skipping leading flags
+// it sees `--silent` (not exec/dlx), matches, and routes a direct-execution
+// command into script resolution: the captured flag/exec token is absent from the
+// scripts map → opaque → the name heuristic sees `prettier` and false-PASSes a
+// check-only formatter. `(?:--?\S+\s+)*` consumes leading option flags so the
+// lookahead still reaches `exec`/`dlx`, excludes the command, and routes it to
+// the direct-binary classifier (segmentExecutes), which requires `--write`
+// (Codex P2 #3656758667). `([^\s-]\S*)` captures the first token as the script
+// name; it must NOT begin with `-` (a script name never does), otherwise the
+// `*` group backtracks to ZERO iterations and the capture grabs the option flag
+// itself (`--silent`), re-enabling the opaque false-PASS the skip was meant to
+// prevent. JavaScript lacks possessive quantifiers, so the non-dash first char
+// is what makes the skip non-backtracking in practice.
+const PM_SCRIPT_RE = /\b(?:npm|pnpm|yarn|bun)\s+(?:--?\S+\s+)*(?:run\s+)?(?!exec\b|dlx\b)([^\s-]\S*)/;
 // Global-flagged regex matching a FULL PM invocation span — the keyword plus
 // every non-operator token up to the next shell operator (&& || ; |) or end of
 // string — for inline substitution in a script body (resolveScriptBody).

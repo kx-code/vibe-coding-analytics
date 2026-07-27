@@ -1735,6 +1735,59 @@ test("Agent hooks PASS when Edit and Write are covered by SEPARATE PostToolUse e
   assert.ok(hooks && hooks.ok, "split Edit/Write PostToolUse entries must aggregate to PASS");
 });
 
+test("Agent hooks MISS when `npm <option> exec prettier` is check-only (no --write) (Codex P2 #3656758667)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-hooks-pmopt-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.writeFileSync(
+    path.join(dir, "package.json"),
+    JSON.stringify({ name: "x", devDependencies: { prettier: "*", eslint: "*" } }),
+  );
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  // `npm --silent exec prettier .` directly executes prettier (like npx) with a
+  // global option BEFORE `exec`. It is check-only (no --write), so format-on-save
+  // is NOT satisfied. PM_SCRIPT_RE's lookahead must skip the leading --silent to
+  // reach `exec`, route the command to the direct-binary classifier, and see that
+  // prettier lacks --write — instead of capturing --silent as a script name, going
+  // opaque, and false-PASSing via the prettier name heuristic.
+  fs.writeFileSync(
+    path.join(dir, ".claude", "settings.json"),
+    JSON.stringify({
+      hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [
+        { type: "command", command: "npm --silent exec prettier ." },
+        { type: "command", command: "npm --silent exec eslint ." },
+      ] }] },
+    }),
+  );
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  assert.ok(hooks && !hooks.ok, "check-only `npm --silent exec prettier` (no --write) must MISS");
+});
+
+test("Agent hooks PASS when `npm <option> exec prettier --write` carries the write flag (Codex P2 #3656758667)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-hooks-pmopt-write-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.writeFileSync(
+    path.join(dir, "package.json"),
+    JSON.stringify({ name: "x", devDependencies: { prettier: "*", eslint: "*" } }),
+  );
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  // Same routing as the check-only case, but --write IS present — the direct-binary
+  // classifier must still credit format-on-save once the write flag is seen, so the
+  // fix does not regress the writing-formatter path.
+  fs.writeFileSync(
+    path.join(dir, ".claude", "settings.json"),
+    JSON.stringify({
+      hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [
+        { type: "command", command: "npm --silent exec prettier --write ." },
+        { type: "command", command: "npm --silent exec eslint ." },
+      ] }] },
+    }),
+  );
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  assert.ok(hooks && hooks.ok, "`npm --silent exec prettier --write` must credit format-on-save");
+});
+
 test("evolve --write merges into a semantically-equivalent matcher (Write|Edit), no duplicate entry (Codex P2)", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-merge-semeq-"));
   fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {}, devDependencies: { prettier: "*", eslint: "*" } }));
