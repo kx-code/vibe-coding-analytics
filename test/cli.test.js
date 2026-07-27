@@ -3941,6 +3941,12 @@ test("Agent hooks do NOT credit lint when `lint` is a filename/argument, only wh
   assert.equal(evalLint("tee lint-report"), false, "`tee lint-report` -> lint is a filename -> MISS");
   assert.equal(evalLint("cat lint"), false, "`cat lint` -> lint is an arg to cat (terminal cmd) -> MISS");
   assert.equal(evalLint("node tool.js eslint"), false, "`node tool.js eslint` -> eslint is an arg, node is terminal -> MISS");
+  // A shell WITHOUT -c treats its first non-option token as a script FILE, so
+  // `bash eslint` runs a file named "eslint" — eslint is NOT executed -> MISS
+  // (Codex P2 #3657945044). Contrast `sh -c '... eslint ...'` below, which DOES
+  // execute the script and credits lint.
+  assert.equal(evalLint("bash eslint"), false, "`bash eslint` (no -c) -> eslint is a script-file arg -> MISS");
+  assert.equal(evalLint("sh eslint"), false, "`sh eslint` (no -c) -> eslint is a script-file arg -> MISS");
   // Real lint commands still credit (control): eslint is the executed command.
   assert.ok(evalLint("eslint ."), "`eslint .` -> eslint is the command -> PASS");
   assert.ok(evalLint("npx eslint ."), "`npx eslint .` -> eslint after runner -> PASS");
@@ -3980,6 +3986,9 @@ test("Agent hooks do NOT credit format when the formatter is an argument, only w
   // Formatter as an argument (even WITH a write flag) is NOT format-on-save -> MISS.
   assert.equal(evalFmt("cat prettier --write"), false, "`cat prettier --write` -> prettier is an arg to cat -> format MISS");
   assert.equal(evalFmt("node tool.js format --write"), false, "`node tool.js format --write` -> format is an arg, node terminal -> MISS");
+  // A shell WITHOUT -c treats its first non-option token as a script FILE, so
+  // `bash prettier --write` does NOT execute prettier -> MISS (Codex P2 #3657945044).
+  assert.equal(evalFmt("bash prettier --write"), false, "`bash prettier --write` (no -c) -> prettier is a script-file arg -> MISS");
   // Real format commands still credit (control): prettier is the executed command.
   assert.ok(evalFmt("prettier --write ."), "`prettier --write .` -> prettier is the command + --write -> PASS");
   assert.ok(evalFmt("npx prettier --write --ignore-unknown {}"), "`npx prettier --write ...` -> prettier after runner -> PASS");

@@ -1241,7 +1241,11 @@ function resolveScriptBody(invocation, scripts, seen, workspaceScripts) {
  *    tool tokens inside the (quote-stripped) script ARE executed. The scaffolded
  *    combined hook is `xargs -0 -I{} sh -c 'npx prettier --write ... && npx
  *    eslint ...' _ {}`: after quote-stripping, `sh` precedes the inner tool
- *    tokens, so shells MUST be pass-throughs or format/lint both false-MISS.
+ *    tokens, so a shell WITH -c MUST be a pass-through or format/lint false-MISS.
+ *    WITHOUT -c the shell is TERMINAL: its first non-option token is a script
+ *    FILE (GNU Bash `bash --help`: `[-c command_string | file]`), so `bash
+ *    eslint` must NOT credit lint (Codex P2 #3657945044) — checked in the loop
+ *    via shellHasC, not unconditionally here.
  *  - `env` (POSIX) / `cross-env` (npm): set environment variables then run the
  *    next command, so `cross-env FOO=1 prettier --write .` must still credit
  *    format (Codex P2 #3656270114). A `VAR=value` ASSIGNMENT that follows one of
@@ -1257,18 +1261,42 @@ function resolveScriptBody(invocation, scripts, seen, workspaceScripts) {
 function segmentExecutes(seg, cmdRe) {
   const tokens = String(seg || "").split(/\s+/).filter(Boolean);
   // env (POSIX) / cross-env (npm) set env vars, then run the following command.
-  const PASS_THROUGH = /^(?:npx|bunx|xargs|exec|dlx|npm|pnpm|yarn|bun|sh|bash|dash|zsh|ksh|ash|env|cross-env)$/;
+  const PASS_THROUGH = /^(?:npx|bunx|xargs|exec|dlx|npm|pnpm|yarn|bun|env|cross-env)$/;
+  // Shells are pass-through ONLY with -c (checked via shellHasC); without -c a
+  // shell is TERMINAL (its first non-option token is a script FILE).
+  const SHELL_RE = /^(?:sh|bash|dash|zsh|ksh|ash)$/;
   // A leading `VAR=value` assignment (NODE_ENV=test, FOO=1) prefixes the real
   // command; skip it so the formatter/linter behind it is reached. Bounded: the
   // name starts with a letter/underscore, so a `-` option flag (handled above)
   // never matches.
   const ENV_ASSIGN = /^[A-Za-z_][A-Za-z0-9_]*=/;
-  for (const t of tokens) {
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i];
     if (cmdRe.test(t)) return true;        // reached as the executed command
     if (t.startsWith("-")) continue;        // option flag consumed by a runner
-    if (PASS_THROUGH.test(t)) continue;     // pass-through runner / PM exec / shell -c / env setter
+    if (PASS_THROUGH.test(t)) continue;     // pass-through runner / PM exec / env setter
+    if (SHELL_RE.test(t)) {
+      if (shellHasC(tokens, i)) continue;   // `sh -c '<script>'` executes the script
+      return false;                          // `bash eslint` (no -c): eslint is a script FILE
+    }
     if (ENV_ASSIGN.test(t)) continue;       // VAR=value environment-prefix assignment
     return false;                           // terminal command: tool not executed
+  }
+  return false;
+}
+
+/** True when the shell at tokens[shellIdx] was invoked with -c, scanned across
+ *  its OPTION cluster only (the flags immediately preceding the command string
+ *  or script file). `sh -c '<script>'` EXECUTES the script, so tool tokens
+ *  inside it ARE executed (pass-through); WITHOUT -c the first non-option token
+ *  is a script FILE whose args are data, so `bash eslint` must NOT credit lint
+ *  (Codex P2 #3657945044). Bash usage: `[-bc...] [-c command_string | file]`.
+ *  A clustered short flag (-lc, -ic) carries -c; a long option (--login) does
+ *  not, so the scan stops at the first non-option token (the string/file). */
+function shellHasC(tokens, shellIdx) {
+  for (let j = shellIdx + 1; j < tokens.length; j++) {
+    if (/^-[^-]*c/.test(tokens[j])) return true;
+    if (!tokens[j].startsWith("-")) break;
   }
   return false;
 }
