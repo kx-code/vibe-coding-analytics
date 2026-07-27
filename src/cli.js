@@ -91,7 +91,7 @@ function analyzeProject(cwd) {
     roots.some((root) => [...filesByRoot.get(root)].some((file) => file.startsWith(prefix)));
 
   const packageJson = readJson(path.join(cwd, "package.json"));
-  const scripts = collectAllScripts(cwd, allFiles);
+  const { flat: scripts, byName: workspaceScripts } = collectAllScripts(cwd, allFiles);
   const shape = detectShape(cwd, packageJson);
   const untrackedHarness = untrackedHarnessFiles(cwd, allFiles);
 
@@ -100,7 +100,7 @@ function analyzeProject(cwd) {
 
   const numberedRules = countNumberedRules(roots);
   const ruleTrace = analyzeRuleTraceability(roots, allFiles, cwd);
-  const hooks = detectHooksConfig(roots, scripts);
+  const hooks = detectHooksConfig(roots, scripts, workspaceScripts);
   const isClaude = isClaudeCodeProject(allFiles);
   const hasFormatters = hasNodeFormattersAnywhere(roots);
   // N/A semantics: a check that does not apply to this project should neither
@@ -277,7 +277,7 @@ function analyzeProject(cwd) {
   }
   const score = total === 0 ? 100 : Math.round((earned / total) * 100);
   const warnings = detectWarnings(checks);
-  return { cwd, shape, roots, files: allFiles, packageJson, scripts, checks, score, warnings, untrackedHarness };
+  return { cwd, shape, roots, files: allFiles, packageJson, scripts, workspaceScripts, checks, score, warnings, untrackedHarness };
 }
 
 /** Surface false-safety combinations (grounded in SKILL.md Red Flags). */
@@ -451,17 +451,26 @@ function detectShape(cwd, packageJson) {
   return "single project";
 }
 
-/** Merge scripts from every package.json in the tree (root + nested subpackages). */
+/** Merge scripts from every package.json in the tree (root + nested subpackages).
+ *  Returns the flat merged `scripts` map (last-write-wins across packages) AND a
+ *  `byName` map keyed by each package's `name` — the identity `npm run
+ *  --workspace <name>` uses to select a specific package, so a workspace-scoped
+ *  script invocation can be resolved against THAT package's scripts rather than
+ *  the flattened value (which belongs to whichever manifest was visited last). */
 function collectAllScripts(cwd, allFiles) {
-  const scripts = {};
+  const flat = {};
+  const byName = {};
   for (const file of allFiles) {
     if (file.includes("node_modules/")) continue;
     if (file === "package.json" || file.endsWith("/package.json")) {
       const pkg = readJson(path.join(cwd, file));
-      if (pkg && pkg.scripts) Object.assign(scripts, pkg.scripts);
+      if (pkg && pkg.scripts) {
+        Object.assign(flat, pkg.scripts);
+        if (typeof pkg.name === "string" && pkg.name) byName[pkg.name] = pkg.scripts;
+      }
     }
   }
-  return scripts;
+  return { flat, byName };
 }
 
 function anyMakefileTarget(roots, targets) {
@@ -784,7 +793,12 @@ const DANGEROUS_CMD_RE = new RegExp(
       // but accepts `.`, `/`, space, or end-of-line, so the bare verb (`mkfs`,
       // `TRUNCATE TABLE`) AND the `mkfs.ext4` filesystem-type suffix still match.
       "mkfs(?![\\w-])",
-      "dd\\s+if",
+      // dd is destructive when it WRITES to a block device (`dd of=/dev/sda`,
+      // `dd if=/dev/zero of=/dev/sda`); `if=` is optional (stdin default) and a
+      // read-only `dd if=/dev/sda` is not irreversible. Match the device OUTPUT
+      // operand wherever it appears, so the guard is not satisfied by a deny
+      // entry that only blocks the `if=` form.
+      "dd\\s+.*?\\bof\\s*=\\s*\\/dev\\/",
       "drop\\s+(?:table|database)",
       "truncate(?![\\w-])",
       // SQL reaches the DB through a client, not as a bare command: block the
@@ -948,19 +962,38 @@ const SHORT_WRITE_FLAG_RE = /(?:^|\s)-w(?=\s|$)/;
  *  flag buried one indirection down is still seen. A `seen` set guards against
  *  cycles (`"a": "npm run b"`, `"b": "npm run a"`). Returns null when the script
  *  name is absent from the map (body opaque/unknown) — callers then fall back to
- *  the opaque-trust heuristic rather than guessing. */
-function resolveScriptBody(invocation, scripts, seen) {
-  const m = PM_SCRIPT_RE.exec(String(invocation || ""));
+ *  the opaque-trust heuristic rather than guessing.
+ *
+ *  When the invocation carries a `-w`/`--workspace <name>` selector, the body is
+ *  resolved from THAT package's scripts (`workspaceScripts[name]`) instead of the
+ *  flat merged map: the flat value is last-write-wins across packages, so without
+ *  scoping a workspace that runs `prettier --check` is misread as another
+ *  workspace's `prettier --write` and falsely credited as format-on-save. The
+ *  scope carries through the chain (a workspace's `format` -> its own `_fmt`),
+ *  and a selector whose package is absent from the map falls back to the flat map
+ *  rather than guessing. */
+function resolveScriptBody(invocation, scripts, seen, workspaceScripts) {
+  const s = String(invocation || "");
+  const m = PM_SCRIPT_RE.exec(s);
   if (!m) return null;
   const name = m[1];
   if (!name || seen.has(name)) return null;
-  const body = scripts ? scripts[name] : undefined;
+  // `-w`/`--workspace` are npm/pnpm/yarn's package selector (documented in
+  // `npm run --help`); `[ =]` covers the space and `=` spellings. Bounded by
+  // whitespace so it does not fire mid-token, and `-w` alone (no value) leaves
+  // wsName undefined -> flat fallback.
+  const ws = s.match(/(?:^|\s)(?:--workspace|-w)[ =](\S+)/);
+  const wsName = ws && ws[1];
+  const scope = wsName && workspaceScripts && workspaceScripts[wsName]
+    ? workspaceScripts[wsName]
+    : scripts;
+  const body = scope ? scope[name] : undefined;
   if (typeof body !== "string" || body.trim() === "") return null;
   seen.add(name);
-  return PM_SCRIPT_RE.test(body) ? resolveScriptBody(body, scripts, seen) : body;
+  return PM_SCRIPT_RE.test(body) ? resolveScriptBody(body, scope, seen, workspaceScripts) : body;
 }
 
-function commandPurposes(cmd, scripts) {
+function commandPurposes(cmd, scripts, workspaceScripts) {
   let c = String(cmd || "");
   // Drop the FULL argument list of echo/printf — status text such as
   // 'lint and format complete' OR unquoted `echo lint && echo format`. Their
@@ -1005,8 +1038,8 @@ function commandPurposes(cmd, scripts) {
       // it writes unless the invocation line itself signals check-only by name
       // (`format:check`) or flag. The body is classified recursively so a script
       // that chains to prettier --write (or --check) is followed all the way down.
-      const body = resolveScriptBody(seg, scripts || {}, new Set());
-      if (body != null) return commandPurposes(body, scripts).includes("format");
+      const body = resolveScriptBody(seg, scripts || {}, new Set(), workspaceScripts);
+      if (body != null) return commandPurposes(body, scripts, workspaceScripts).includes("format");
       return !(FORMAT_CHECK_RE.test(seg) && !FORMAT_WRITE_RE.test(seg));
     }
     // Direct binary call: require an explicit write flag. prettier writes to
@@ -1032,7 +1065,7 @@ function commandPurposes(cmd, scripts) {
  *  could not repair either half. Scoping to the primary keeps the check honest
  *  (split coverage reports MISS) and the repair working (the missing purpose is
  *  scaffolded at the primary). */
-function detectHooksConfig(roots, scripts) {
+function detectHooksConfig(roots, scripts, workspaceScripts) {
   const primary = roots?.[0];
   const settings = primary ? readJson(path.join(primary, ".claude", "settings.json")) : null;
   const local = primary ? readJson(path.join(primary, ".claude", "settings.local.json")) : null;
@@ -1057,7 +1090,7 @@ function detectHooksConfig(roots, scripts) {
       // wide matcher entry may carry a lint hook AND a format hook, and a
       // quoted status echo inside one command must not flip the other purpose.
       for (const h of entry.hooks || []) {
-        for (const purpose of commandPurposes(h?.command, scripts)) {
+        for (const purpose of commandPurposes(h?.command, scripts, workspaceScripts)) {
           if (purpose === "lint") postToolUseLint = true;
           else if (purpose === "format") postToolUseFormat = true;
         }
@@ -1370,6 +1403,12 @@ function defaultDenyList(report) {
     "Bash(git push * --force)",
     "Bash(git push * -f)",
     "Bash(git reset --hard:*)",
+    // Git accepts the revision BEFORE the mode (`git reset HEAD~1 --hard`), which
+    // does not start with the `git reset --hard` prefix above and so bypasses it
+    // while still discarding index and working-tree changes. A lone `*` spans the
+    // revision — the same mechanism `git push * --force` uses for a flag placed
+    // after the refspec — so this catches `--hard` in either position.
+    "Bash(git reset * --hard:*)",
     // git clean needs only -f to delete untracked files irreversibly (git refuses
     // without it; -d merely adds directories). Claude Code prefix-matches the
     // LITERAL spelling, so every force spelling must be scaffolded — `git clean
@@ -1381,7 +1420,14 @@ function defaultDenyList(report) {
     "Bash(git clean --force:*)",
     "Bash(sudo rm:*)",
     "Bash(mkfs:*)",
-    "Bash(dd if=:*)",
+    "Bash(dd of=/dev/:*)",
+    // dd may carry an `if=` (or other operands) BEFORE `of=`, e.g.
+    // `dd if=/dev/zero of=/dev/sda`, which does not start with `dd of=/dev/` and
+    // so bypasses the prefix entry above. A lone `*` spans the leading operands
+    // (same mechanism as `git push * --force`), blocking the device write
+    // regardless of argument order. `if=` alone is a non-destructive read and is
+    // intentionally NOT blocked.
+    "Bash(dd * of=/dev/:*)",
     "Bash(> /dev/sd:*)",
     "Bash(:> *)",
     "Bash(curl * | sh)",
@@ -1471,7 +1517,7 @@ function packageManagerExecutor(pm) {
 function claudeHooksSettings(report) {
   const roots = report.roots;
   if (!hasNodeFormattersAnywhere(roots)) return null;
-  const { postToolUseLint, postToolUseFormat } = detectHooksConfig(roots, report.scripts);
+  const { postToolUseLint, postToolUseFormat } = detectHooksConfig(roots, report.scripts, report.workspaceScripts);
   if (postToolUseLint && postToolUseFormat) return null;
   const exec = packageManagerExecutor(detectPackageManager(report.cwd, report.packageJson));
   // Emit only the formatter purpose(s) not already satisfied in EITHER settings
@@ -1657,7 +1703,7 @@ function buildInitFiles(report) {
       files.push(file(".claude/settings.local.json", claudePermissionsLocal(report), mergePermissionsLocal));
     }
     const hooksContent = claudeHooksSettings(report);
-    if (hooksContent) files.push(file(".claude/settings.json", hooksContent, (existing, incoming) => mergeHooksSettings(existing, incoming, report.scripts)));
+    if (hooksContent) files.push(file(".claude/settings.json", hooksContent, (existing, incoming) => mergeHooksSettings(existing, incoming, report.scripts, report.workspaceScripts)));
   }
   return files;
 }
@@ -1783,7 +1829,7 @@ function buildEvolutionFiles(report, plan) {
       files.push(file(".claude/settings.local.json", claudePermissionsLocal(report), mergePermissionsLocal));
     }
     const hooksContent = claudeHooksSettings(report);
-    if (hooksContent) files.push(file(".claude/settings.json", hooksContent, (existing, incoming) => mergeHooksSettings(existing, incoming, report.scripts)));
+    if (hooksContent) files.push(file(".claude/settings.json", hooksContent, (existing, incoming) => mergeHooksSettings(existing, incoming, report.scripts, report.workspaceScripts)));
   }
   return files;
 }
@@ -1796,7 +1842,7 @@ function file(relativePath, content, merge) {
  *  unrelated user settings. Dedupes commands within the Edit|Write matcher.
  *  Used as the `merge` strategy so `evolve --write` backfills hooks even when
  *  settings.json already exists with user content. */
-function mergeHooksSettings(existingContent, incomingContent, scripts) {
+function mergeHooksSettings(existingContent, incomingContent, scripts, workspaceScripts) {
   const existing = JSON.parse(existingContent);
   const incoming = JSON.parse(incomingContent);
   existing.hooks ??= {};
@@ -1832,14 +1878,14 @@ function mergeHooksSettings(existingContent, incomingContent, scripts) {
       // detection" and "already merged" stay consistent.
       const coveredPurposes = new Set();
       for (const h of existingEntry.hooks) {
-        for (const purpose of commandPurposes(h?.command, scripts)) coveredPurposes.add(purpose);
+        for (const purpose of commandPurposes(h?.command, scripts, workspaceScripts)) coveredPurposes.add(purpose);
       }
       for (const h of entry.hooks || []) {
         if (!h?.command || knownCmds.has(h.command)) continue;
         // A combined command (e.g. `npm run lint && npm run format`) carries
         // multiple purposes; only skip it when EVERY purpose it serves is
         // already covered, otherwise an uncovered purpose would go unscaffolded.
-        const purposes = commandPurposes(h.command, scripts);
+        const purposes = commandPurposes(h.command, scripts, workspaceScripts);
         if (purposes.length && purposes.every((p) => coveredPurposes.has(p))) continue;
         existingEntry.hooks.push(h);
         knownCmds.add(h.command);

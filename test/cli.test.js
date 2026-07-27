@@ -3188,3 +3188,122 @@ test("evolve --write does not append a redundant formatter when an existing `npm
   const cmds = (entry.hooks || []).map((h) => h.command);
   assert.ok(!cmds.some((c) => /prettier --write --ignore-unknown/.test(c)), "no scaffold prettier appended (`npm run format` -> prettier --write already covers format)");
 });
+
+// ---- Codex round 14: destructive dd output operand, hard-reset flag order, workspace script scope (PR #16) ----
+
+test("Dangerous-command guard recognizes dd writing to a block device, and no longer accepts the read-only if= form (Codex P1)", () => {
+  // `dd if=:*` only blocked the (non-destructive, read) `if=` form; the truly
+  // irreversible operation is WRITING to a device (`dd of=/dev/sda`,
+  // `dd if=/dev/zero of=/dev/sda`), which bypassed the old guard while detection
+  // reported protection installed. Each device-write variant must now satisfy it.
+  for (const variant of ["Bash(dd of=/dev/:*)", "Bash(dd * of=/dev/:*)"]) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-deny-dd-"));
+    fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+    fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+    fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({ permissions: { deny: [variant] } }));
+    const r = analyzeForTest(dir);
+    const guard = r.checks.find((c) => c.area === "Dangerous-command guard");
+    assert.ok(guard && guard.ok, `${variant} must satisfy the dangerous-command guard (destructive dd device write)`);
+  }
+  // The old `if=`-only entry must NO LONGER satisfy the guard: it blocks only a
+  // read, leaving the destructive `of=/dev/` form unguarded.
+  const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), "vca-deny-dd-old-"));
+  fs.writeFileSync(path.join(dir2, "CLAUDE.md"), "# x\n");
+  fs.mkdirSync(path.join(dir2, ".claude"), { recursive: true });
+  fs.writeFileSync(path.join(dir2, ".claude", "settings.json"), JSON.stringify({ permissions: { deny: ["Bash(dd if=:*)"] } }));
+  const guard2 = analyzeForTest(dir2).checks.find((c) => c.area === "Dangerous-command guard");
+  assert.ok(guard2 && !guard2.ok, "`dd if=:*` (read-only) must NOT satisfy the guard anymore");
+});
+
+test("init --write scaffolds dd device-write deny entries, not the read-only if= form (Codex P1)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-init-dd-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo" }));
+  await runCli(["init", "--cwd", dir, "--write"]);
+  const local = fs.readFileSync(path.join(dir, ".claude", "settings.local.json"), "utf8");
+  assert.ok(/Bash\(dd of=\/dev\/:\*\)/.test(local), "deny list blocks dd of=/dev/ (device write, of-first)");
+  assert.ok(/Bash\(dd \* of=\/dev\/:\*\)/.test(local), "deny list blocks dd with operands before of=/dev/ (e.g. dd if=/dev/zero of=/dev/sda)");
+  assert.ok(!/Bash\(dd if=:\*\)/.test(local), "deny list no longer blocks the non-destructive dd if= read form");
+});
+
+test("Dangerous-command guard recognizes `git reset HEAD~1 --hard` and scaffolds it (Codex P1)", () => {
+  // `git reset --hard:*` is prefix-only, so `git reset HEAD~1 --hard` (revision
+  // before the flag — accepted by Git, equally destructive) bypassed it. The
+  // middle-wildcard entry must satisfy the guard, and init must scaffold it.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-deny-reset-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({ permissions: { deny: ["Bash(git reset * --hard:*)"] } }));
+  const r = analyzeForTest(dir);
+  const guard = r.checks.find((c) => c.area === "Dangerous-command guard");
+  assert.ok(guard && guard.ok, "`git reset * --hard:*` must satisfy the guard (covers `git reset HEAD~1 --hard`)");
+});
+
+test("init --write scaffolds git reset covering the revision before --hard (Codex P1)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-init-reset-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo" }));
+  await runCli(["init", "--cwd", dir, "--write"]);
+  const local = fs.readFileSync(path.join(dir, ".claude", "settings.local.json"), "utf8");
+  assert.ok(/Bash\(git reset \* --hard:\*\)/.test(local), "deny list covers `git reset HEAD~1 --hard` (revision before --hard)");
+});
+
+test("Agent hooks honor `--workspace a` and resolve its check-only format as a MISS (Codex P2)", () => {
+  // Two workspaces both define `format`: `a` is check-only, `b` writes. The flat
+  // merged map is last-write-wins, so without honoring the selector the hook for
+  // `a` was misread as `b`'s writer and falsely credited as format-on-save.
+  // `npm run format --workspace a` must resolve a's check-only body -> MISS.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-scripts-wsa-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({
+    name: "root", scripts: {}, workspaces: ["packages/*"],
+    devDependencies: { prettier: "*", eslint: "*" },
+  }));
+  fs.mkdirSync(path.join(dir, "packages", "a"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "packages", "a", "package.json"), JSON.stringify({
+    name: "a", scripts: { format: "prettier --check ." },
+  }));
+  fs.mkdirSync(path.join(dir, "packages", "b"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "packages", "b", "package.json"), JSON.stringify({
+    name: "b", scripts: { format: "prettier --write ." },
+  }));
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({
+    hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [
+      { type: "command", command: "npm run format --workspace a" },
+      { type: "command", command: "npx eslint --no-warn-ignored {}" },
+    ] }] },
+  }));
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  assert.equal(hooks.ok, false, "`npm run format --workspace a` -> a's prettier --check is check-only -> format MISS (was falsely PASS via flat last-wins map)");
+});
+
+test("Agent hooks credit format-on-save for `--workspace b` whose format writes (Codex P2)", () => {
+  // Same monorepo; the selector picks b's writer this time, proving resolution
+  // follows the selector in BOTH directions (not hard-coded to one workspace).
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-scripts-wsb-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({
+    name: "root", scripts: {}, workspaces: ["packages/*"],
+    devDependencies: { prettier: "*", eslint: "*" },
+  }));
+  fs.mkdirSync(path.join(dir, "packages", "a"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "packages", "a", "package.json"), JSON.stringify({
+    name: "a", scripts: { format: "prettier --check ." },
+  }));
+  fs.mkdirSync(path.join(dir, "packages", "b"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "packages", "b", "package.json"), JSON.stringify({
+    name: "b", scripts: { format: "prettier --write ." },
+  }));
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({
+    hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [
+      { type: "command", command: "npm run format --workspace b" },
+      { type: "command", command: "npx eslint --no-warn-ignored {}" },
+    ] }] },
+  }));
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  assert.ok(hooks && hooks.ok, "`npm run format --workspace b` -> b's prettier --write credits format-on-save");
+});
