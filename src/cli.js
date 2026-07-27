@@ -457,6 +457,14 @@ function detectShape(cwd, packageJson) {
  *  specific package, so a workspace-scoped script invocation can be resolved
  *  against THAT package's scripts rather than the flattened value.
  *
+ *  The `byName` map is ALSO keyed by each member's DIRECTORY path (relative to
+ *  cwd, e.g. `packages/a`): npm's `--workspace` selector accepts a PATH form
+ *  (`--workspace packages/a`, npm run --help), not only a package name. Keyed by
+ *  name alone, a path selector missed `byName` and fell back to the flat
+ *  last-write-wins map — so `--workspace packages/a` (check-only formatter)
+ *  could resolve to another member's writer and false-PASS format-on-save. The
+ *  path key is normalized the same way the selector is (leading `./` stripped).
+ *
  *  The ROOT manifest is merged LAST so it wins the last-write-wins merge. An
  *  unscoped `npm run X` runs the ROOT package's script (npm run --help: `npm run
  *  <command>` with no --workspace selector runs in the current package), so the
@@ -476,6 +484,9 @@ function collectAllScripts(cwd, allFiles) {
       if (pkg && pkg.scripts) {
         Object.assign(flat, pkg.scripts);
         if (typeof pkg.name === "string" && pkg.name) byName[pkg.name] = pkg.scripts;
+        // Also key by member DIRECTORY (relative to cwd) so the `--workspace
+        // <path>` selector form resolves to THIS package rather than the flat map.
+        byName[file.slice(0, -"/package.json".length)] = pkg.scripts;
       }
     }
   }
@@ -484,6 +495,13 @@ function collectAllScripts(cwd, allFiles) {
     if (typeof rootPkg.name === "string" && rootPkg.name) byName[rootPkg.name] = rootPkg.scripts;
   }
   return { flat, byName };
+}
+
+/** Normalize a `--workspace` selector value for `byName` lookup. npm accepts a
+ *  package NAME or a member PATH (`packages/a`, `./packages/a`); strip a leading
+ *  `./` so the path form matches the directory key collectAllScripts records. */
+function normalizeWorkspaceKey(sel) {
+  return String(sel || "").replace(/^\.\/+/, "");
 }
 
 function anyMakefileTarget(roots, targets) {
@@ -1068,13 +1086,28 @@ function resolveScriptBody(invocation, scripts, seen, workspaceScripts) {
   // `-w`/`--workspace` are npm/pnpm/yarn's package selector (documented in
   // `npm run --help`); `[ =]` covers the space and `=` spellings. Bounded by
   // whitespace so it does not fire mid-token, and `-w` alone (no value) leaves
-  // wsName undefined -> flat fallback.
+  // wsName undefined -> flat fallback. The selector value is NORMALIZED (leading
+  // `./` stripped) before the byName lookup so the PATH form (`--workspace
+  // packages/a` / `./packages/a`) matches the directory key collectAllScripts
+  // records, not only the package-NAME form.
   const ws = s.match(/(?:^|\s)(?:--workspace|-w)[ =](\S+)/);
-  const wsName = ws && ws[1];
+  const wsName = ws ? normalizeWorkspaceKey(ws[1]) : null;
   const scope = wsName && workspaceScripts && workspaceScripts[wsName]
     ? workspaceScripts[wsName]
     : scripts;
   const body = scope ? scope[name] : undefined;
+  // Absent from the selected manifest -> OPAQUE (null), NOT a hard MISS. The
+  // caller's name-heuristic fallback (`LINT_CMD_RE`/`FORMAT_CMD_RE`) then trusts
+  // `npm run lint`/`npm run format` by NAME. This opaque-trust is INTENTIONAL,
+  // not a gap: a hook command that NAMES a lint/format script expresses the
+  // user's intent to lint/format, and the body may live where vca cannot fully
+  // resolve it (workspace member, generated script, custom runner). Erring toward
+  // trust avoids false-MISS noise that would make init/evolve append redundant
+  // racing hooks. A cycle (a -> b -> a) is also opaque: the seen-set terminates
+  // recursion and a leftover PM keyword signals opaque so the caller falls back
+  // rather than re-resolving infinitely. (Codex once proposed treating absent as
+  // a hard MISS; rejected because it conflicts with this documented trust policy
+  // — see the `npm run format` + scripts:{} PASS cases in cli.test.js.)
   if (typeof body !== "string" || body.trim() === "") return null;
   seen.add(name);
   if (!PM_SCRIPT_RE.test(body)) return body;

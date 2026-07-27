@@ -3120,6 +3120,10 @@ test("Agent hooks fall back to opaque-trust for an unresolvable/cyclic script (C
   //  (a) `npm run format` whose body is absent from every package.json — we cannot
   //      see the body, so trust the script name (opaque-trust), same as before.
   //  (b) a cycle `a -> b -> a` — resolveScriptBody's seen-set must terminate it.
+  // Opaque-trust (absent -> trust the NAME) is INTENTIONAL: a hook that names a
+  // lint/format script expresses intent, and the body may live where vca cannot
+  // resolve it. Rejecting absent as a hard MISS would false-FAIL the documented
+  // `npm run format` + scripts:{} PASS cases (see resolveScriptBody comment).
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-scripts-cycle-"));
   fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
   fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({
@@ -3138,6 +3142,42 @@ test("Agent hooks fall back to opaque-trust for an unresolvable/cyclic script (C
   const r = analyzeForTest(dir);
   const hooks = r.checks.find((c) => c.area === "Agent hooks");
   assert.ok(hooks && hooks.ok, "unresolvable `npm run format` + cyclic `npm run a` fall back to opaque-trust (no hang, no false MISS)");
+});
+
+test("Agent hooks: --workspace <member-path> resolves that member's script (Codex P2 #3655945495)", () => {
+  // npm's --workspace selector accepts a member PATH (`packages/a`, `./packages/a`)
+  // as well as a package NAME. Keyed by name alone, the path form missed byName
+  // and fell back to the flat merged map — so a check-only member could be
+  // shadowed by the root's (or another member's) writer and false-PASS. Now
+  // collectAllScripts also keys by member directory path. Here the root's format
+  // is a writer (wins the flat last-write-wins merge) but the selected member
+  // `packages/a` is check-only: the PATH selector must resolve to `a`, not flat.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-ws-path-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({
+    name: "root",
+    workspaces: ["packages/*"],
+    scripts: { format: "prettier --write ." },   // root writer -> wins flat merge
+    devDependencies: { prettier: "*", eslint: "*" },
+  }));
+  fs.mkdirSync(path.join(dir, "packages/a"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "packages/a/package.json"), JSON.stringify({
+    name: "a",
+    scripts: { format: "prettier --check ." },   // member a: check-only
+  }));
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({
+    hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [
+      { type: "command", command: "npm run format --workspace packages/a" },  // PATH selector -> a's check-only
+      { type: "command", command: "npx eslint --no-warn-ignored {}" },
+    ] }] },
+  }));
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  assert.ok(hooks, "Agent hooks check present");
+  // Path selector resolves to packages/a (check-only) -> format NOT satisfied,
+  // rather than flat-fallback to the root writer. Pre-fix this false-PASSed.
+  assert.equal(hooks.ok, false, "--workspace packages/a resolves to a's check-only formatter, not flat-fallback to the root writer");
 });
 
 test("init --write scaffolds a writing formatter when `npm run format` is check-only (Codex P2)", async () => {
