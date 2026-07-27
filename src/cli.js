@@ -1352,6 +1352,19 @@ function defaultDenyList(report) {
       "Bash(psql -c:*)",
       "Bash(psql -f:*)",
       "Bash(mysql -e:*)",
+      // An execute flag placed AFTER connection options — `psql -d prod -c
+      // 'DROP TABLE users'`, `mysql -h host -e 'TRUNCATE TABLE users'` — is
+      // NOT caught by the prefix-only entries above: Claude Code matches
+      // `Bash(psql -c:*)` as a literal prefix, so a -c/-f/-e that follows
+      // -d/-h/-U/-p/etc. slips past the guard, yet detection still reports
+      // the guard installed (the detector regex allows the flag anywhere, so
+      // the existing entry already satisfies it). A lone `*` spans the
+      // preceding arguments — the same mechanism `git push * --force` uses to
+      // catch a flag placed after the refspec — so these catch the execute
+      // flag in either position (flag-first OR flag-after-options).
+      "Bash(psql * -c:*)",
+      "Bash(psql * -f:*)",
+      "Bash(mysql * -e:*)",
       "Bash(prisma migrate reset:*)",
       "Bash(npx prisma migrate reset:*)",
     );

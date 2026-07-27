@@ -2389,7 +2389,7 @@ test("Dangerous-command guard recognizes SQL client / migration reset commands a
   // (prisma migrate reset), not as a bare command. Each must satisfy the guard;
   // init scaffolds them ONLY for DB projects (isDbProject), since a non-DB
   // project has nothing to DROP/TRUNCATE.
-  for (const variant of ["Bash(psql -c:*)", "Bash(psql -f:*)", "Bash(mysql -e:*)", "Bash(prisma migrate reset:*)"]) {
+  for (const variant of ["Bash(psql -c:*)", "Bash(psql -f:*)", "Bash(mysql -e:*)", "Bash(prisma migrate reset:*)", "Bash(psql * -c:*)", "Bash(psql * -f:*)", "Bash(mysql * -e:*)"]) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-deny-sql-var-"));
     fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
     fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
@@ -2420,6 +2420,13 @@ test("Dangerous-command guard recognizes SQL client / migration reset commands a
   assert.ok(/Bash\(mysql -e:\*\)/.test(dbLocal), "mysql -e scaffolded for DB project");
   assert.ok(/Bash\(prisma migrate reset:\*\)/.test(dbLocal), "prisma migrate reset scaffolded for DB project");
   assert.ok(/Bash\(npx prisma migrate reset:\*\)/.test(dbLocal), "npx prisma migrate reset scaffolded for DB project");
+  // Execute flag AFTER connection options must also be scaffolded: a prefix-only
+  // `psql -c:*` misses `psql -d prod -c 'DROP TABLE users'` (Claude Code matches
+  // it as a literal prefix), so the after-options form is required to actually
+  // block the destructive command at runtime.
+  assert.ok(/Bash\(psql \* -c:\*\)/.test(dbLocal), "psql * -c (flag after options) scaffolded for DB project");
+  assert.ok(/Bash\(psql \* -f:\*\)/.test(dbLocal), "psql * -f (flag after options) scaffolded for DB project");
+  assert.ok(/Bash\(mysql \* -e:\*\)/.test(dbLocal), "mysql * -e (flag after options) scaffolded for DB project");
   // Non-DB project: SQL / migration entries are NOT scaffolded.
   const webDir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-deny-sql-web-"));
   fs.writeFileSync(path.join(webDir, "CLAUDE.md"), "# x\n");
