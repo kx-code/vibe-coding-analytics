@@ -126,13 +126,13 @@ function analyzeProject(cwd) {
     ),
     check(
       "Single validation command",
-      Boolean(scripts.ci || scripts.validate) ||
+      Boolean(allScripts.ci || allScripts.validate) ||
         anyMakefileTarget(roots, ["ci", "validate", "test"]),
       "Add npm run ci/validate or a Makefile target that agents can run before completion.",
     ),
     check(
       "Typecheck",
-      Boolean(scripts["type-check"] || scripts.typecheck || scripts.lint) ||
+      Boolean(allScripts["type-check"] || allScripts.typecheck || allScripts.lint) ||
         hasAt("go.mod") ||
         hasAt("pubspec.yaml") ||
         hasAt("tsconfig.json") ||
@@ -236,7 +236,7 @@ function analyzeProject(cwd) {
     ),
     check(
       "Failure observability",
-      Boolean(scripts.monitor) || hasObservabilitySensor(allFiles),
+      Boolean(allScripts.monitor) || hasObservabilitySensor(allFiles),
       "Add monitoring/alerting (monitor scripts, health workflows, error counters) so critical-path failures surface instead of failing silently.",
     ),
     check(
@@ -509,11 +509,25 @@ function collectAllScripts(cwd, allFiles) {
   return { flat, byName, all };
 }
 
-/** Normalize a `--workspace` selector value for `byName` lookup. npm accepts a
- *  package NAME or a member PATH (`packages/a`, `./packages/a`); strip a leading
- *  `./` so the path form matches the directory key collectAllScripts records. */
+/** Normalize a `--workspace`/`--filter` selector value for `byName` lookup. npm
+ *  accepts a package NAME or a member PATH (`packages/a`, `./packages/a`); strip a
+ *  leading `./` so the path form matches the directory key collectAllScripts
+ *  records.
+ *
+ *  pnpm `--filter` (npm `--workspace` does NOT use these) appends modifiers that
+ *  are NOT part of the package name: a trailing `...` selects the package plus its
+ *  dependencies, a leading `...` selects it plus its dependents, and `^...`
+ *  selects direct dependencies only (pnpm --filter run --help). Strip them so the
+ *  BASE name/path resolves against byName; otherwise `pnpm --filter a... run
+ *  format` (which pnpm runs successfully) is rejected as an unknown workspace ->
+ *  false MISS + redundant scaffolding. Package names cannot contain `...`
+ *  (npm naming rules), so the strip is safe for npm/yarn selectors too.
+ *  (Codex P2 #3660031350) */
 function normalizeWorkspaceKey(sel) {
-  return String(sel || "").replace(/^\.\/+/, "");
+  return String(sel || "")
+    .replace(/^\.\/+/, "")
+    .replace(/\^?\.\.\.$/, "") // trailing `...` (pkg + deps) or `^...` (direct deps)
+    .replace(/^\.\.\./, ""); //  leading `...` (pkg + dependents)
 }
 
 function anyMakefileTarget(roots, targets) {

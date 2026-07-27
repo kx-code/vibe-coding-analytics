@@ -4310,6 +4310,55 @@ test("Agent hooks MISS when `npm --workspace <name>` targets a package not decla
   assert.ok(hooks2 && hooks2.ok, "`npm --workspace a run format` -> a is declared -> format PASS (control)");
 });
 
+test("Repository-wide inventory checks see scripts in workspace members, not only the root (Codex P2 #3660031344)", () => {
+  // After the collectAllScripts split, `scripts` is root-only (unscoped hook
+  // resolution). But presence checks that audit the WHOLE package tree —
+  // "Single validation command", "Typecheck", "Failure observability" — must use
+  // the full inventory, or a `ci`/`lint`/`monitor` script living only in a
+  // workspace member (root has none) wrongly reports MISS.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-inv-member-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({
+    name: "root", scripts: {}, workspaces: ["packages/*"],
+  }));
+  fs.mkdirSync(path.join(dir, "packages", "app"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "packages", "app", "package.json"), JSON.stringify({
+    name: "app", scripts: { ci: "node --test", lint: "eslint .", monitor: "node monitor.js" },
+  }));
+  const r = analyzeForTest(dir);
+  const byArea = Object.fromEntries(r.checks.map((c) => [c.area, c.ok]));
+  assert.ok(byArea["Single validation command"], "ci in a workspace member satisfies 'Single validation command'");
+  assert.ok(byArea.Typecheck, "lint in a workspace member satisfies 'Typecheck'");
+  assert.ok(byArea["Failure observability"], "monitor in a workspace member satisfies 'Failure observability'");
+});
+
+test("Agent hooks resolve `pnpm --filter <pkg>... run format` (pnpm filter-with-dependencies syntax) (Codex P2 #3660031350)", () => {
+  // pnpm `--filter <name>...` selects the named package AND its dependencies
+  // (pnpm --filter run --help); the trailing `...` is pnpm filter syntax, not part
+  // of the package name. The selector lookup must strip this modifier so the base
+  // name resolves, instead of fail-closing as an unknown workspace (false MISS).
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-pnpm-filter-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({
+    name: "root", scripts: {}, workspaces: ["packages/*"],
+    devDependencies: { prettier: "*", eslint: "*" },
+  }));
+  fs.mkdirSync(path.join(dir, "packages", "a"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "packages", "a", "package.json"), JSON.stringify({
+    name: "a", scripts: { format: "prettier --write ." },
+  }));
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({
+    hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [
+      { type: "command", command: "npx eslint --no-warn-ignored {}" },
+      { type: "command", command: "pnpm --filter a... run format" },
+    ] }] },
+  }));
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  assert.ok(hooks && hooks.ok, "`pnpm --filter a... run format` -> a's prettier --write -> format PASS");
+});
+
 test("Dangerous-command guard NOT N/A when a user-authored .claude/commands/ entry exists without CLAUDE.md (Codex P2)", () => {
   // isClaudeCodeProject recognized agents/ and skills/ but NOT custom slash
   // commands, so a project whose only Claude artifact was
