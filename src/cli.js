@@ -833,12 +833,12 @@ function denyEntryBlocksDangerousCommand(entry) {
   return DANGEROUS_CMD_RE.test(cmd);
 }
 
-/** Compile a Claude Code PostToolUse matcher into { catchAll, re }. Claude Code
- *  interprets the matcher field as a REGEX tested against the tool name. An
- *  empty matcher is a catch-all (fires on every tool); a /pattern/flags literal
- *  is unwrapped; an unparseable pattern returns null so callers fall back
- *  safely. Extracted so detection, merge, and the broad-matcher check share one
- *  compilation path instead of each reopening the regex. */
+/** Compile a Claude Code PostToolUse matcher into { catchAll, re }. An empty
+ *  matcher is a catch-all (fires on every tool); a /pattern/flags literal is
+ *  unwrapped; an unparseable pattern returns null so callers fall back safely.
+ *  Extracted so detection, merge, and the broad-matcher check share one
+ *  compilation path. This only COMPILES the regex — whether it "fires on" a tool
+ *  name uses exact-alternation-vs-regex semantics (see matcherFiresOn). */
 function compileMatcher(matcher) {
   let m = String(matcher ?? "").trim();
   if (m === "") return { catchAll: true, re: null };
@@ -855,32 +855,44 @@ function compileMatcher(matcher) {
   }
 }
 
-/** Classify a matcher by whether it fires on the Edit and Write tools. Compiled
- *  and tested against "Edit" and "Write" rather than split on "|" and compared
- *  as bare fragments, so anchored (`^(Edit|Write)$`) and delimited
- *  (`/Edit|Write/i`) forms are honored exactly like the bare alternation
- *  (`Edit|Write`) the scaffold emits. Returns "catch-all" (empty matcher, fires
- *  on every tool), "both" (non-empty regex matching Edit AND Write), or "no".
- *
- *  NotebookEdit|Write still does NOT cover Edit: as a regex, `NotebookEdit` is
- *  not a substring of the tool name "Edit", so the test fails — exact tool-name
- *  semantics are preserved. An unparseable regex falls back to "no" so detection
- *  never falsely PASSES. */
-function matcherCoverage(matcher) {
-  const compiled = compileMatcher(matcher);
-  if (!compiled) return "no";
-  if (compiled.catchAll) return "catch-all";
-  return compiled.re.test("Edit") && compiled.re.test("Write") ? "both" : "no";
-}
-
-/** True when a compiled matcher fires on a given tool name (a catch-all fires
- *  on every tool). Used to tell whether a matcher that covers Edit+Write is
- *  BROADER than edits — e.g. `.*` or `Edit|Write|Read` also fire on Read. */
+/** True when a matcher fires on a given tool name. A catch-all fires on every
+ *  tool. Otherwise matching follows Claude Code's documented matcher model
+ *  (code.claude.com/docs/en/hooks): a matcher is either an EXACT alternation of
+ *  tool names (only letters, digits, _, -, space, comma, |) or a regular
+ *  expression. For an exact alternation we match WHOLE tool names — `Edit|Write`
+ *  fires on Edit and Write ONLY, not on TodoWrite / NotebookEdit / MultiEdit
+ *  that merely contain those substrings (the docs describe `Edit|Write` as
+ *  firing on "only the Edit or Write tools"). A matcher containing any OTHER
+ *  regex metacharacter (^ $ . * + ? ( ) [ ] { } \ / : etc.) is the user's own
+ *  regex and is tested AS WRITTEN, so their anchors (`^(Edit|Write)$`) and
+ *  prefixes (`^mcp__`) stand. This matters for MERGE: a bare unanchored
+ *  `.test()` made `Edit|Write` fire on TodoWrite, so matcherIsEditWriteEntry
+ *  rejected the scaffolded entry and evolve duplicated it instead of merging. */
 function matcherFiresOn(matcher, toolName) {
   const compiled = compileMatcher(matcher);
   if (!compiled) return false;
   if (compiled.catchAll) return true;
+  const src = compiled.re.source;
+  // Exact-alternation charset per the Claude Code docs. Inside a character class
+  // `-` is literal at the tail and `|`/`,`/space are literal (not operators).
+  const isExactAlternation = /^[A-Za-z0-9_ ,|-]+$/.test(src) && src.trim() !== "";
+  if (isExactAlternation) {
+    return new RegExp("^(?:" + src + ")$").test(toolName);
+  }
   return compiled.re.test(toolName);
+}
+
+/** Classify a matcher by whether it fires on the Edit and Write tools, via the
+ *  shared matcherFiresOn primitive so exact-alternation and regex forms agree.
+ *  Returns "catch-all" (empty matcher, fires on every tool), "both" (non-empty
+ *  matcher firing on Edit AND Write), or "no". `NotebookEdit|Write` is "no"
+ *  (NotebookEdit does not equal Edit as a whole name); an unparseable regex
+ *  falls back to "no" so detection never falsely PASSES. */
+function matcherCoverage(matcher) {
+  const compiled = compileMatcher(matcher);
+  if (!compiled) return "no";
+  if (compiled.catchAll) return "catch-all";
+  return matcherFiresOn(matcher, "Edit") && matcherFiresOn(matcher, "Write") ? "both" : "no";
 }
 
 /** True when a PostToolUse matcher fires on BOTH Edit and Write. Used by
@@ -891,25 +903,38 @@ function matcherCoversEditWrite(matcher) {
   return c === "catch-all" || c === "both";
 }
 
-/** Tools a formatter/linter hook must NOT run after. Read carries a file_path
- *  but formatting on every read mutates the working tree needlessly; the others
- *  (Bash, Glob, Grep, Task) carry NO edited file_path, so an appended
- *  prettier/eslint hook misfires on the literal `{}` arg. Used to reject merge
- *  targets that cover edits but also fire on these. */
-const NON_EDIT_TOOLS = ["Read", "Bash", "Glob", "Grep", "Task"];
+/** PostToolUse tools whose payload carries `tool_input.file_path` and that we
+ *  want a formatter/linter to run after. A matcher is a safe MERGE target only
+ *  when it fires on a SUBSET of these: any other tool either carries no
+ *  file_path (so the appended `{}` hook runs on an empty arg and blocks) or is
+ *  needlessly broad (Read mutates the tree on every read). NotebookEdit edits
+ *  notebooks but exposes `notebook_path`, not `file_path`, so it is NOT here. */
+const FILE_EDIT_TOOLS = ["Edit", "Write", "MultiEdit"];
 
-/** True only for a NON-catch-all matcher scoped to edits — fires on both Edit
- *  and Write AND on nothing else. Used by MERGE: we append formatter hooks to
- *  an existing entry only when it is scoped to edits. Appending to a catch-all
- *  OR a broader matcher (`.*`, `Edit|Write|Read`, `Edit|Write|Bash`) would make
- *  prettier/eslint run after a non-edit tool — Read mutates the tree on every
- *  file read, and Bash/Glob/Grep/Task payloads carry no file_path so the hook
- *  fails on `{`. Such entries are preserved untouched and a separate Edit|Write
- *  entry is added instead. Detection (matcherCoversEditWrite) stays lenient — a
- *  broad matcher still COVERS edits — only the MERGE needs the stricter scope. */
+/** Every OTHER known Claude Code tool — the complement of FILE_EDIT_TOOLS.
+ *  matcherIsEditWriteEntry treats this as an ALLOWLIST: a matcher that fires on
+ *  ANY of these is rejected as a merge target, so `Edit|Write|WebFetch`,
+ *  `Edit|Write|WebSearch`, and `Edit|Write|NotebookEdit` are caught even though
+ *  none was named in a small banned list. A matcher covering an unknown future
+ *  non-edit tool would slip through — add such tools here when discovered. */
+const NON_FILE_EDIT_TOOLS = [
+  "Read", "Bash", "Glob", "Grep", "Task", "LS", "TodoWrite",
+  "WebFetch", "WebSearch", "NotebookEdit",
+];
+
+/** True only for a NON-catch-all matcher scoped to file edits — fires on both
+ *  Edit and Write AND on no tool outside FILE_EDIT_TOOLS. Used by MERGE: we
+ *  append formatter hooks to an existing entry only when it is scoped to file
+ *  edits. Appending to a catch-all OR a broader matcher (`.*`, `Edit|Write|Read`,
+ *  `Edit|Write|WebFetch`) would make prettier/eslint run after a tool whose
+ *  payload carries no file_path, so the hook fails on the literal `{` arg and
+ *  blocks after an unrelated tool use. Such entries are preserved untouched and
+ *  a separate Edit|Write entry is added instead. Detection
+ *  (matcherCoversEditWrite) stays lenient — a broad matcher still COVERS edits
+ *  — only the MERGE needs the stricter allowlist scope. */
 function matcherIsEditWriteEntry(matcher) {
   if (matcherCoverage(matcher) !== "both") return false;
-  return !NON_EDIT_TOOLS.some((tool) => matcherFiresOn(matcher, tool));
+  return !NON_FILE_EDIT_TOOLS.some((tool) => matcherFiresOn(matcher, tool));
 }
 
 /** Shared classification of a PostToolUse command's formatter purpose. Detection
@@ -1016,15 +1041,33 @@ function commandPurposes(cmd, scripts, workspaceScripts) {
   // set. Returning a single value left format undetected, and init/evolve then
   // appended a redundant prettier hook that ran the formatter twice per edit.
   const purposes = [];
-  if (LINT_CMD_RE.test(c)) purposes.push("lint");
+  // Split on shell conjunctions ONCE; lint and format are both classified per
+  // segment (and, for package-manager scripts, against the resolved body) rather
+  // than against the joined blob.
+  const segments = c.split(/\s*(?:&&|\|\||\||;)\s*/);
+  // Lint mirrors the format path below: resolve a package-manager script body
+  // before crediting lint. Otherwise `npm run lint` is credited purely because
+  // the invocation contains the word "lint", so a placeholder body
+  // (`"lint": "echo not configured"`) false-PASSes the Agent-hooks check and
+  // skips eslint scaffolding. Classify the resolved body; fall back to the
+  // invocation line only when the body is opaque (absent from every
+  // package.json we saw), so a real lint script we cannot see is still credited.
+  const lintSatisfied = segments.some((seg) => {
+    if (PM_SCRIPT_RE.test(seg)) {
+      const body = resolveScriptBody(seg, scripts || {}, new Set(), workspaceScripts);
+      if (body != null) return commandPurposes(body, scripts, workspaceScripts).includes("lint");
+      return LINT_CMD_RE.test(seg);
+    }
+    return LINT_CMD_RE.test(seg);
+  });
+  if (lintSatisfied) purposes.push("lint");
   // Determine the format purpose from the FORMATTER segment(s) only. A combined
   // command such as `eslint --fix . && prettier --check .` attaches --fix to the
   // LINTER; testing FORMAT_WRITE_RE against the whole string saw eslint's --fix
   // and treated prettier --check as write-enabled, false-PASSing the Agent-hooks
-  // check (Prettier never rewrote the file). Split on shell conjunctions and
-  // inspect each formatter segment's OWN flags: format counts when at least one
-  // formatter segment is not check-only.
-  const segments = c.split(/\s*(?:&&|\|\||\||;)\s*/);
+  // check (Prettier never rewrote the file). Inspect each formatter segment's
+  // OWN flags: format counts when at least one formatter segment is not
+  // check-only.
   const formatSatisfied = segments.some((seg) => {
     if (!FORMAT_CMD_RE.test(seg)) return false;
     if (PM_SCRIPT_RE.test(seg)) {

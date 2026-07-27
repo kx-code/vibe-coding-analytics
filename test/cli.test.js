@@ -3189,6 +3189,84 @@ test("evolve --write does not append a redundant formatter when an existing `npm
   assert.ok(!cmds.some((c) => /prettier --write --ignore-unknown/.test(c)), "no scaffold prettier appended (`npm run format` -> prettier --write already covers format)");
 });
 
+test("Agent hooks MISS when `npm run lint` resolves to a non-linting placeholder body (Codex P2)", () => {
+  // `npm run lint` was credited purely because the invocation contains "lint",
+  // so a placeholder body (`"lint": "echo not configured"`) false-PASSed the
+  // Agent-hooks check and skipped eslint scaffolding. Mirror the format path:
+  // resolve the script body and classify THAT — an `echo` body carries no
+  // linter, so lint is MISSING.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-scripts-lint-miss-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({
+    name: "demo",
+    scripts: { lint: "echo not configured" },
+    devDependencies: { prettier: "*", eslint: "*" },
+  }));
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({
+    hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [
+      { type: "command", command: "npm run lint" },
+      { type: "command", command: "npx prettier --write --ignore-unknown {}" },
+    ] }] },
+  }));
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  assert.equal(hooks.ok, false, "`npm run lint` -> echo placeholder does NOT lint -> lint MISS (was falsely PASS)");
+});
+
+test("Agent hooks PASS when `npm run lint` resolves to a real eslint body (Codex P2)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-scripts-lint-pass-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({
+    name: "demo",
+    scripts: { lint: "eslint ." },
+    devDependencies: { prettier: "*", eslint: "*" },
+  }));
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({
+    hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [
+      { type: "command", command: "npm run lint" },
+      { type: "command", command: "npx prettier --write --ignore-unknown {}" },
+    ] }] },
+  }));
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  assert.ok(hooks && hooks.ok, "`npm run lint` -> eslint . credits lint (body resolved, not just the invocation word)");
+});
+
+test("evolve --write does NOT merge hooks into a matcher that also fires on a non-edit tool (Codex P2)", async () => {
+  // `Edit|Write|WebFetch` covers edits BUT also fires on WebFetch, whose payload
+  // carries no file_path — appending a `{}` formatter/linter hook there would
+  // run it after a WebFetch and block on the empty arg. Such an entry must be
+  // preserved untouched and a separate Edit|Write entry added. The bare
+  // scaffolded `Edit|Write` must STILL be a merge target: it matches Edit/Write
+  // as WHOLE names, not the substring "TodoWrite"/"NotebookEdit", so evolve
+  // merges into it (covered by the merge-preserve tests above) instead of duping.
+  for (const broadMatcher of ["Edit|Write|WebFetch", "Edit|Write|WebSearch", "Edit|Write|NotebookEdit"]) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-merge-broad-"));
+    fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {}, devDependencies: { prettier: "*", eslint: "*" } }));
+    fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
+    fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, ".claude", "settings.json"),
+      JSON.stringify({
+        hooks: { PostToolUse: [{ matcher: broadMatcher, hooks: [
+          { type: "command", command: "prettier --write --ignore-unknown {}" },
+        ] }] },
+      }),
+    );
+    await runCli(["evolve", "--cwd", dir, "--write"]);
+    const merged = JSON.parse(fs.readFileSync(path.join(dir, ".claude", "settings.json"), "utf8"));
+    const entries = merged.hooks?.PostToolUse || [];
+    const broad = entries.find((e) => e.matcher === broadMatcher);
+    assert.ok(broad, `${broadMatcher}: original broad matcher entry preserved`);
+    const broadCmds = (broad.hooks || []).map((h) => h.command);
+    assert.ok(!broadCmds.some((c) => /eslint/.test(c)), `${broadMatcher}: scaffold eslint NOT appended into the broad matcher (it fires on a non-edit tool)`);
+    const editWrite = entries.find((e) => e.matcher === "Edit|Write");
+    assert.ok(editWrite, `${broadMatcher}: a separate Edit|Write entry was added for the missing lint purpose`);
+  }
+});
+
 // ---- Codex round 14: destructive dd output operand, hard-reset flag order, workspace script scope (PR #16) ----
 
 test("Dangerous-command guard recognizes dd writing to a block device, and no longer accepts the read-only if= form (Codex P1)", () => {
