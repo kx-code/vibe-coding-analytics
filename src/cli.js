@@ -2353,18 +2353,50 @@ function packageManagerExecutor(pm) {
  *  without a config. (Codex P1 #3659665368; root-scope tightening #3660108918) */
 function hasEslintConfig(report) {
   const ESLINT_CONFIG_RE = /(?:^|\/)(?:eslint\.config\.(?:js|mjs|cjs|ts|mts|cts)|\.eslintrc(?:\.js|\.cjs|\.mjs|\.json|\.ya?ml)?)$/i;
+  // TS flat configs (eslint.config.ts/.mts/.cts) are NOT natively loadable by ESLint;
+  // ESLint 9.10+ resolves them via jiti. Without jiti installed, `eslint <file>`
+  // errors ("Cannot find module 'jiti'") and the scaffolded PostToolUse `|| exit 2`
+  // would block every edit. Only credit a TS config when jiti is resolvable.
+  // JS/legacy configs always run. (Codex P1 #3663668184)
+  const ESLINT_TS_CONFIG_RE = /(?:^|\/)eslint\.config\.(?:ts|mts|cts)$/i;
+  const jitiResolvable = canResolveJiti(report);
   if (report.files) {
     for (const f of report.files) {
       // Root-level only: a config under a workspace member does NOT apply to root
       // or sibling-package files, so a root-level scaffolded eslint hook would error
       // (exit 2 -> blocking) on every non-member edit. File paths are relative with
       // `/` separators, so a root-level file has no separator. (Codex P1 #3660108918)
-      if (!f.includes("/") && ESLINT_CONFIG_RE.test(f)) return true;
+      if (f.includes("/") || !ESLINT_CONFIG_RE.test(f)) continue;
+      // TS flat config without jiti would error at runtime — skip it and keep
+      // scanning for a JS/legacy config that actually runs. (Codex P1 #3663668184)
+      if (ESLINT_TS_CONFIG_RE.test(f) && !jitiResolvable) continue;
+      return true;
     }
   }
   // Root inline `eslintConfig` only — member inline configs are out of scope for the
   // same reason (a root hook cannot use them). (Codex P1 #3660108918)
   if (Boolean(report.packageJson?.eslintConfig)) return true;
+  return false;
+}
+
+/** Whether ESLint can resolve jiti at runtime, which is required to load a TS flat
+ *  config (eslint.config.ts/.mts/.cts). jiti is resolvable when it is declared as a
+ *  dependency OR physically present in the root node_modules (npm/yarn hoist
+ *  transitive jiti; pnpm without hoisting does not, which is the correct
+ *  conservative answer). Failure-safe: when in doubt, returns false so a TS config
+ *  is NOT credited and the lint hook is not scaffolded (no blocking hook). (Codex
+ *  P1 #3663668184) */
+function canResolveJiti(report) {
+  const deps = report.packageJson?.dependencies || {};
+  const devDeps = report.packageJson?.devDependencies || {};
+  if (deps.jiti || devDeps.jiti) return true;
+  if (report.cwd) {
+    try {
+      if (fs.existsSync(path.join(report.cwd, "node_modules", "jiti", "package.json"))) return true;
+    } catch {
+      // fs access errors are conservative: treat jiti as unresolvable.
+    }
+  }
   return false;
 }
 

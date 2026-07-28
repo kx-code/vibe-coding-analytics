@@ -1675,12 +1675,33 @@ test("init --write scaffolds the eslint hook when an ESLint config exists (Codex
   assert.ok(/prettier/.test(cmds) && /\beslint\b/.test(cmds), "both prettier+eslint scaffolded when an ESLint config exists");
 });
 
-test("init --write scaffolds the eslint hook for a TypeScript flat config (eslint.config.ts) (Codex P2 #3663506858)", async () => {
+test("init --write scaffolds the eslint hook for a TypeScript flat config when jiti is resolvable (Codex P2 #3663506858 + P1 #3663668184)", async () => {
   // ESLint 9.10+ resolves `eslint.config.ts`/`.mts`/`.cts` via jiti. The old
   // regex only listed js|mjs|cjs, so hasEslintConfig returned false for a TS flat
   // config: init scaffolded prettier-only and the lint hook was never generated,
-  // so the next scan still reported Agent hooks missing.
+  // so the next scan still reported Agent hooks missing. #3663668184 tightens
+  // this further: a TS flat config is only credited when jiti is resolvable
+  // (declared as a dependency or present in node_modules), otherwise the
+  // scaffolded `eslint <file>` hook would error on every edit and block.
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-init-eslintcfg-ts-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({
+    name: "demo", scripts: {}, devDependencies: { prettier: "*", eslint: "*", jiti: "*" },
+  }));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
+  fs.writeFileSync(path.join(dir, "eslint.config.ts"), "export default [];\n");
+  await runCli(["init", "--cwd", dir, "--write"]);
+  const settings = JSON.parse(fs.readFileSync(path.join(dir, ".claude", "settings.json"), "utf8"));
+  const cmds = (settings.hooks?.PostToolUse || []).flatMap((e) => (e.hooks || []).map((h) => h.command)).join("\n");
+  assert.ok(/\beslint\b/.test(cmds), "eslint hook scaffolded for a TS flat config when jiti is declared");
+});
+
+test("init --write does NOT scaffold the eslint hook for a TS flat config when jiti is NOT resolvable (Codex P1 #3663668184)", async () => {
+  // Without jiti (neither declared as a dep nor resolvable in node_modules),
+  // ESLint cannot load `eslint.config.ts` at runtime: `eslint <file>` errors and
+  // the scaffolded PostToolUse `|| exit 2` would block every edit. hasEslintConfig
+  // must therefore NOT credit a TS flat config in that case — only prettier is
+  // scaffolded, matching the failure-safe behavior for a non-runnable lint config.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-init-eslintcfg-ts-nojiti-"));
   fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({
     name: "demo", scripts: {}, devDependencies: { prettier: "*", eslint: "*" },
   }));
@@ -1689,7 +1710,8 @@ test("init --write scaffolds the eslint hook for a TypeScript flat config (eslin
   await runCli(["init", "--cwd", dir, "--write"]);
   const settings = JSON.parse(fs.readFileSync(path.join(dir, ".claude", "settings.json"), "utf8"));
   const cmds = (settings.hooks?.PostToolUse || []).flatMap((e) => (e.hooks || []).map((h) => h.command)).join("\n");
-  assert.ok(/\beslint\b/.test(cmds), "eslint hook scaffolded for a TypeScript flat config (eslint.config.ts)");
+  assert.ok(/prettier/.test(cmds), "prettier still scaffolded without jiti");
+  assert.ok(!/\beslint\b/.test(cmds), "eslint hook NOT scaffolded for a TS flat config when jiti is unresolvable");
 });
 
 test("scaffolded hooks pass paths NUL-delimited via xargs -0 and skip unknown parsers (Codex P2)", async () => {
