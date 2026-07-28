@@ -152,8 +152,10 @@ for marketplace submission.
 - Agent hooks: `PostToolUse` on `Edit|Write` running eslint + prettier
   (format-on-save + lint-on-edit at edit time), plus a `permissions.deny`
   list blocking irreversible commands (`rm -rf`, `git push -f`, `git reset --hard`,
-  `curl | sh`, `DROP TABLE`, …). `vca init --write` scaffolds both for Claude Code projects;
-  the deny list gains `DROP TABLE` / `TRUNCATE TABLE` on database projects
+  `curl | sh`, `psql -c 'DROP TABLE …'`, …). `vca init --write` scaffolds both for Claude Code projects;
+  the deny list gains destructive-SQL entries (`psql *-c *DROP TABLE*`,
+  `mysql *-e *TRUNCATE*`, …) on database projects — matched inside the client
+  invocation, since the real command never starts with the bare keyword
 - Cross-session memory: ADR decisions, agent memory, or a decisions log
 - Self-evolution loops that promote repeated work into durable harness assets
 - Depth hints on passing checks (test-file / instruction-line / skill counts) so a stub is distinguishable from a mature project at the same score

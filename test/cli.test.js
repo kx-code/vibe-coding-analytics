@@ -1282,7 +1282,11 @@ test("init --write adds DROP TABLE deny for DB projects", async () => {
   await runCli(["init", "--cwd", dir, "--write"]);
   const local = fs.readFileSync(path.join(dir, ".claude", "settings.local.json"), "utf8");
   assert.ok(/DROP TABLE/.test(local), "DB project deny list includes DROP TABLE");
-  assert.ok(/TRUNCATE TABLE/.test(local), "DB project deny list includes TRUNCATE TABLE");
+  assert.ok(/TRUNCATE/.test(local), "DB project deny list includes TRUNCATE");
+  // Destructive SQL is matched INSIDE the client invocation (psql -c / mysql -e),
+  // not as a bare DROP/TRUNCATE executable — the literal-prefix form matches
+  // nothing real (Codex P1 #3660903603).
+  assert.ok(/psql \*-c \*DROP TABLE/.test(local), "DROP TABLE deny targets the psql -c client invocation");
 });
 
 test("evolve --write backfills hooks + deny list on a Claude Code project", async () => {
@@ -2830,7 +2834,7 @@ test("Dangerous-command guard recognizes SQL client / migration reset commands a
   // (prisma migrate reset), not as a bare command. Each must satisfy the guard;
   // init scaffolds them ONLY for DB projects (isDbProject), since a non-DB
   // project has nothing to DROP/TRUNCATE.
-  for (const variant of ["Bash(psql -c:*)", "Bash(psql -f:*)", "Bash(mysql -e:*)", "Bash(prisma migrate reset:*)", "Bash(psql * -c:*)", "Bash(psql * -f:*)", "Bash(mysql * -e:*)"]) {
+  for (const variant of ["Bash(psql -c:*)", "Bash(psql -f:*)", "Bash(mysql -e:*)", "Bash(prisma migrate reset:*)", "Bash(psql * -c:*)", "Bash(psql * -f:*)", "Bash(mysql * -e:*)", "Bash(psql *-c *DROP TABLE*)", "Bash(mysql *-e *TRUNCATE*)"]) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-deny-sql-var-"));
     fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
     fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
@@ -2899,9 +2903,12 @@ test("init routes broad SQL-client invocations through `ask`, hard-denying only 
     assert.ok(ask.includes(broad), `${broad} routed through ask (prompt), not hard-denied`);
     assert.ok(!deny.includes(broad), `${broad} must NOT be hard-denied (would block safe SELECT/migration runs)`);
   }
-  // Destructive keywords + unambiguous reset stay hard-denied.
-  assert.ok(deny.includes("Bash(DROP TABLE:*)"), "DROP TABLE stays hard-denied");
-  assert.ok(deny.includes("Bash(TRUNCATE TABLE:*)"), "TRUNCATE TABLE stays hard-denied");
+  // Destructive keywords are hard-denied via the CLIENT invocation that actually
+  // carries them (psql -c / mysql -e), not as a bare executable — a bare
+  // `Bash(DROP TABLE:*)` matches nothing real (Codex P1 #3660903603).
+  assert.ok(deny.includes("Bash(psql *-c *DROP TABLE*)"), "DROP TABLE via psql -c stays hard-denied");
+  assert.ok(deny.includes("Bash(mysql *-e *TRUNCATE*)"), "TRUNCATE via mysql -e stays hard-denied");
+  assert.ok(!deny.includes("Bash(DROP TABLE:*)"), "bare DROP TABLE executable form is NOT emitted (ineffective)");
   assert.ok(deny.includes("Bash(prisma migrate reset:*)"), "prisma migrate reset stays hard-denied");
   // Non-DB project: no SQL-client ask entries at all.
   const webDir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-sql-ask-web-"));
@@ -2910,6 +2917,47 @@ test("init routes broad SQL-client invocations through `ask`, hard-denying only 
   await runCli(["init", "--cwd", webDir, "--write"]);
   const webLocal = JSON.parse(fs.readFileSync(path.join(webDir, ".claude", "settings.local.json"), "utf8"));
   assert.deepEqual(webLocal.permissions?.ask || [], [], "non-DB project has no SQL-client ask entries");
+});
+
+test("SQL deny entries block the real client invocation, not a bare DROP/TRUNCATE executable (Codex P1 #3660903603)", async () => {
+  // Reproduction: a literal-prefix `Bash(DROP TABLE:*)` only blocks a nonexistent
+  // shell executable named DROP. The real destructive command runs as
+  // `psql -c 'DROP TABLE users'`, which starts with `psql` and so slipped past the
+  // deny into the weaker `ask` rules — a blind approval meant irreversible data
+  // loss. The deny must carry the keyword INSIDE the client invocation. We prove
+  // effectiveness with a minimal model of Claude Code's Bash(...) matching: `*` is
+  // the only wildcard and spans any run of characters (crossing argument
+  // boundaries, exactly as `git push * --force` spans a refspec); a trailing `:*`
+  // is the prefix-match suffix; everything else is literal.
+  function bashDenyMatches(entry, command) {
+    const m = String(entry).match(/^Bash\((.*)\)$/);
+    if (!m) return false;
+    let pat = m[1];
+    if (pat.endsWith(":*")) pat = pat.slice(0, -2) + "*";
+    // Split on `*` (the only wildcard), escape each literal segment, rejoin with
+    // `.*` — escaping first would turn `*` into `\*` and then `\.*` (literal dot).
+    const re = new RegExp("^" + pat.split("*").map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join(".*") + "$");
+    return re.test(command);
+  }
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-sql-deny-effective-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", dependencies: { prisma: "*" } }));
+  await runCli(["init", "--cwd", dir, "--write"]);
+  const local = JSON.parse(fs.readFileSync(path.join(dir, ".claude", "settings.local.json"), "utf8"));
+  const deny = local.permissions?.deny || [];
+  // Sanity-check the matcher: the OLD bare-keyword form demonstrably misses the
+  // real command (this is the bug).
+  assert.ok(!bashDenyMatches("Bash(DROP TABLE:*)", "psql -c 'DROP TABLE users'"), "model confirms bare DROP TABLE does not match the real client invocation");
+  // vca must NOT emit that ineffective bare form.
+  assert.ok(!deny.includes("Bash(DROP TABLE:*)"), "bare DROP TABLE executable form is not emitted (matches nothing real)");
+  // A destructive psql/mysql invocation IS blocked by some emitted deny entry —
+  // whether -c/-e is the first arg or follows connection options.
+  const dropCmd = "psql -d prod -c 'DROP TABLE users'";
+  const truncCmd = "mysql -h db -e 'TRUNCATE TABLE sessions'";
+  assert.ok(deny.some((e) => bashDenyMatches(e, dropCmd)), `some deny entry blocks \`${dropCmd}\` (keyword inside the client invocation)`);
+  assert.ok(deny.some((e) => bashDenyMatches(e, truncCmd)), `some deny entry blocks \`${truncCmd}\``);
+  // A SAFE query on the same clients is NOT hard-denied (it falls through to ask).
+  assert.ok(!deny.some((e) => bashDenyMatches(e, "psql -c 'SELECT 1'")), "safe psql -c SELECT is not hard-denied (routes through ask)");
 });
 
 test("evolve unions `ask` entries into an existing settings.local.json without dropping user rules (Codex P2 #3659221996)", async () => {
@@ -2931,7 +2979,7 @@ test("evolve unions `ask` entries into an existing settings.local.json without d
   const ask = local.permissions?.ask || [];
   assert.ok(ask.includes("Bash(my-tool:*)"), "user-authored ask rule preserved");
   assert.ok(ask.includes("Bash(psql -c:*)"), "psql -c ask entry merged in by evolve");
-  assert.ok(local.permissions?.deny?.includes("Bash(DROP TABLE:*)"), "destructive-keyword deny merged in by evolve");
+  assert.ok(local.permissions?.deny?.includes("Bash(psql *-c *DROP TABLE*)"), "destructive-SQL deny merged in by evolve");
 });
 
 test("Agent hooks MISS when a PostToolUse hook only echoes a lint/format status string (Codex P2)", () => {
@@ -4823,8 +4871,8 @@ test("init --write adds the SQL denies when a DB project's existing list omits t
   );
   await runCli(["init", "--cwd", dir, "--write"]);
   const local = JSON.parse(fs.readFileSync(path.join(dir, ".claude", "settings.local.json"), "utf8"));
-  assert.ok(local.permissions.deny.some((d) => /^Bash\(DROP TABLE/.test(d)), "DROP TABLE deny added for DB project (was missing)");
-  assert.ok(local.permissions.deny.some((d) => /^Bash\(TRUNCATE TABLE/.test(d)), "TRUNCATE TABLE deny added for DB project (was missing)");
+  assert.ok(local.permissions.deny.some((d) => /psql \*-c \*DROP TABLE/.test(d)), "DROP TABLE (via psql -c) deny added for DB project (was missing)");
+  assert.ok(local.permissions.deny.some((d) => /mysql \*-e \*TRUNCATE/.test(d)), "TRUNCATE (via mysql -e) deny added for DB project (was missing)");
   assert.ok(local.permissions.deny.some((d) => /prisma migrate reset/.test(d)), "prisma migrate reset deny added for DB project (was missing)");
 });
 

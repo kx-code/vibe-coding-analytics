@@ -2178,15 +2178,28 @@ export function defaultDenyList(report) {
   ];
   if (isDbProject(report)) {
     deny.push(
-      // Destructive SQL KEYWORDS and an unambiguous reset command are HARD-denied:
-      // they exist only to discard data. The bare-keyword entries are also what the
-      // dangerous-command detector keys on (denyEntryFamily → "sql-destructive"), so
-      // guard stays satisfied. (Broad SQL-CLIENT invocations that run arbitrary SQL
-      // — psql -c/-f, mysql -e — are routed through `ask` instead; see
-      // defaultAskList. Codex P2 #3659221996 / #3656905061.)
-      "Bash(DROP TABLE:*)",
-      "Bash(DROP DATABASE:*)",
-      "Bash(TRUNCATE TABLE:*)",
+      // Destructive SQL reaches the DB through a CLIENT (`psql -c`, `mysql -e`),
+      // never as a bare shell command. A literal-prefix `Bash(DROP TABLE:*)` only
+      // blocks a nonexistent executable named DROP, so the real
+      // `psql -c 'DROP TABLE users'` slipped past the deny into the weaker `ask`
+      // rules and could be blind-approved into irreversible data loss. Match the
+      // keyword INSIDE the client invocation instead: `*` is Claude Code's only
+      // wildcard and spans arguments (same mechanism as `git push * --force` /
+      // `dd * of=/dev/:*`), and there is no space between `*` and `-c` so a single
+      // entry catches `-c` whether it is the first arg (`psql -c '…'`) or follows
+      // connection options (`psql -d prod -c '…'` — `*` eats the intervening args).
+      // deny takes precedence over ask, so a destructive `psql -c 'DROP TABLE x'`
+      // is HARD-denied while a safe `psql -c 'SELECT 1'` (no keyword) still routes
+      // through `ask` (defaultAskList). `-f` (file) can't be inspected and stays
+      // ask-only. (Codex P1 #3660903603; ask routing is Codex P2 #3659221996 /
+      // #3656905061; denyEntryFamily still classifies these via the psql/mysql
+      // execute-flag regexes.)
+      "Bash(psql *-c *DROP TABLE*)",
+      "Bash(psql *-c *DROP DATABASE*)",
+      "Bash(psql *-c *TRUNCATE*)",
+      "Bash(mysql *-e *DROP TABLE*)",
+      "Bash(mysql *-e *DROP DATABASE*)",
+      "Bash(mysql *-e *TRUNCATE*)",
       // prisma migrate reset drops & recreates the dev database irreversibly — a
       // single, unambiguous destructive command, so it is hard-denied.
       "Bash(prisma migrate reset:*)",
