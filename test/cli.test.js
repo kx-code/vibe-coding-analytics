@@ -3111,6 +3111,34 @@ test("git push clustered force flags (-qf/-fq) are denied, not just standalone -
   assert.ok(!deny.some((e) => bashDenyMatches(e, "git push -q origin main")), "quiet-only push (-q, no force) is not blocked by a -f cluster entry");
 });
 
+test("sudo-wrapped device writes (mkfs/dd) are denied, not just their bare forms (Codex P1 #3663963739)", async () => {
+  // Claude Code deny patterns are literal-prefix globs, so `Bash(mkfs:*)` does NOT
+  // block `sudo mkfs.ext4 /dev/sda` (it does not start with `mkfs`). Only `sudo rm`
+  // had a sudo variant, so `sudo mkfs` / `sudo dd of=/dev/` destroyed a disk while
+  // denyGuardIsComplete still reported the guard complete. The scaffolded deny list
+  // must include sudo-wrapped device-write variants alongside the bare ones.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-sudo-device-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo" }));
+  await runCli(["init", "--cwd", dir, "--write"]);
+  const deny = JSON.parse(fs.readFileSync(path.join(dir, ".claude", "settings.local.json"), "utf8")).permissions?.deny || [];
+  for (const cmd of [
+    "sudo mkfs.ext4 /dev/sda",
+    "sudo mkfs /dev/sda1",
+    "sudo dd of=/dev/sda",
+    "sudo dd if=/dev/zero of=/dev/sda",
+  ]) {
+    assert.ok(deny.some((e) => bashDenyMatches(e, cmd)), `some deny entry blocks sudo device write \`${cmd}\``);
+  }
+  // A safe sudo read/listing must NOT be caught by the new device entries.
+  assert.ok(!deny.some((e) => bashDenyMatches(e, "sudo ls -la /")), "safe sudo listing is not blocked by a device-write entry");
+  // The default list itself emits the sudo device variants (so denyGuardIsComplete
+  // requires them and a guard lacking them is reported incomplete).
+  const list = defaultDenyList({ files: new Set(), packageJson: null, roots: [] });
+  assert.ok(list.includes("Bash(sudo mkfs:*)"), "defaultDenyList emits Bash(sudo mkfs:*)");
+  assert.ok(list.includes("Bash(sudo dd of=/dev/:*)"), "defaultDenyList emits Bash(sudo dd of=/dev/:*)");
+});
+
 test("evolve unions `ask` entries into an existing settings.local.json without dropping user rules (Codex P2 #3659221996)", async () => {
   // evolve backfills settings.local.json only when NO dangerous-command guard is
   // detected yet (permissionsDeny === false); in that case it must MERGE the ask
@@ -3333,6 +3361,29 @@ test("Agent hooks PASS when lint and format run inside a shell-wrapper quoted sc
   const r = analyzeForTest(dir);
   const hooks = r.checks.find((c) => c.area === "Agent hooks");
   assert.ok(hooks && hooks.ok, "a shell-wrapper script running lint+format must satisfy BOTH purposes");
+});
+
+test("Agent hooks PASS when lint and format run inside `bash -cl '...'` (c not last in the cluster) (Codex P2 #3663963745)", () => {
+  // Bash treats short flags in a cluster as order-independent: `-cl` and `-lc`
+  // BOTH mean login shell + `-c <script>`. isShortCFlag only matched `c` as the
+  // FINAL cluster char (`/c$/`), so `bash -cl '...'` was NOT recognized as a -c
+  // invocation: maskDataQuotes masked the quoted script to inert `quoteddata`,
+  // both purposes looked missing, and scan false-FAILED (init/evolve appended a
+  // duplicate hook). Align isShortCFlag with shellHasC, which recognizes `c`
+  // anywhere in the cluster.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-hooks-cl-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {}, devDependencies: { prettier: "*", eslint: "*" } }));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, ".claude", "settings.json"),
+    JSON.stringify({
+      hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [{ type: "command", command: "bash -cl 'npx prettier --write . && npx eslint .'" }] }] },
+    }),
+  );
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  assert.ok(hooks && hooks.ok, "`bash -cl '...lint+format...'` must satisfy BOTH purposes (c not last in cluster)");
 });
 
 test("Agent hooks MISS format when the formatter runs in check-only mode (Codex P2)", () => {

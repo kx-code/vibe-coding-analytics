@@ -1507,7 +1507,14 @@ function maskDataQuotes(cmd) {
   let out = "";
   let i = 0;
   const n = cmd.length;
-  const isShortCFlag = (s) => /^-[^-\s]*c$/.test(s);
+  // Recognize `c` ANYWHERE in a short-option cluster (`-c`, `-cl`, `-lc`, `-ic`),
+  // not just as the final char: Bash treats clustered short flags as
+  // order-independent, so `bash -cl '...'` and `bash -lc '...'` both run the
+  // quoted script. Anchoring at `c$` missed `-cl` (c not last), so maskDataQuotes
+  // masked the real script to inert `quoteddata` and both purposes false-MISSed.
+  // Aligned with shellHasC, which already matches `c` anywhere in the cluster.
+  // (Codex P2 #3663963745)
+  const isShortCFlag = (s) => /^-[^-\s]*c/.test(s);
   // A package-manager SELECTOR flag takes a single package-name/path token as its
   // value (`npm --workspace '@scope/app' run hooks`), never a shell script with
   // operators. Preserve that quoted value as a BARE token (drop the enclosing
@@ -2197,6 +2204,16 @@ export function defaultDenyList(report) {
     // regardless of argument order. `if=` alone is a non-destructive read and is
     // intentionally NOT blocked.
     "Bash(dd * of=/dev/:*)",
+    // sudo-wrapped device writes: Claude Code prefix-matches the LITERAL spelling,
+    // so `Bash(mkfs:*)` does NOT block `sudo mkfs.ext4 /dev/sda` (it does not start
+    // with `mkfs`). Only `sudo rm` had a sudo variant, so `sudo mkfs` / `sudo dd
+    // of=/dev/` could destroy a disk while denyGuardIsComplete still reported the
+    // guard complete. Emit sudo-wrapped variants so the scaffold blocks the
+    // privileged form too; denyEntryFamily strips a leading `sudo`, so these still
+    // classify as the device-write family. (Codex P1 #3663963739)
+    "Bash(sudo mkfs:*)",
+    "Bash(sudo dd of=/dev/:*)",
+    "Bash(sudo dd * of=/dev/:*)",
     "Bash(> /dev/sd:*)",
     "Bash(:> *)",
     // Pipe-to-shell download-and-execute. Claude Code treats the space in a Bash
