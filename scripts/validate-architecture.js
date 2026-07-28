@@ -9,7 +9,8 @@ const required = [
   "skills/vibe-coding-analytics/SKILL.md",
   "templates/claude/commands/analytics.md",
   "templates/claude/commands/init.md",
-  "templates/claude/commands/evolve.md"
+  "templates/claude/commands/evolve.md",
+  "templates/claude/commands/steer.md"
 ];
 
 const missing = required.filter((file) => !fs.existsSync(file));

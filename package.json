@@ -20,6 +20,7 @@
   "scripts": {
     "start": "node ./bin/vibe-coding-analytics.js",
     "analytics": "node ./bin/vibe-coding-analytics.js analytics",
+    "scan": "node ./bin/vibe-coding-analytics.js scan",
     "init": "node ./bin/vibe-coding-analytics.js init",
     "evolve": "node ./bin/vibe-coding-analytics.js evolve",
     "test": "node --test",
