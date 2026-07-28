@@ -2321,7 +2321,7 @@ function packageManagerExecutor(pm) {
  *  a workspace member. Prettier needs no gate: it ships sane defaults and runs
  *  without a config. (Codex P1 #3659665368; root-scope tightening #3660108918) */
 function hasEslintConfig(report) {
-  const ESLINT_CONFIG_RE = /(?:^|\/)(?:eslint\.config\.(?:js|mjs|cjs)|\.eslintrc(?:\.js|\.cjs|\.mjs|\.json|\.ya?ml)?)$/i;
+  const ESLINT_CONFIG_RE = /(?:^|\/)(?:eslint\.config\.(?:js|mjs|cjs|ts|mts|cts)|\.eslintrc(?:\.js|\.cjs|\.mjs|\.json|\.ya?ml)?)$/i;
   if (report.files) {
     for (const f of report.files) {
       // Root-level only: a config under a workspace member does NOT apply to root

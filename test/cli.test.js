@@ -1673,6 +1673,23 @@ test("init --write scaffolds the eslint hook when an ESLint config exists (Codex
   assert.ok(/prettier/.test(cmds) && /\beslint\b/.test(cmds), "both prettier+eslint scaffolded when an ESLint config exists");
 });
 
+test("init --write scaffolds the eslint hook for a TypeScript flat config (eslint.config.ts) (Codex P2 #3663506858)", async () => {
+  // ESLint 9.10+ resolves `eslint.config.ts`/`.mts`/`.cts` via jiti. The old
+  // regex only listed js|mjs|cjs, so hasEslintConfig returned false for a TS flat
+  // config: init scaffolded prettier-only and the lint hook was never generated,
+  // so the next scan still reported Agent hooks missing.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-init-eslintcfg-ts-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({
+    name: "demo", scripts: {}, devDependencies: { prettier: "*", eslint: "*" },
+  }));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
+  fs.writeFileSync(path.join(dir, "eslint.config.ts"), "export default [];\n");
+  await runCli(["init", "--cwd", dir, "--write"]);
+  const settings = JSON.parse(fs.readFileSync(path.join(dir, ".claude", "settings.json"), "utf8"));
+  const cmds = (settings.hooks?.PostToolUse || []).flatMap((e) => (e.hooks || []).map((h) => h.command)).join("\n");
+  assert.ok(/\beslint\b/.test(cmds), "eslint hook scaffolded for a TypeScript flat config (eslint.config.ts)");
+});
+
 test("scaffolded hooks pass paths NUL-delimited via xargs -0 and skip unknown parsers (Codex P2)", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-hooks-xargs-"));
   fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {}, devDependencies: { prettier: "*", eslint: "*" } }));
