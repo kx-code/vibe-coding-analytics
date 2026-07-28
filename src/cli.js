@@ -1496,6 +1496,14 @@ function maskDataQuotes(cmd) {
   let i = 0;
   const n = cmd.length;
   const isShortCFlag = (s) => /^-[^-\s]*c$/.test(s);
+  // A package-manager SELECTOR flag takes a single package-name/path token as its
+  // value (`npm --workspace '@scope/app' run hooks`), never a shell script with
+  // operators. Preserve that quoted value as a BARE token (drop the enclosing
+  // quotes, keep the content) so the downstream workspace lookup sees the real
+  // member name. Masking it to inert `quoteddata` (the data-branch default) made
+  // the lookup fail closed, so scan reported a real lint/format hook MISSING and
+  // init/evolve merged a duplicate that ran on every edit. (Codex P2 #3663506850)
+  const isSelectorFlag = (s) => /^(?:--workspace|--filter|--prefix|--dir|-w|-C|workspace)$/.test(s);
   const lastToken = (s) => {
     const t = String(s).trim().split(/\s+/);
     return t[t.length - 1] || "";
@@ -1510,9 +1518,13 @@ function maskDataQuotes(cmd) {
         j += 1;
       }
       // A shell -c script: keep the quotes so the later quote-strip exposes the
-      // real commands inside. Everything else is DATA: drop the content (and the
-      // enclosing quotes) for a placeholder that holds no operators.
+      // real commands inside. A PM selector value: emit the BARE content (no
+      // quotes) so the workspace lookup tokenizes it; the value is a single token
+      // with no shell operators, so no phantom segment can be exposed. Everything
+      // else is DATA: drop the content (and the enclosing quotes) for a placeholder
+      // that holds no operators.
       if (isShortCFlag(lastToken(out))) out += cmd.slice(i, j + 1);
+      else if (isSelectorFlag(lastToken(out))) out += " " + cmd.slice(i + 1, j) + " ";
       else out += " quoteddata ";
       i = j + 1;
       continue;

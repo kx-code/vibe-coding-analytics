@@ -2291,6 +2291,44 @@ test("Agent hooks detected when formatters live in an EXPLICIT (non-glob) worksp
   assert.equal(hooks.na, false, "explicit workspace member with formatters -> NOT N/A");
 });
 
+test("Agent hooks PASS for a quoted workspace selector `npm --workspace '@scope/app' run hooks` (Codex P2 #3663506850)", () => {
+  // maskDataQuotes replaced the quoted selector value `'@scope/app'` with inert
+  // `quoteddata` before the workspace lookup, so a real lint+format hook resolved
+  // through a workspace member was reported MISSING (init/evolve would merge a
+  // duplicate that ran on every edit). The selector value is a single
+  // package-name token with no shell operators, so it is preserved as a bare
+  // token for the lookup.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-quoted-ws-sel-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# root\n");
+  fs.writeFileSync(
+    path.join(dir, "package.json"),
+    JSON.stringify({ name: "root", workspaces: ["packages/*"] }),
+  );
+  fs.mkdirSync(path.join(dir, "packages", "app"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, "packages", "app", "package.json"),
+    JSON.stringify({
+      name: "@scope/app",
+      devDependencies: { prettier: "*", eslint: "*" },
+      scripts: { hooks: "eslint --fix . && prettier --write ." },
+    }),
+  );
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, ".claude", "settings.json"),
+    JSON.stringify({
+      hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [
+        { type: "command", command: "npm --workspace '@scope/app' run hooks" },
+      ] }] },
+    }),
+  );
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  assert.ok(hooks, "Agent hooks check present");
+  assert.equal(hooks.na, false, "workspace member with formatters -> not N/A");
+  assert.equal(hooks.ok, true, "quoted `--workspace '@scope/app'` selector resolves to the member's lint+format script");
+});
+
 test("Agent hooks detected when prettier and eslint are SPLIT across root and a workspace member (Codex P2)", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-fmt-ws-split-"));
   fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
