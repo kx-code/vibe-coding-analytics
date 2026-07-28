@@ -1278,6 +1278,8 @@ test("init --write scaffolds hooks + deny list for Claude Code projects", async 
   assert.ok(/Bash\(git push \* -f\)/.test(local), "deny list covers -f flag AFTER the refspec (git push origin main -f)");
   assert.ok(/Bash\(git push \* --force \*\)/.test(local), "deny list covers --force BETWEEN repo and refspec (git push origin --force main, Codex P1 #3656425150)");
   assert.ok(/Bash\(git push \* -f \*\)/.test(local), "deny list covers -f BETWEEN repo and refspec (git push origin -f main, Codex P1 #3656425150)");
+  assert.ok(/Bash\(git push -qf:\*\)/.test(local), "deny list covers clustered force -qf (git push -qf origin main, Codex P1 #3663668182)");
+  assert.ok(/Bash\(git push \* -qf \*\)/.test(local), "deny list covers clustered -qf BETWEEN repo and refspec (git push origin -qf main, Codex P1 #3663668182)");
 });
 
 test("init --write does NOT scaffold hooks for non-Claude-Code projects", async () => {
@@ -3058,6 +3060,33 @@ test("prisma migrate reset is denied through pnpm/yarn/bunx wrappers, not just n
   // Safe prisma subcommands are NOT denied.
   assert.ok(!deny.some((e) => bashDenyMatches(e, "pnpm exec prisma migrate dev")), "prisma migrate dev is not denied");
   assert.ok(!deny.some((e) => bashDenyMatches(e, "yarn prisma generate")), "prisma generate is not denied");
+});
+
+test("git push clustered force flags (-qf/-fq) are denied, not just standalone -f (Codex P1 #3663668182)", async () => {
+  // Git accepts clustered short options: `git push -qf origin main` (quiet+force)
+  // and `git push -fq origin main`. Claude Code deny patterns are literal globs,
+  // so a standalone-`-f` entry (`git push -f:*`) does not start with `git push -qf`,
+  // and `git push * -f` needs a standalone `-f` token — clustered `-qf`/`-fq`
+  // bypassed every entry, so denyGuardIsComplete reported the guard complete
+  // while a destructive force push remained allowed.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-push-cluster-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo" }));
+  await runCli(["init", "--cwd", dir, "--write"]);
+  const deny = JSON.parse(fs.readFileSync(path.join(dir, ".claude", "settings.local.json"), "utf8")).permissions?.deny || [];
+  for (const cmd of [
+    "git push -qf origin main",
+    "git push -fq origin main",
+    "git push origin main -qf",
+    "git push origin main -fq",
+    "git push origin -qf main",
+    "git push origin -fq main",
+  ]) {
+    assert.ok(deny.some((e) => bashDenyMatches(e, cmd)), `some deny entry blocks clustered force push \`${cmd}\``);
+  }
+  // A quiet-only push (`-q`, no force) must NOT be blocked by the new -f cluster
+  // entries — the cluster alphabet includes `q`, but `-q` alone has no `f`.
+  assert.ok(!deny.some((e) => bashDenyMatches(e, "git push -q origin main")), "quiet-only push (-q, no force) is not blocked by a -f cluster entry");
 });
 
 test("evolve unions `ask` entries into an existing settings.local.json without dropping user rules (Codex P2 #3659221996)", async () => {

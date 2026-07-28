@@ -856,7 +856,13 @@ const DANGEROUS_CMD_FAMILIES = [
   ] },
   // git-force-push
   { fam: "git-force-push", pats: [
-      "git\\s+push\\b.*?\\s(?:--force|-f)(?:\\s|$)",
+      // Force as a standalone flag (`-f`/`--force`) OR clustered with other git
+      // push short flags (`-qf`, `-fq`). The cluster `[fqvnutd]*f[fqvnutd]*` draws
+      // from git push's real short-flag alphabet (f/q/v/n/u/t/d) so a lone `-u`
+      // (set-upstream, no force) does not false-match, and the trailing
+      // `(?:\s|$)` requires whitespace/end AFTER the cluster so `--force-with-lease`
+      // (the safer, conditional variant) is NOT matched. (Codex P1 #3663668182)
+      "git\\s+push\\b.*?\\s(?:--force|-[fqvnutd]*f[fqvnutd]*)(?:\\s|$)",
   ] },
   // git-hard-reset
   { fam: "git-hard-reset", pats: [
@@ -2146,6 +2152,19 @@ export function defaultDenyList(report) {
     // the refspec that follows the flag, closing the bypass. (Codex P1 #3656425150)
     "Bash(git push * --force *)",
     "Bash(git push * -f *)",
+    // Clustered short-flag force: Git accepts `git push -qf origin main`
+    // (quiet+force) and `git push -fq origin main`, but Claude Code literal globs
+    // need each spelling — `git push -f:*` does not start with `git push -qf`, and
+    // `git push * -f` needs a standalone `-f` token. Cover the common quiet+force
+    // cluster (`-qf`/`-fq`) in all three flag positions (first / after refspec /
+    // between repo and refspec). Other clusters (`-vf`, 3+ flags) remain a
+    // literal-matching limitation, same as the rm clusters above. (Codex P1 #3663668182)
+    "Bash(git push -qf:*)",
+    "Bash(git push -fq:*)",
+    "Bash(git push * -qf)",
+    "Bash(git push * -fq)",
+    "Bash(git push * -qf *)",
+    "Bash(git push * -fq *)",
     "Bash(git reset --hard:*)",
     // Git accepts the revision BEFORE the mode (`git reset HEAD~1 --hard`), which
     // does not start with the `git reset --hard` prefix above and so bypasses it
