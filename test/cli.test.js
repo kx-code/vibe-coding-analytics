@@ -3386,6 +3386,31 @@ test("Agent hooks PASS when lint and format run inside `bash -cl '...'` (c not l
   assert.ok(hooks && hooks.ok, "`bash -cl '...lint+format...'` must satisfy BOTH purposes (c not last in cluster)");
 });
 
+test("Agent hooks PASS when the PostToolUse matcher is a case-insensitive regex `/edit|write/i` (Codex P2 #3664125019)", () => {
+  // matcherFiresOn rebuilds an exact-alternation regex with anchors to enforce
+  // whole-name matching, but dropped the compiled flags. A delimited matcher like
+  // `/edit|write/i` (compiled with the `i` flag) was rebuilt case-sensitive as
+  // `^(?:edit|write)$`, so neither `Edit` nor `Write` matched, detectHooksConfig
+  // skipped the entry, scan false-reported the hooks missing, and init/evolve
+  // appended duplicate lint/format hooks that run on every edit.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-hooks-ci-matcher-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {}, devDependencies: { prettier: "*", eslint: "*" } }));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, ".claude", "settings.json"),
+    JSON.stringify({
+      hooks: { PostToolUse: [{ matcher: "/edit|write/i", hooks: [
+        { type: "command", command: "npx prettier --write ." },
+        { type: "command", command: "npx eslint ." },
+      ] }] },
+    }),
+  );
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  assert.ok(hooks && hooks.ok, "a `/edit|write/i` matcher firing on Edit+Write must satisfy BOTH purposes");
+});
+
 test("Agent hooks MISS format when the formatter runs in check-only mode (Codex P2)", () => {
   // A check-mode formatter (`prettier --check`, `npm run format:check`) reports
   // drift but does NOT rewrite the file, so it does not honor the format-on-save

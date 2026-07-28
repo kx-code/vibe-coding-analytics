@@ -1007,7 +1007,11 @@ function matcherFiresOn(matcher, toolName) {
   // `-` is literal at the tail and `|`/`,`/space are literal (not operators).
   const isExactAlternation = /^[A-Za-z0-9_ ,|-]+$/.test(src) && src.trim() !== "";
   if (isExactAlternation) {
-    return new RegExp("^(?:" + src + ")$").test(toolName);
+    // Preserve the compiled flags (e.g. the `i` in `/edit|write/i`): rebuilding
+    // without them dropped case-insensitivity, so a delimited matcher like
+    // `/edit|write/i` matched neither `Edit` nor `Write`, scan reported the hooks
+    // missing, and init/evolve appended duplicates. (Codex P2 #3664125019)
+    return new RegExp("^(?:" + src + ")$", compiled.re.flags).test(toolName);
   }
   return compiled.re.test(toolName);
 }
