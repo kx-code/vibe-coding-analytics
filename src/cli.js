@@ -1269,6 +1269,12 @@ function parsePmInvocation(invocation) {
       if (prefix === null) prefix = t.slice(t.indexOf("=") + 1);
       i++; continue;
     }
+    // `--script-shell <path>` (npm/pnpm) takes a VALUE (the shell binary) but does
+    // NOT select a member or change where package.json is read — it only sets the
+    // shell used to run the script body. Consume the value so it is NOT misread as
+    // the script name (which would skip body resolution). (Codex P2 #3663668188)
+    if (t === "--script-shell") { i += 2; continue; }
+    if (/^--script-shell=/.test(t)) { i++; continue; }                            // inline (--script-shell=/bin/sh)
     if (t.startsWith("-")) { i++; continue; }                                     // boolean option
     return { name: t, ws, prefix, pm: pm[0], hasRun };                            // first bare token = command
   }

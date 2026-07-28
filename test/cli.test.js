@@ -5139,6 +5139,34 @@ test("Agent hooks MISS for `npm --workspace <root-name> run format`: npm rejects
   assert.equal(hooks.ok, false, "`npm --workspace <root-name>` must MISS: npm rejects selecting the root via --workspace");
 });
 
+test("Agent hooks MISS for `npm run --script-shell /bin/sh format` when that script is check-only (Codex P2 #3663668188)", () => {
+  // `--script-shell <path>` (npm/pnpm) takes a VALUE (the shell binary) but does
+  // NOT select a member or change where package.json is read — it only sets the
+  // shell used to run the script body. parsePmInvocation must consume the value so
+  // the FOLLOWING bare token is read as the real script NAME and its body is
+  // resolved. Without the fix, `--script-shell` was treated as a boolean option and
+  // `/bin/sh` was misread as the script name; the real `format` body was never
+  // inspected, so a CHECK-ONLY format (prettier --check) behind --script-shell was
+  // opaque-credited as format-on-save — a FALSE PASS that hid a broken hook from
+  // scan and skipped init/evolve repair.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-script-shell-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({
+    name: "root", scripts: { format: "prettier --check ." },
+    devDependencies: { prettier: "*", eslint: "*" },
+  }));
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({
+    hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [
+      { type: "command", command: "npx eslint --no-warn-ignored {}" },
+      { type: "command", command: "npm run --script-shell /bin/sh format" },
+    ] }] },
+  }));
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  assert.equal(hooks.ok, false, "`npm run --script-shell /bin/sh format` must resolve the `format` body; check-only format must MISS");
+});
+
 test("init --write skips the format hook when an existing `npm --prefix <dir> run <formatter>` in settings.local.json already covers it (Codex P2 #3660714238)", async () => {
   // The scaffold path (claudeHooksSettings) must pass dirScripts to
   // detectHooksConfig, matching the main analyzer. Without it, a hook in
