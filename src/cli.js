@@ -898,7 +898,11 @@ const DANGEROUS_CMD_FAMILIES = [
       // (where -c/-e is a substring of a different flag) don't false-match.
       "psql\\s+.*?-(?:c|f)(?=\\s|$)",
       "mysql\\s+.*?(?:-e|--execute)(?=\\s|$)",
-      "prisma\\s+migrate\\s+reset\\b",
+      // prisma reset runs through any package manager's runner (`npx`, `pnpm exec`,
+      // `yarn exec`, `bunx`), each prefixing the command differently. An optional
+      // runner + `.*?` for its subcommand lets the detector (and denyEntryFamily)
+      // recognize wrapper-wrapped forms, not just bare `prisma …`. (Codex P1 #3663410490.)
+      "(?:(?:npx|pnpm|yarn|bunx?)\\s+.*?)?prisma\\s+migrate\\s+reset\\b",
   ] },
   // pipe-to-shell
   { fam: "pipe-to-shell", pats: [
@@ -2194,16 +2198,30 @@ export function defaultDenyList(report) {
       // ask-only. (Codex P1 #3660903603; ask routing is Codex P2 #3659221996 /
       // #3656905061; denyEntryFamily still classifies these via the psql/mysql
       // execute-flag regexes.)
-      "Bash(psql *-c *DROP TABLE*)",
-      "Bash(psql *-c *DROP DATABASE*)",
-      "Bash(psql *-c *TRUNCATE*)",
-      "Bash(mysql *-e *DROP TABLE*)",
-      "Bash(mysql *-e *DROP DATABASE*)",
-      "Bash(mysql *-e *TRUNCATE*)",
-      // prisma migrate reset drops & recreates the dev database irreversibly — a
-      // single, unambiguous destructive command, so it is hard-denied.
+      // SQL keywords are case-insensitive, but Claude Code deny patterns match
+      // LITERALLY (case-sensitive), so an uppercase-only entry is bypassed by
+      // `psql -c 'drop table users'`. Emit BOTH uppercase (the convention agents
+      // follow) and lowercase (casual typing / generated SQL) for each keyword.
+      // Exhaustive mixed-case coverage is impossible with static literal globs;
+      // the `ask` routing remains the case-insensitive backstop prompting on ANY
+      // psql -c / mysql -e. (Codex P1 #3663410485.)
+      "Bash(psql *-c *DROP TABLE*)", "Bash(psql *-c *drop table*)",
+      "Bash(psql *-c *DROP DATABASE*)", "Bash(psql *-c *drop database*)",
+      "Bash(psql *-c *TRUNCATE*)", "Bash(psql *-c *truncate*)",
+      "Bash(mysql *-e *DROP TABLE*)", "Bash(mysql *-e *drop table*)",
+      "Bash(mysql *-e *DROP DATABASE*)", "Bash(mysql *-e *drop database*)",
+      "Bash(mysql *-e *TRUNCATE*)", "Bash(mysql *-e *truncate*)",
+      // prisma migrate reset drops & recreates the dev database irreversibly. It
+      // runs through ANY package manager's runner, each prefixing the command
+      // differently and so bypassing a single `prisma …` / `npx prisma …` pair.
+      // A `*` between the runner and `prisma` spans the manager's subcommand
+      // (`pnpm exec`, `pnpm dlx`, `yarn exec`, `yarn run`). (Codex P1 #3663410490.)
       "Bash(prisma migrate reset:*)",
       "Bash(npx prisma migrate reset:*)",
+      "Bash(pnpm *prisma migrate reset:*)",
+      "Bash(yarn *prisma migrate reset:*)",
+      "Bash(bunx *prisma migrate reset:*)",
+      "Bash(bun *prisma migrate reset:*)",
     );
   }
   return deny;

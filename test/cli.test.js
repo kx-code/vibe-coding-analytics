@@ -29,6 +29,22 @@ const FULL_GUARD_DENY_LIST = [
 // fixture cannot drift from the implementation. (Codex P1 #3660483486)
 const COMPLETE_NON_DB_DENY = defaultDenyList({ files: new Set(), packageJson: null, roots: [] });
 
+// Minimal model of Claude Code's Bash(...) permission matching, used to prove the
+// scaffolded deny entries actually match real destructive commands (not just that
+// the right string is emitted). Inside the parens, `*` is the only wildcard and
+// spans any run of characters (crossing argument boundaries, exactly as
+// `git push * --force` spans a refspec); a trailing `:*` is the prefix-match
+// suffix; everything else is literal. Splitting on `*` before escaping avoids
+// turning `*` into `\*` and then `\.*` (literal dot).
+function bashDenyMatches(entry, command) {
+  const m = String(entry).match(/^Bash\((.*)\)$/);
+  if (!m) return false;
+  let pat = m[1];
+  if (pat.endsWith(":*")) pat = pat.slice(0, -2) + "*";
+  const re = new RegExp("^" + pat.split("*").map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join(".*") + "$");
+  return re.test(command);
+}
+
 test("analyzes an empty project with missing harness areas", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-empty-"));
   const report = analyzeForTest(dir);
@@ -2834,7 +2850,7 @@ test("Dangerous-command guard recognizes SQL client / migration reset commands a
   // (prisma migrate reset), not as a bare command. Each must satisfy the guard;
   // init scaffolds them ONLY for DB projects (isDbProject), since a non-DB
   // project has nothing to DROP/TRUNCATE.
-  for (const variant of ["Bash(psql -c:*)", "Bash(psql -f:*)", "Bash(mysql -e:*)", "Bash(prisma migrate reset:*)", "Bash(psql * -c:*)", "Bash(psql * -f:*)", "Bash(mysql * -e:*)", "Bash(psql *-c *DROP TABLE*)", "Bash(mysql *-e *TRUNCATE*)"]) {
+  for (const variant of ["Bash(psql -c:*)", "Bash(psql -f:*)", "Bash(mysql -e:*)", "Bash(prisma migrate reset:*)", "Bash(psql * -c:*)", "Bash(psql * -f:*)", "Bash(mysql * -e:*)", "Bash(psql *-c *DROP TABLE*)", "Bash(mysql *-e *TRUNCATE*)", "Bash(pnpm exec prisma migrate reset:*)", "Bash(bunx prisma migrate reset:*)"]) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-deny-sql-var-"));
     fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
     fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
@@ -2865,6 +2881,8 @@ test("Dangerous-command guard recognizes SQL client / migration reset commands a
   assert.ok(/Bash\(mysql -e:\*\)/.test(dbLocal), "mysql -e scaffolded for DB project");
   assert.ok(/Bash\(prisma migrate reset:\*\)/.test(dbLocal), "prisma migrate reset scaffolded for DB project");
   assert.ok(/Bash\(npx prisma migrate reset:\*\)/.test(dbLocal), "npx prisma migrate reset scaffolded for DB project");
+  assert.ok(/Bash\(pnpm \*prisma migrate reset:\*\)/.test(dbLocal), "pnpm prisma migrate reset scaffolded for DB project");
+  assert.ok(/Bash\(bunx \*prisma migrate reset:\*\)/.test(dbLocal), "bunx prisma migrate reset scaffolded for DB project");
   // Execute flag AFTER connection options must also be scaffolded: a prefix-only
   // `psql -c:*` misses `psql -d prod -c 'DROP TABLE users'` (Claude Code matches
   // it as a literal prefix), so the after-options form is required to actually
@@ -2924,21 +2942,8 @@ test("SQL deny entries block the real client invocation, not a bare DROP/TRUNCAT
   // shell executable named DROP. The real destructive command runs as
   // `psql -c 'DROP TABLE users'`, which starts with `psql` and so slipped past the
   // deny into the weaker `ask` rules — a blind approval meant irreversible data
-  // loss. The deny must carry the keyword INSIDE the client invocation. We prove
-  // effectiveness with a minimal model of Claude Code's Bash(...) matching: `*` is
-  // the only wildcard and spans any run of characters (crossing argument
-  // boundaries, exactly as `git push * --force` spans a refspec); a trailing `:*`
-  // is the prefix-match suffix; everything else is literal.
-  function bashDenyMatches(entry, command) {
-    const m = String(entry).match(/^Bash\((.*)\)$/);
-    if (!m) return false;
-    let pat = m[1];
-    if (pat.endsWith(":*")) pat = pat.slice(0, -2) + "*";
-    // Split on `*` (the only wildcard), escape each literal segment, rejoin with
-    // `.*` — escaping first would turn `*` into `\*` and then `\.*` (literal dot).
-    const re = new RegExp("^" + pat.split("*").map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join(".*") + "$");
-    return re.test(command);
-  }
+  // loss. The deny must carry the keyword INSIDE the client invocation. Proven
+  // with the shared bashDenyMatches model of Claude Code's Bash(...) glob.
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-sql-deny-effective-"));
   fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
   fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", dependencies: { prisma: "*" } }));
@@ -2958,6 +2963,46 @@ test("SQL deny entries block the real client invocation, not a bare DROP/TRUNCAT
   assert.ok(deny.some((e) => bashDenyMatches(e, truncCmd)), `some deny entry blocks \`${truncCmd}\``);
   // A SAFE query on the same clients is NOT hard-denied (it falls through to ask).
   assert.ok(!deny.some((e) => bashDenyMatches(e, "psql -c 'SELECT 1'")), "safe psql -c SELECT is not hard-denied (routes through ask)");
+});
+
+test("SQL deny entries cover lowercase destructive SQL, not just uppercase (Codex P1 #3663410485)", async () => {
+  // SQL keywords are case-insensitive but Claude Code deny patterns match
+  // literally, so `psql -c 'drop table users'` bypasses an uppercase-only entry.
+  // vca emits BOTH cases for each keyword; the `ask` routing is the backstop for
+  // unbounded mixed-case permutations.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-sql-case-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", dependencies: { prisma: "*" } }));
+  await runCli(["init", "--cwd", dir, "--write"]);
+  const deny = JSON.parse(fs.readFileSync(path.join(dir, ".claude", "settings.local.json"), "utf8")).permissions?.deny || [];
+  assert.ok(deny.some((e) => bashDenyMatches(e, "psql -c 'drop table users'")), "lowercase `drop table` via psql -c is denied");
+  assert.ok(deny.some((e) => bashDenyMatches(e, "psql -c 'DROP TABLE users'")), "uppercase `DROP TABLE` via psql -c still denied");
+  assert.ok(deny.some((e) => bashDenyMatches(e, "mysql -e 'truncate table logs'")), "lowercase `truncate` via mysql -e is denied");
+  assert.ok(deny.some((e) => bashDenyMatches(e, "mysql -e 'drop database prod'")), "lowercase `drop database` via mysql -e is denied");
+});
+
+test("prisma migrate reset is denied through pnpm/yarn/bunx wrappers, not just npx (Codex P1 #3663410490)", async () => {
+  // prisma reset runs through any package manager's runner; each prefixes the
+  // command differently and bypasses a `prisma …` / `npx prisma …` pair.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-prisma-pm-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", dependencies: { prisma: "*" } }));
+  await runCli(["init", "--cwd", dir, "--write"]);
+  const deny = JSON.parse(fs.readFileSync(path.join(dir, ".claude", "settings.local.json"), "utf8")).permissions?.deny || [];
+  for (const cmd of [
+    "pnpm exec prisma migrate reset --force",
+    "pnpm dlx prisma migrate reset",
+    "yarn prisma migrate reset",
+    "yarn exec prisma migrate reset",
+    "bunx prisma migrate reset",
+    "bun prisma migrate reset",
+    "npx prisma migrate reset",
+  ]) {
+    assert.ok(deny.some((e) => bashDenyMatches(e, cmd)), `some deny entry blocks \`${cmd}\``);
+  }
+  // Safe prisma subcommands are NOT denied.
+  assert.ok(!deny.some((e) => bashDenyMatches(e, "pnpm exec prisma migrate dev")), "prisma migrate dev is not denied");
+  assert.ok(!deny.some((e) => bashDenyMatches(e, "yarn prisma generate")), "prisma generate is not denied");
 });
 
 test("evolve unions `ask` entries into an existing settings.local.json without dropping user rules (Codex P2 #3659221996)", async () => {
