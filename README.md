@@ -12,7 +12,8 @@
 `vibe-coding-analytics` treats vibe coding as an engineering loop — clear
 instructions, scoped memory, repeatable checks, reviewer roles, reusable
 skills, and recurring improvement. It ships as a single npm package with a
-zero-config CLI and first-class templates for Claude Code and Codex.
+zero-config CLI and native adapters for Codex, Claude Code, Cursor, Kiro, and
+GitHub Copilot.
 
 ## ✨ Features
 
@@ -87,6 +88,26 @@ files.
 | `scan` | Audit the current project for AI coding readiness (`analytics` is an alias). |
 | `init` | Propose or create a minimum viable harness: `AGENTS.md`, `.ai/workflows`, `.ai/reviewers`, knowledge base, ADR decision log, CI, validator script, plus native adapters for Codex, Claude Code, Cursor, Kiro, and Copilot. |
 | `evolve` | Propose or create self-evolution loop files for repeated improvements; also backfills hooks + deny list when missing. |
+
+## Compatibility Model
+
+`vca init --write` uses a multi-entry, single-source model:
+
+- `AGENTS.md` is the canonical durable-rule file for project facts, commands,
+  and stable agent rules.
+- `.ai/workflows/*` and `.ai/reviewers/*` are portable source material for
+  reusable workflows and reviewer criteria.
+- Tool-native files are intentionally thin adapters:
+  - Codex reads `AGENTS.md`.
+  - Claude Code reads `CLAUDE.md`, `.claude/commands/*`, and
+    `.claude/settings*.json`.
+  - Cursor reads `.cursor/rules/*.mdc`.
+  - Kiro reads `.kiro/steering/*.md`.
+  - GitHub Copilot reads `.github/copilot-instructions.md`.
+
+The adapter files point back to `AGENTS.md` and `.ai/` instead of duplicating
+long-lived rules, so a project can be opened with multiple AI CLIs or IDEs
+without maintaining several copies of the same guidance.
 
 ## Integrations
 
