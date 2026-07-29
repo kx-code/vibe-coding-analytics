@@ -1,6 +1,6 @@
 {
   "name": "vibe-coding-analytics",
-  "version": "0.2.3",
+  "version": "0.3.0",
   "description": "Initialize, audit, and evolve project harnesses for modern AI coding agents.",
   "type": "module",
   "bin": {
@@ -23,8 +23,9 @@
     "scan": "node ./bin/vibe-coding-analytics.js scan",
     "init": "node ./bin/vibe-coding-analytics.js init",
     "evolve": "node ./bin/vibe-coding-analytics.js evolve",
+    "lint": "node --check ./src/cli.js && node --check ./bin/vibe-coding-analytics.js && node --check ./scripts/validate-architecture.js && node --check ./test/cli.test.js",
     "test": "node --test",
-    "validate": "npm test && node ./scripts/validate-architecture.js",
+    "validate": "npm run lint && npm test && node ./scripts/validate-architecture.js",
     "ci": "npm run validate"
   },
   "keywords": [

@@ -1,0 +1,21 @@
+name: Health Check
+
+on:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Check published package metadata
+        run: npm view vibe-coding-analytics version
+      - name: Smoke test published CLI
+        run: npx --yes vibe-coding-analytics --version

@@ -57,8 +57,50 @@ test("init --write creates baseline harness files", async () => {
   fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "sample", scripts: {} }));
   await runCli(["init", "--cwd", dir, "--write"]);
   assert.equal(fs.existsSync(path.join(dir, "AGENTS.md")), true);
-  assert.equal(fs.existsSync(path.join(dir, ".claude/commands/evolve.md")), true);
+  assert.equal(fs.existsSync(path.join(dir, "CLAUDE.md")), true);
+  assert.equal(fs.existsSync(path.join(dir, ".github/copilot-instructions.md")), true);
+  assert.equal(fs.existsSync(path.join(dir, ".cursor/rules/vibe-coding-analytics.mdc")), true);
+  assert.equal(fs.existsSync(path.join(dir, ".kiro/steering/vibe-coding-analytics.md")), true);
+  assert.equal(fs.existsSync(path.join(dir, ".ai/workflows/evolve.md")), true);
   assert.equal(fs.existsSync(path.join(dir, "docs/knowledge-base/constraints.md")), true);
+  assert.equal(fs.existsSync(path.join(dir, "docs/decisions/0001-harness-baseline.md")), true);
+  assert.equal(fs.existsSync(path.join(dir, "scripts/validate-harness.js")), true);
+  assert.equal(fs.existsSync(path.join(dir, ".github/workflows/ci.yml")), true);
+  assert.equal(fs.existsSync(path.join(dir, ".ai/reviewers/harness-reviewer.md")), true);
+  assert.equal(fs.existsSync(path.join(dir, ".claude/commands/evolve.md")), true);
+  assert.equal(fs.existsSync(path.join(dir, ".claude/agents/harness-reviewer.md")), true);
+  assert.equal(fs.existsSync(path.join(dir, ".claude/settings.local.json")), true);
+  const initCommand = fs.readFileSync(path.join(dir, ".claude/commands/init.md"), "utf8");
+  assert.ok(/Compatibility target/.test(initCommand), "/init documents mainstream AI compatibility targets");
+  assert.ok(/Codex reads AGENTS\.md/.test(initCommand), "/init covers Codex");
+  assert.ok(/Cursor reads \.cursor\/rules\/\*\.mdc/.test(initCommand), "/init covers Cursor");
+  assert.ok(/Kiro reads \.kiro\/steering\/\*\.md/.test(initCommand), "/init covers Kiro");
+  assert.ok(/Do not assume \.ai\/ is auto-discovered/.test(initCommand), "/init keeps .ai as a portable source layer, not a fake standard");
+  assert.ok(/thin adapters/.test(initCommand), "/init keeps tool-native files thin");
+  for (const adapterPath of [
+    "CLAUDE.md",
+    ".github/copilot-instructions.md",
+    ".cursor/rules/vibe-coding-analytics.mdc",
+    ".kiro/steering/vibe-coding-analytics.md",
+  ]) {
+    const adapter = fs.readFileSync(path.join(dir, adapterPath), "utf8");
+    assert.ok(/AGENTS\.md/.test(adapter), `${adapterPath} points to canonical AGENTS.md`);
+  }
+});
+
+test("init-generated mainstream AI adapters are recognized without leaving Claude guard gaps", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-mainstream-ai-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "sample", scripts: {} }));
+  await runCli(["init", "--cwd", dir, "--write"]);
+  const report = analyzeForTest(dir);
+  const hooks = report.checks.find((c) => c.area === "Agent hooks");
+  const guard = report.checks.find((c) => c.area === "Dangerous-command guard");
+  const reusable = report.checks.find((c) => c.area === "Reusable skills");
+  const reviewers = report.checks.find((c) => c.area === "Specialist reviewers");
+  assert.ok(hooks && hooks.na, "Agent hooks are N/A without prettier/eslint dependencies");
+  assert.ok(guard && guard.ok, "generated Claude deny guard satisfies Dangerous-command guard");
+  assert.ok(reusable && reusable.ok, ".ai/workflows count as reusable AI workflows");
+  assert.ok(reviewers && reviewers.ok, ".ai/reviewers count as reviewer specs");
 });
 
 test("detects harness across git submodules and fractal CLAUDE.md", () => {
@@ -130,6 +172,21 @@ test("detects root-level plugin agents as specialist reviewers", () => {
   const report = analyzeForTest(dir);
   const reviewers = report.checks.find((c) => c.area === "Specialist reviewers");
   assert.ok(reviewers && reviewers.ok, "reviewers via root-level .claude/plugins/.../agents/");
+});
+
+test("detects Codex skill-packaged agents as specialist reviewers", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-codex-agent-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "p" }));
+  fs.writeFileSync(path.join(dir, "AGENTS.md"), "# p");
+  fs.mkdirSync(path.join(dir, "skills", "demo", "agents"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, "skills", "demo", "agents", "openai.yaml"),
+    "interface:\n  display_name: Demo\n",
+  );
+
+  const report = analyzeForTest(dir);
+  const reviewers = report.checks.find((c) => c.area === "Specialist reviewers");
+  assert.ok(reviewers && reviewers.ok, "reviewers via skills/<name>/agents/*.yaml");
 });
 
 test("detects typecheck config in a deeply-nested git submodule", () => {
@@ -1282,13 +1339,14 @@ test("init --write scaffolds hooks + deny list for Claude Code projects", async 
   assert.ok(/Bash\(git push \* -qf \*\)/.test(local), "deny list covers clustered -qf BETWEEN repo and refspec (git push origin -qf main, Codex P1 #3663668182)");
 });
 
-test("init --write does NOT scaffold hooks for non-Claude-Code projects", async () => {
+test("init --write scaffolds Claude adapters without hooks when no formatter is available", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-init-nohooks-"));
-  // package.json but no CLAUDE.md and no .claude/ -> not a Claude Code project.
   fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {} }));
   await runCli(["init", "--cwd", dir, "--write"]);
-  assert.equal(fs.existsSync(path.join(dir, ".claude", "settings.json")), false, "no settings.json for non-CC project");
-  assert.equal(fs.existsSync(path.join(dir, ".claude", "settings.local.json")), false, "no settings.local.json for non-CC project");
+  assert.equal(fs.existsSync(path.join(dir, ".claude", "settings.json")), false, "no hook settings without formatter tools");
+  assert.equal(fs.existsSync(path.join(dir, ".claude", "settings.local.json")), true, "dangerous-command guard is scaffolded with the Claude adapter");
+  const local = fs.readFileSync(path.join(dir, ".claude", "settings.local.json"), "utf8");
+  assert.ok(/Bash\(rm -rf:\*\)/.test(local), "deny list includes rm -rf");
 });
 
 test("init --write adds DROP TABLE deny for DB projects", async () => {
@@ -1745,19 +1803,15 @@ test("generated read-path pipeline preserves quotes/backslashes/spaces end-to-en
   assert.equal(out.trim(), tricky, "quote+backslash+space path survives the NUL-delimited pipeline");
 });
 
-test("init on a non-Claude project does not flip Claude detection on the next scan (Codex P2)", async () => {
+test("init on a generic project generates Claude adapters with a complete deny guard", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-bootstrap-"));
   fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {} }));
-  // No CLAUDE.md and no .claude/ -> not a Claude Code project.
   await runCli(["init", "--cwd", dir, "--write"]);
-  // init scaffolds .claude/commands/* unconditionally; a commands-only dir must
-  // NOT count as Claude Code configuration, or a fresh baseline fails its own
-  // newly-added hook checks on the next scan.
   const r = analyzeForTest(dir);
   const hooks = r.checks.find((c) => c.area === "Agent hooks");
   const guard = r.checks.find((c) => c.area === "Dangerous-command guard");
-  assert.ok(hooks && hooks.ok, "Agent hooks N/A — commands-only .claude/ is not a Claude project");
-  assert.ok(guard && guard.ok, "Dangerous-command guard N/A — commands-only .claude/ is not a Claude project");
+  assert.ok(hooks && hooks.na, "Agent hooks are N/A when prettier/eslint are not present");
+  assert.ok(guard && guard.ok, "Dangerous-command guard is satisfied by generated .claude/settings.local.json");
 });
 
 test("Dangerous-command guard NOT N/A when .claude/agents/ exists without CLAUDE.md or settings (Codex P2)", () => {

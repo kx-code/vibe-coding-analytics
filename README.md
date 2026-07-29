@@ -18,8 +18,9 @@ zero-config CLI and first-class templates for Claude Code and Codex.
 
 - **Audit** a project for AI coding readiness across agents, memory, skills,
   tests, CI, and deploy hooks.
-- **Scaffold** baseline harness files (`AGENTS.md`, `CLAUDE.md`, skills, slash
-  commands, reviewer agents).
+- **Scaffold** baseline harness files (`AGENTS.md`, `.ai/workflows`,
+  `.ai/reviewers`, knowledge base, ADR decision log, CI, validator script, and
+  native adapters for Codex, Claude Code, Cursor, Kiro, and Copilot).
 - **Evolve** a concrete improvement plan: maps detected analytics gaps to
   promotion targets (tests, validators, CI, skills, rules) and surfaces recent
   git fix hotspots as regression-test candidates.
@@ -84,7 +85,7 @@ files.
 | Command | Purpose |
 | --- | --- |
 | `scan` | Audit the current project for AI coding readiness (`analytics` is an alias). |
-| `init` | Propose or create baseline harness files, including Claude Code hooks + a deny list for projects with `CLAUDE.md` / `.claude/`. |
+| `init` | Propose or create a minimum viable harness: `AGENTS.md`, `.ai/workflows`, `.ai/reviewers`, knowledge base, ADR decision log, CI, validator script, plus native adapters for Codex, Claude Code, Cursor, Kiro, and Copilot. |
 | `evolve` | Propose or create self-evolution loop files for repeated improvements; also backfills hooks + deny list when missing. |
 
 ## Integrations
@@ -136,7 +137,7 @@ for marketplace submission.
 
 ## What It Checks
 
-- `AGENTS.md`, `CLAUDE.md`, Cursor rules, and Copilot instructions
+- `AGENTS.md`, `CLAUDE.md`, Cursor rules, Kiro steering, and Copilot instructions
 - Project memory such as PRDs, constraints, patterns, known issues, or fractal
   per-directory `CLAUDE.md`
 - Reusable skills, slash commands, specialist reviewers (`.claude/agents/`,
@@ -158,6 +159,9 @@ for marketplace submission.
   invocation, since the real command never starts with the bare keyword
 - Cross-session memory: ADR decisions, agent memory, or a decisions log
 - Self-evolution loops that promote repeated work into durable harness assets
+- Minimum viable harness generation: project facts, validation command, CI,
+  `.ai/workflows`, `.ai/reviewers`, knowledge base, decision memory,
+  architecture validator, and native AI tool adapters
 - Depth hints on passing checks (test-file / instruction-line / skill counts) so a stub is distinguishable from a mature project at the same score
 - False-safety warnings when checks are partially present (tests without CI, agent rules without enforcement, no single validation command)
 

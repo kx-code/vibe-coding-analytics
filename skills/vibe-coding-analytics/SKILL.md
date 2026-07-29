@@ -36,10 +36,10 @@ Use this loop for both new projects and existing repositories:
 | Area | Look For |
 | --- | --- |
 | Project facts | `README`, package scripts, framework config, deployment model, env examples |
-| Agent instructions | `AGENTS.md`, `CLAUDE.md`, `.cursor/rules`, `.github/copilot-instructions.md` |
+| Agent instructions | `AGENTS.md`, `CLAUDE.md`, `.cursor/rules`, `.kiro/steering`, `.github/copilot-instructions.md` |
 | Memory | `docs/PRD`, `docs/knowledge-base`, decisions, constraints, known issues |
-| Skills and commands | `.claude/skills`, `.claude/commands`, reusable workflows |
-| Review roles | `.claude/agents`, security/database/pipeline/release reviewers |
+| Skills and commands | `.ai/workflows`, skills, tool-specific commands |
+| Review roles | `.ai/reviewers`, `.claude/agents`, security/database/pipeline/release reviewers |
 | Sensors | typecheck, lint, tests, Playwright, architecture validation, pre-commit hooks |
 | CI and release | GitHub Actions, PR template, deploy workflow, post-deploy checks |
 | Feedback loops | bug-to-test practice, issue/PR review loops, recurring health checks |
@@ -61,6 +61,13 @@ For a new or weakly instrumented project, start with:
 5. `docs/knowledge-base/patterns.md`, `constraints.md`, and `known-issues.md`.
 6. One reviewer agent for the highest-risk domain.
 7. One architecture validator for rules that should not rely on memory.
+
+`vca init --write` productizes this baseline by generating stable project
+instructions, `.ai/workflows`, `.ai/reviewers`, knowledge-base files, an ADR
+decision log, CI, a dependency-free harness validator, and native adapter files
+for mainstream tools: Codex (`AGENTS.md`), Claude Code (`CLAUDE.md` and
+`.claude/commands`), Cursor (`.cursor/rules/*.mdc`), Kiro
+(`.kiro/steering/*.md`), and Copilot (`.github/copilot-instructions.md`).
 
 Do not overbuild. Add more harness only when the project has repeated operations or recurring failure modes.
 

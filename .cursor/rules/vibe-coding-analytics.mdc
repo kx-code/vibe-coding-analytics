@@ -1,0 +1,12 @@
+---
+description: vibe-coding-analytics AI coding harness
+alwaysApply: true
+---
+
+# vibe-coding-analytics Cursor Rule
+
+Canonical project guidance lives in AGENTS.md.
+
+Use .ai/workflows/ for portable workflow prompts and .ai/reviewers/ for review
+criteria. Keep durable rules in AGENTS.md; add Cursor-specific details here only
+when they cannot be expressed in the shared source.

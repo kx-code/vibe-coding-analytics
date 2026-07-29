@@ -20,11 +20,11 @@ This repository packages a reusable vibe coding harness analyzer as:
 
 ## Design Rules
 
-- CLI commands are read-only by default. Only `--write` creates files.
-- Keep the package dependency-free unless a dependency has clear user value.
-- Keep generated project files conservative and easy to edit.
-- Promote repeated workflow needs into templates, skills, or validators.
-- Do not add project-specific business rules to the generic skill.
+Rule 1: CLI commands are read-only by default. Only `--write` creates files.
+Rule 2: Keep the package dependency-free unless a dependency has clear user value.
+Rule 3: Keep generated project files conservative and easy to edit.
+Rule 4: Promote repeated workflow needs into templates, skills, or validators.
+Rule 5: Do not add project-specific business rules to the generic skill.
 
 ## Release Notes
 
