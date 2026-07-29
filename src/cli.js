@@ -240,7 +240,7 @@ function analyzeProject(cwd) {
     ),
     check(
       "Failure observability",
-      Boolean(allScripts.monitor) || hasObservabilitySensor(allFiles),
+      Boolean(allScripts.monitor) || hasObservabilitySensor(allFiles, cwd),
       "Add monitoring/alerting (monitor scripts, health workflows, error counters) so critical-path failures surface instead of failing silently.",
     ),
     check(
@@ -565,14 +565,16 @@ function anyMakefileTarget(roots, targets) {
   return false;
 }
 
-/** Count numbered rules ("规则 N" / "Rule N") across project roots. */
+/** Count numbered rules ("规则 N" / "Rule N") across project roots.
+ *  Only line-start rule entries count. A prose sentence such as "add Rule N
+ *  after each bug fix" describes the pattern; it is not itself a steering rule. */
 function countNumberedRules(roots) {
   let count = 0;
   for (const root of roots) {
     for (const name of ["CLAUDE.md", "AGENTS.md"]) {
       try {
         const text = fs.readFileSync(path.join(root, name), "utf8");
-        const matches = text.match(/(?:规则|Rule)\s*\d+/gi);
+        const matches = text.match(/^[ \t]*(?:[-*]\s*)?(?:规则|Rule)\s*\d+\b/gim);
         if (matches) count += matches.length;
       } catch {
         /* ignore */
@@ -739,16 +741,51 @@ function hasDeployArtifact(filesByRoot) {
   return false;
 }
 
-/** Observability sensors: monitor/alert/health files in script/workflow/worker paths.
+/** Observability sensors: monitor/alert/health files in script/workflow/worker paths,
+ *  plus scheduled/long-running worker entrypoints that emit failure signals.
  *  README or docs that merely mention monitoring do not count. */
-function hasObservabilitySensor(allFiles) {
+function hasObservabilitySensor(allFiles, cwd = process.cwd()) {
   for (const file of allFiles) {
     if (!/(monitor|alert|observability|health[-_]?check)/i.test(file)) continue;
     if (file.includes(".github/workflows/")) return true;
     if (file.startsWith("scripts/") || file.includes("/scripts/")) return true;
     if (file.startsWith("workers/") || file.includes("/workers/")) return true;
+    if (/(^|\/)packages\/[^/]*(?:monitor|worker)[^/]*\//i.test(file)) return true;
+  }
+
+  for (const file of allFiles) {
+    if (isScheduledWorkerConfig(file, cwd)) return true;
+    if (isObservableWorkerEntrypoint(file, cwd)) return true;
   }
   return false;
+}
+
+function isScheduledWorkerConfig(file, cwd) {
+  if (!/(^|\/)(?:wrangler|worker)\.toml$/i.test(file)) return false;
+  if (!/(^|\/)(?:packages\/[^/]*(?:monitor|worker)[^/]*|workers\/[^/]+)\//i.test(file)) return false;
+  try {
+    const text = fs.readFileSync(path.join(cwd, file), "utf8");
+    return /\[\s*triggers\s*\]|crons\s*=|cron\s*=/i.test(text);
+  } catch {
+    return false;
+  }
+}
+
+function isObservableWorkerEntrypoint(file, cwd) {
+  if (!/(^|\/)(?:packages\/[^/]*(?:monitor|worker)[^/]*|workers\/[^/]+)\/src\/[^/]+\.(?:[cm]?js|ts)$/i.test(file)) {
+    return false;
+  }
+  try {
+    const text = fs.readFileSync(path.join(cwd, file), "utf8");
+    const hasAsyncFailureSurface =
+      /\bwaitUntil\s*\(/.test(text) ||
+      /\bconsole\.(?:error|warn)\s*\(/.test(text) ||
+      /\bctx\.(?:waitUntil|passThroughOnException)\b/.test(text);
+    const hasWorkerShape = /\b(?:fetch|scheduled)\s*\(/.test(text) || /\bexport\s+default\b/.test(text);
+    return hasAsyncFailureSurface && hasWorkerShape;
+  } catch {
+    return false;
+  }
 }
 
 /** Cross-session memory: ADR/decisions logs or agent memory stores. */
