@@ -283,6 +283,23 @@ test("failure observability detected via monitor/alert/health files", () => {
   );
 });
 
+test("failure observability detected via scheduled worker config", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-obs-worker-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "a" }));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# a");
+  fs.mkdirSync(path.join(dir, "packages", "indexing-worker"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, "packages", "indexing-worker", "wrangler.toml"),
+    'name = "indexing-worker"\n[triggers]\ncrons = ["*/30 * * * *"]\n',
+  );
+
+  const r = analyzeForTest(dir);
+  assert.ok(
+    r.checks.find((c) => c.area === "Failure observability")?.ok,
+    "scheduled worker config satisfies observability",
+  );
+});
+
 test("cross-session memory detected via decisions, ADR, or agent memory", () => {
   const adrDir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-mem-adr-"));
   fs.writeFileSync(path.join(adrDir, "package.json"), JSON.stringify({ name: "a" }));
@@ -947,6 +964,24 @@ test("analytics counts English Rule N numbering", () => {
   const r = analyzeForTest(dir);
   const loop = r.checks.find((c) => c.area === "Steering loop");
   assert.ok(loop && loop.ok, "English Rule N counts toward steering loop");
+});
+
+test("analytics does not count prose mentions of Rule N as steering rules", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-sl-prose-"));
+  fs.writeFileSync(
+    path.join(dir, "AGENTS.md"),
+    [
+      "# Rules",
+      "When fixing bugs, add Rule N to the durable project memory.",
+      "A template may mention Rule 123 without defining a real numbered rule.",
+      "- Rule 1: real rule",
+      "- Rule 2: real rule",
+    ].join("\n"),
+  );
+  const r = analyzeForTest(dir);
+  const loop = r.checks.find((c) => c.area === "Steering loop");
+  assert.ok(loop && !loop.ok, "only the two line-start entries count toward steering loop");
+  assert.match(loop.action, /Found 2\./);
 });
 
 test("analytics MISS Steering loop with no rules file", () => {
