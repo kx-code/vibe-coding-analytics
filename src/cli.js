@@ -1370,8 +1370,22 @@ function resolveScriptBody(invocation, scripts, seen, workspaceScripts, byDir) {
   //   (--prefix/-C/--dir) only change WHERE the PM reads package.json; npm reads
   //   <dir>/package.json directly and does NOT error on an undeclared dir.
   //   (Codex P2 #3659471687 / #3660483494)
-  const wsLong = wsRaw ? null : s.match(/(?:^|\s)(?:--workspace|--filter)[ =](\S+)/);
-  const prefixLong = prefixRaw ? null : s.match(/(?:^|\s)(?:--prefix|-C|--dir)[ =](\S+)/);
+  // Scope the NON-POSITIONAL long-form selector search to the portion BEFORE the
+  // first standalone `--` argument delimiter. npm/pnpm/yarn FORWARD trailing args
+  // after `--` to the script being run (`npm run format -- --workspace a` appends
+  // `--workspace a` to the ROOT `format` script; it is NOT an npm selector —
+  // `npm run --help` documents `npm run <cmd> [-- <args>]`). Without this scoping
+  // the regexes below match a FORWARDED `--workspace`/`--filter`/`--prefix`, scope
+  // resolution to that member, and either false-MISS (unknown member -> "" sentinel)
+  // or false-PASS (member's writer credited while npm runs ROOT's check-only body).
+  // parsePmInvocation's positional walk already stops at the command name, but these
+  // long-form regexes are deliberately NON-positional (long-form flags are valid in
+  // ANY position, e.g. `npm run format --workspace a`), so they need their own `--`
+  // guard. (Codex P2 #3664214667)
+  const selectorDelim = s.search(/(?:^|\s)--(?:\s|$)/);
+  const selectorScope = selectorDelim === -1 ? s : s.slice(0, selectorDelim);
+  const wsLong = wsRaw ? null : selectorScope.match(/(?:^|\s)(?:--workspace|--filter)[ =](\S+)/);
+  const prefixLong = prefixRaw ? null : selectorScope.match(/(?:^|\s)(?:--prefix|-C|--dir)[ =](\S+)/);
   const wsName = wsRaw ? normalizeWorkspaceKey(wsRaw)
     : wsLong ? normalizeWorkspaceKey(wsLong[1]) : null;
   const prefixName = prefixRaw ? normalizeWorkspaceKey(prefixRaw)

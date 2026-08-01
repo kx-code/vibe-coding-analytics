@@ -4191,6 +4191,56 @@ test("Agent hooks: `npm run <script> -- --write` forwards the flag into the body
   assert.equal(hooks.ok, true, "forwarded --write turns `prettier .` into a writer, so format-on-save is satisfied");
 });
 
+test("Agent hooks: a selector after the `--` argument delimiter is forwarded, not an npm selector (Codex P2 #3664214667)", () => {
+  // `npm run format -- --workspace a` appends `--workspace a` to the ROOT `format`
+  // script as forwarded args (npm run --help: `npm run <cmd> [-- <args>]`); it is NOT
+  // an npm selector. The non-positional long-form selector regex matched the FORWARDED
+  // `--workspace a`, scoped resolution to member `a`, and credited `a`'s
+  // `prettier --write .` even though npm actually runs ROOT `format` =
+  // `prettier --check .` (check-only) — a false-PASS that leaves format-on-save
+  // unsatisfied and init/evolve omits the write hook. Selector parsing must stop at
+  // the first standalone `--`.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-fwd-selector-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({
+    name: "root",
+    scripts: { format: "prettier --check ." },   // ROOT format is check-only
+    workspaces: ["packages/*"],
+    devDependencies: { prettier: "*", eslint: "*" },
+  }));
+  fs.mkdirSync(path.join(dir, "packages", "a"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "packages", "a", "package.json"), JSON.stringify({
+    name: "a",
+    scripts: { format: "prettier --write ." },   // member `a`'s format WRITES
+  }));
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({
+    hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [
+      { type: "command", command: "npm run format -- --workspace a" },
+      { type: "command", command: "npx eslint --no-warn-ignored {}" },
+    ] }] },
+  }));
+  const r = analyzeForTest(dir);
+  const hooks = r.checks.find((c) => c.area === "Agent hooks");
+  // ROOT format is check-only; the forwarded `--workspace a` must NOT scope to member
+  // `a`, so format-on-save is NOT satisfied -> MISS (so init/evolve scaffolds a writer).
+  assert.equal(hooks.ok, false, "forwarded --workspace after `--` is not a selector; root format is check-only -> MISS");
+
+  // Control: WITHOUT the `--` delimiter, `--workspace a` AFTER the script name is a
+  // legitimate npm global selector (npm scans all args), so member `a`'s writer is
+  // credited and format-on-save PASSES. The fix scopes selectors to before `--`, it
+  // must NOT break this post-command-name global-selector form.
+  fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({
+    hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [
+      { type: "command", command: "npm run format --workspace a" },
+      { type: "command", command: "npx eslint --no-warn-ignored {}" },
+    ] }] },
+  }));
+  const r2 = analyzeForTest(dir);
+  const hooks2 = r2.checks.find((c) => c.area === "Agent hooks");
+  assert.ok(hooks2 && hooks2.ok, "`npm run format --workspace a` (no `--`) is a real selector -> member a's writer -> PASS (control)");
+});
+
 test("init --write scaffolds a writing formatter when `npm run format` is check-only (Codex P2)", async () => {
   // Practical outcome: because format is now correctly detected as MISSING, init
   // must scaffold a real writing prettier hook instead of skipping it.
