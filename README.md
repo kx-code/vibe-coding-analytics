@@ -166,8 +166,10 @@ for marketplace submission.
 - Tests, typecheck, lint, architecture validators, and CI
 - Rule-to-sensor coverage: prose rules in `CLAUDE.md`/`AGENTS.md` backed by
   computational sensors (tests, lint, validators), not prose-only
-- Steering loop: numbered rules (`Rule N`) in `CLAUDE.md`/`AGENTS.md`
-  that grow after each bug fix — the rising count is the feedback-loop heartbeat
+- Steering loop: either numbered rules (`Rule N`) in `CLAUDE.md`/`AGENTS.md`,
+  or 5+ numbered `D…`/`ADR-…` decision entries backed by a promotion policy or
+  cross-document references. Requiring evidence of active use prevents a stale
+  ADR directory, changelog, or release notes from creating false confidence.
 - Failure observability: monitoring, alerting, or error counters so critical-path
   failures surface instead of failing silently
 - Deploy and post-deploy verification hooks

@@ -981,7 +981,7 @@ test("analytics does not count prose mentions of Rule N as steering rules", () =
   const r = analyzeForTest(dir);
   const loop = r.checks.find((c) => c.area === "Steering loop");
   assert.ok(loop && !loop.ok, "only the two line-start entries count toward steering loop");
-  assert.match(loop.action, /Found 2\./);
+  assert.match(loop.action, /Found 2 rules/);
 });
 
 test("analytics MISS Steering loop with no rules file", () => {
@@ -989,6 +989,78 @@ test("analytics MISS Steering loop with no rules file", () => {
   const r = analyzeForTest(dir);
   const loop = r.checks.find((c) => c.area === "Steering loop");
   assert.ok(loop && !loop.ok, "no rules file misses steering loop");
+});
+
+test("analytics PASS Steering loop with an actively promoted decision log", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-sl-decisions-"));
+  fs.mkdirSync(path.join(dir, "docs"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, "docs", "decisions.md"),
+    ["# Decisions", "## D001 First", "## D002 Second", "## D003 Third", "## D004 Fourth", "## D005 Fifth"].join("\n"),
+  );
+  fs.writeFileSync(path.join(dir, "AGENTS.md"), "# Promotion rules\nRepeated bug → regression test or validator.\n");
+  const loop = analyzeForTest(dir).checks.find((c) => c.area === "Steering loop");
+  assert.ok(loop && loop.ok, "numbered decisions plus a promotion policy pass");
+  assert.equal(loop.steeringEvidence, "decision-log");
+  assert.match(loop.action, /false-safety/);
+  assert.match(loop.depth, /5 numbered decision/);
+});
+
+test("analytics PASS Steering loop when decision IDs are used across documents", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-sl-refs-"));
+  fs.mkdirSync(path.join(dir, "docs", "adr"), { recursive: true });
+  for (let i = 1; i <= 5; i += 1) {
+    fs.writeFileSync(path.join(dir, "docs", "adr", `ADR-${i}.md`), `# ADR-0${i} Choice ${i}\n`);
+  }
+  fs.writeFileSync(path.join(dir, "AGENTS.md"), "Follow ADR-01 and ADR-02 during review.\n");
+  const loop = analyzeForTest(dir).checks.find((c) => c.area === "Steering loop");
+  assert.ok(loop && loop.ok, "two externally referenced decisions demonstrate active use");
+});
+
+test("analytics does not treat stale ADRs, changelogs, or promotion prose alone as steering", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-sl-stale-"));
+  fs.mkdirSync(path.join(dir, "docs", "adr"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "docs", "adr", "history.md"), "D001 a\nD002 b\nD003 c\nD004 d\nD005 e\n");
+  fs.writeFileSync(path.join(dir, "CHANGELOG.md"), "# Promotion rules\nD006 release\nD007 release\n");
+  const loop = analyzeForTest(dir).checks.find((c) => c.area === "Steering loop");
+  assert.ok(loop && !loop.ok, "an unrelated heading does not activate an unreferenced ADR archive");
+});
+
+test("analytics counts decision IDs in markdown tables via cross-references", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-sl-table-"));
+  fs.mkdirSync(path.join(dir, "docs"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, "docs", "decisions.md"),
+    [
+      "# Decisions",
+      "| 编号 | 状态 | 决定及依据 |",
+      "| --- | --- | --- |",
+      "| D001 | 已确认 | first |",
+      "| D002 | 已确认 | second |",
+      "| D003 | 已确认 | third |",
+      "| D004 | 已确认 | fourth |",
+      "| D005 | 已确认 | fifth |",
+    ].join("\n"),
+  );
+  fs.writeFileSync(path.join(dir, "AGENTS.md"), "Follow D001 and D002 during review.\n");
+  const loop = analyzeForTest(dir).checks.find((c) => c.area === "Steering loop");
+  assert.ok(loop && loop.ok, "table-form decision entries count and qualify through references");
+  assert.equal(loop.steeringEvidence, "decision-log");
+});
+
+test("analytics detects suffix-form and Chinese promotion-policy headings", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-sl-suffix-"));
+  fs.mkdirSync(path.join(dir, "docs"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, "docs", "decisions.md"),
+    ["# Decisions", "## D001 First", "## D002 Second", "## D003 Third", "## D004 Fourth", "## D005 Fifth"].join("\n"),
+  );
+  fs.writeFileSync(
+    path.join(dir, "docs", "engineering.md"),
+    "## 重复工作提升规则（Steering）\nRepeated bug → regression test.\n",
+  );
+  const loop = analyzeForTest(dir).checks.find((c) => c.area === "Steering loop");
+  assert.ok(loop && loop.ok, "a suffix-form promotion heading qualifies the decision log");
 });
 
 test("every analytics check has a non-empty action/hint", () => {
