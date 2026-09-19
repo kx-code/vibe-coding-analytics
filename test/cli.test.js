@@ -1026,6 +1026,43 @@ test("analytics does not treat stale ADRs, changelogs, or promotion prose alone 
   assert.ok(loop && !loop.ok, "an unrelated heading does not activate an unreferenced ADR archive");
 });
 
+test("analytics counts decision IDs in markdown tables via cross-references", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-sl-table-"));
+  fs.mkdirSync(path.join(dir, "docs"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, "docs", "decisions.md"),
+    [
+      "# Decisions",
+      "| 编号 | 状态 | 决定及依据 |",
+      "| --- | --- | --- |",
+      "| D001 | 已确认 | first |",
+      "| D002 | 已确认 | second |",
+      "| D003 | 已确认 | third |",
+      "| D004 | 已确认 | fourth |",
+      "| D005 | 已确认 | fifth |",
+    ].join("\n"),
+  );
+  fs.writeFileSync(path.join(dir, "AGENTS.md"), "Follow D001 and D002 during review.\n");
+  const loop = analyzeForTest(dir).checks.find((c) => c.area === "Steering loop");
+  assert.ok(loop && loop.ok, "table-form decision entries count and qualify through references");
+  assert.equal(loop.steeringEvidence, "decision-log");
+});
+
+test("analytics detects suffix-form and Chinese promotion-policy headings", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-sl-suffix-"));
+  fs.mkdirSync(path.join(dir, "docs"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, "docs", "decisions.md"),
+    ["# Decisions", "## D001 First", "## D002 Second", "## D003 Third", "## D004 Fourth", "## D005 Fifth"].join("\n"),
+  );
+  fs.writeFileSync(
+    path.join(dir, "docs", "engineering.md"),
+    "## 重复工作提升规则（Steering）\nRepeated bug → regression test.\n",
+  );
+  const loop = analyzeForTest(dir).checks.find((c) => c.area === "Steering loop");
+  assert.ok(loop && loop.ok, "a suffix-form promotion heading qualifies the decision log");
+});
+
 test("every analytics check has a non-empty action/hint", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-actions-"));
   fs.writeFileSync(path.join(dir, "CLAUDE.md"), "project");

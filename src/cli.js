@@ -604,7 +604,7 @@ function analyzeDecisionSteering(allFiles, cwd) {
   for (const file of decisionFiles) {
     try {
       const text = fs.readFileSync(path.join(cwd, file), "utf8");
-      const re = /^[ \t]*(?:#{1,6}\s*|[-*]\s*)?(D\d{2,}|ADR[- ]?\d{2,})\b/gim;
+      const re = /^[ \t]*\|?[ \t]*(?:#{1,6}\s*|[-*]\s*)?(D\d{2,}|ADR[- ]?\d{2,})\b/gim;
       let match;
       while ((match = re.exec(text)) !== null) ids.add(match[1].toUpperCase().replace(" ", "-"));
     } catch {
@@ -620,7 +620,7 @@ function analyzeDecisionSteering(allFiles, cwd) {
       const text = fs.readFileSync(path.join(cwd, file), "utf8");
       const isPolicyFile = /^(?:AGENTS|CLAUDE)\.md$/i.test(file) ||
         (/^docs\//i.test(file) && !/(?:^|\/)(?:changelog|release(?:-notes)?)(?:\.|\/)/i.test(file));
-      if (isPolicyFile && /(?:^|\n)#{1,6}\s*(?:promotion rules?|promot(?:e|ion).*to|提升规则)\b/im.test(text)) {
+      if (isPolicyFile && /(?:^|\n)#{1,6}[^\n]{0,40}(?:promotion rules?|promot(?:e|ion)[^\n]{0,20}to|提升规则)/im.test(text)) {
         hasPromotionPolicy = true;
       }
       if (!isDecisionFile(file)) {
