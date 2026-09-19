@@ -99,6 +99,8 @@ function analyzeProject(cwd) {
     countBasename(allFiles, "CLAUDE.md") >= 2 || countBasename(allFiles, "AGENTS.md") >= 2;
 
   const numberedRules = countNumberedRules(roots);
+  const decisionSteering = analyzeDecisionSteering(allFiles, cwd);
+  const steeringOk = numberedRules >= 5 || decisionSteering.ok;
   const ruleTrace = analyzeRuleTraceability(roots, allFiles, cwd);
   const hooks = detectHooksConfig(roots, scripts, workspaceScripts, dirScripts);
   const isClaude = isClaudeCodeProject(allFiles);
@@ -233,10 +235,14 @@ function analyzeProject(cwd) {
     ),
     check(
       "Steering loop",
-      numberedRules >= 5,
+      steeringOk,
       numberedRules >= 5
         ? "Keep growing numbered rules after each bug fix; each rule should map to a sensor (see Rule sensors)."
-        : `Add numbered rules ("规则 N" / "Rule N") to CLAUDE.md/AGENTS.md that grow after each bug fix -- the rising count is the steering loop heartbeat. Found ${numberedRules}.`,
+        : decisionSteering.ok
+          ? `Found ${decisionSteering.count} numbered decision entries with ${decisionSteering.signal}; keep linking promoted decisions to tests or validators so the log does not become false-safety documentation.`
+          : `Add numbered rules ("规则 N" / "Rule N") or maintain a decision log with 5+ D/ADR entries plus an active promotion policy or cross-document references. Found ${numberedRules} rules and ${decisionSteering.count} decision entries.`,
+      false,
+      { steeringEvidence: decisionSteering.ok ? "decision-log" : "numbered-rules" },
     ),
     check(
       "Failure observability",
@@ -257,7 +263,7 @@ function analyzeProject(cwd) {
     ),
   ];
 
-  enrichDepth(checks, { allFiles, roots, filesByRoot });
+  enrichDepth(checks, { allFiles, roots, filesByRoot, decisionSteering });
   // Weighted score: critical foundation checks (validation/tests/CI) and
   // enforcement checks weigh more than depth/maturity checks, so missing CI
   // hurts the score more than missing "Reusable skills".
@@ -424,7 +430,9 @@ function enrichDepth(checks, ctx) {
   set("Agent instructions", countInstructionLines(ctx.roots, ctx.filesByRoot), "instruction line(s)");
   set("Reusable skills", countSkills(merged), "skill(s)");
   set("Architecture sensors", countValidators(merged), "validator script(s)");
-  set("Steering loop", countNumberedRules(ctx.roots), "numbered rule(s)");
+  const ruleCount = countNumberedRules(ctx.roots);
+  if (ruleCount >= 5) set("Steering loop", ruleCount, "numbered rule(s)");
+  else if (ctx.decisionSteering.ok) set("Steering loop", ctx.decisionSteering.count, "numbered decision(s)");
 }
 
 function check(area, ok, action, na = false, extra = {}) {
@@ -582,6 +590,53 @@ function countNumberedRules(roots) {
     }
   }
   return count;
+}
+
+/** Detect an actively used decision-log steering convention without treating any
+ * old ADR collection as a feedback loop. A log needs at least five distinct
+ * D/ADR identifiers and evidence of use: either an explicit promotion policy or
+ * references to at least two of its identifiers outside the defining files. */
+function analyzeDecisionSteering(allFiles, cwd) {
+  const isDecisionFile = (file) =>
+    /^(?:decisions\.md|docs\/decisions\.md|(?:docs\/)?(?:decisions|adr)\/[^/]+\.md)$/i.test(file);
+  const decisionFiles = [...allFiles].filter((file) => !file.endsWith("/") && isDecisionFile(file));
+  const ids = new Set();
+  for (const file of decisionFiles) {
+    try {
+      const text = fs.readFileSync(path.join(cwd, file), "utf8");
+      const re = /^[ \t]*(?:#{1,6}\s*|[-*]\s*)?(D\d{2,}|ADR[- ]?\d{2,})\b/gim;
+      let match;
+      while ((match = re.exec(text)) !== null) ids.add(match[1].toUpperCase().replace(" ", "-"));
+    } catch {
+      /* ignore unreadable decision files */
+    }
+  }
+
+  let hasPromotionPolicy = false;
+  const referenced = new Set();
+  for (const file of allFiles) {
+    if (file.endsWith("/") || !/\.md$/i.test(file)) continue;
+    try {
+      const text = fs.readFileSync(path.join(cwd, file), "utf8");
+      const isPolicyFile = /^(?:AGENTS|CLAUDE)\.md$/i.test(file) ||
+        (/^docs\//i.test(file) && !/(?:^|\/)(?:changelog|release(?:-notes)?)(?:\.|\/)/i.test(file));
+      if (isPolicyFile && /(?:^|\n)#{1,6}\s*(?:promotion rules?|promot(?:e|ion).*to|提升规则)\b/im.test(text)) {
+        hasPromotionPolicy = true;
+      }
+      if (!isDecisionFile(file)) {
+        for (const id of ids) {
+          const flexible = id.replace("-", "[- ]?");
+          if (new RegExp(`\\b${flexible}\\b`, "i").test(text)) referenced.add(id);
+        }
+      }
+    } catch {
+      /* ignore unreadable markdown files */
+    }
+  }
+  const signal = hasPromotionPolicy
+    ? "an explicit promotion policy"
+    : `${referenced.size} cross-document decision references`;
+  return { ok: ids.size >= 5 && (hasPromotionPolicy || referenced.size >= 2), count: ids.size, signal };
 }
 
 /** Per-rule traceability: extract numbered-rule prose, pull keywords, and check each
