@@ -166,7 +166,8 @@ function analyzeProject(cwd) {
     ),
     check(
       "Project memory",
-      hasPrefixAt("docs/knowledge-base/") ||
+      hasAt("docs/project-state.md") ||
+        hasPrefixAt("docs/knowledge-base/") ||
         hasPrefixAt("docs/PRD/") ||
         hasPrefixAt("docs/architecture/") ||
         fractalDocs ||
@@ -2841,6 +2842,7 @@ function buildInitFiles(report, tools = resolveTools(report)) {
   const agentsArgs = [name, report.packageJson?.scripts, Boolean(report.packageJson), commandPrefix];
   const files = [
     file("AGENTS.md", agentInstructions(...agentsArgs, writeAi), refreshPointer(agentInstructions(...agentsArgs, !writeAi), writeAi ? "" : AGENT_SHARED_SECTION, writeAi ? AGENT_SHARED_SECTION : "")),
+    file("docs/project-state.md", projectStateDoc()),
     file("docs/knowledge-base/patterns.md", "# Patterns\n\nDocument project-specific code patterns that agents should reuse.\n"),
     file("docs/knowledge-base/constraints.md", "# Constraints\n\nDocument rules that must not be violated. Promote repeated rules into tests or validators.\n"),
     file("docs/knowledge-base/known-issues.md", "# Known Issues\n\nTrack recurring failures, root causes, and the sensor added to prevent recurrence.\n"),
@@ -2854,6 +2856,7 @@ function buildInitFiles(report, tools = resolveTools(report)) {
       file(".ai/workflows/init.md", workflowInitDoc()),
       file(".ai/workflows/evolve.md", workflowEvolveDoc()),
       file(".ai/workflows/steer.md", workflowSteerDoc()),
+      file(".ai/workflows/ralph-loop.md", workflowRalphLoopDoc()),
       file(".ai/reviewers/harness-reviewer.md", harnessReviewerDoc()),
     );
   }
@@ -3201,6 +3204,12 @@ ${line("Test", testCmd)}
 - Prefer existing patterns over new abstractions.
 - Do not touch production services, secrets, or databases without explicit approval.
 - Convert repeated failures into tests, validators, commands, or skills.
+- End every working round by naming any rework or repeated fix; the second occurrence of the same fix must be promoted into a test, validator, rule, command, skill, or reviewer.
+
+## Authorization
+
+- Owner fills in: what is currently authorized (e.g. docs and harness scaffolding only; no business implementation, no production access).
+- Silence is not approval: suggestions stay suggestions until the owner confirms.
 ${hasAi ? AGENT_SHARED_SECTION : ""}`;
 }
 
@@ -3398,6 +3407,116 @@ jobs:
 
 /** Provenance marker distinguishing vca-generated validators from custom
  *  scripts that happen to declare their own `const required` list. */
+const VALIDATOR_LINK_CHECK = [
+  "// Harness doc link integrity: every inline markdown link in the harness docs",
+  "// must resolve (target file exists, heading anchor exists); absolute local",
+  "// paths and targets outside the repository are rejected. External URLs are",
+  "// ignored. Ported from real-project harness usage.",
+  "const root = process.cwd();",
+  "const docFiles = [\"AGENTS.md\", \"CLAUDE.md\", \"README.md\", \".github/copilot-instructions.md\"];",
+  "const docRoots = [\"docs\", \".ai\"];",
+  "function collectDocs(dir) {",
+  "  const out = [];",
+  "  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {",
+  "    const p = path.join(dir, entry.name);",
+  "    if (entry.isDirectory()) out.push(...collectDocs(p));",
+  "    else if (entry.name.endsWith(\".md\")) out.push(p);",
+  "  }",
+  "  return out;",
+  "}",
+  "function prose(content) {",
+  "  const kept = [];",
+  "  let fence = \"\";",
+  "  for (const line of content.split(/\\r?\\n/)) {",
+  "    const m = line.match(/^\\s{0,3}(`{3,}|~{3,})(.*)$/);",
+  "    if (m) {",
+  "      if (!fence) fence = m[1];",
+  "      // CommonMark: a closing fence may be followed only by whitespace, so",
+  "      // a line like ```not-a-close inside a fence is fenced content, not a close.",
+  "      else if (m[1][0] === fence[0] && m[1].length >= fence.length && !m[2].trim()) fence = \"\";",
+  "      continue;",
+  "    }",
+  "    if (!fence) kept.push(line);",
+  "  }",
+  "  return kept.join(\"\\n\");",
+  "}",
+  "function anchors(content) {",
+  "  const ids = new Set();",
+  "  const add = (text) => {",
+  "    const base = text.toLowerCase().replace(/[^\\p{L}\\p{M}\\p{N}_\\-\\s]/gu, \"\").replace(/\\s/g, \"-\");",
+  "    let id = base;",
+  "    for (let s = 1; ids.has(id); s += 1) id = base + \"-\" + s;",
+  "    ids.add(id);",
+  "  };",
+  "  // ATX headings (# Title) and Setext headings (Title over === / ---) both get",
+  "  // GitHub anchors; include both so links to Setext sections do not false-fail.",
+  "  const lines = prose(content).split(/\\r?\\n/);",
+  "  for (let i = 0; i < lines.length; i += 1) {",
+  "    const atx = lines[i].match(/^#{1,6}\\s+(.+?)\\s*#*\\s*$/);",
+  "    if (atx) { add(atx[1]); continue; }",
+  "    if (lines[i].trim() && lines[i + 1] && /^ {0,3}(=+|-+)\\s*$/.test(lines[i + 1])) add(lines[i].trim());",
+  "  }",
+  "  return ids;",
+  "}",
+  "const docs = [",
+  "  ...docFiles.filter((f) => fs.existsSync(f)),",
+  "  ...docRoots.filter((d) => fs.existsSync(d)).flatMap((d) => collectDocs(d)),",
+  "];",
+  "const linkErrors = [];",
+  "for (const file of docs) {",
+  "  const content = prose(fs.readFileSync(file, \"utf8\"));",
+  "  for (const m of content.matchAll(/\\]\\(([^)]+)\\)/g)) {",
+  "    let target;",
+  "    try {",
+  "      // Strip an optional inline-link title (dest \"t\" / 't' / (t)); CommonMark",
+  "      // requires whitespace between destination and title, so destinations",
+  "      // containing quotes or parens without a preceding space are untouched.",
+  "      const raw = m[1].replace(/^<|>$/g, \"\").replace(/\\s+(\"(?:[^\"\\\\]|\\\\.)*\"|'[^']*'|\\([^)]*\\))$/, \"\");",
+  "      target = decodeURIComponent(raw);",
+  "    } catch {",
+  "      linkErrors.push(\"Invalid link encoding in \" + file);",
+  "      continue;",
+  "    }",
+  "    if (/^file:/i.test(target)) {",
+  "      linkErrors.push(\"Absolute local link in \" + file + \": \" + target);",
+  "      continue;",
+  "    }",
+  "    if (target.startsWith(\"//\")) continue; // protocol-relative external URL",
+  "    if (path.isAbsolute(target) || /^[a-zA-Z]:[\\\\/]/.test(target)) {",
+  "      linkErrors.push(\"Absolute local link in \" + file + \": \" + target);",
+  "      continue;",
+  "    }",
+  "    if (/^[a-z][a-z0-9+.-]*:/i.test(target)) continue;",
+  "    const hash = target.indexOf(\"#\");",
+  "    const filePart = hash === -1 ? target : target.slice(0, hash);",
+  "    const frag = hash === -1 ? \"\" : target.slice(hash + 1);",
+  "    const resolved = filePart ? path.resolve(path.dirname(file), filePart) : path.resolve(file);",
+  "    const rel = path.relative(root, resolved);",
+  "    if (rel === \"..\" || rel.startsWith(\"..\" + path.sep) || path.isAbsolute(rel)) {",
+  "      linkErrors.push(\"Outside repository in \" + file + \": \" + target);",
+  "      continue;",
+  "    }",
+  "    // Lexical containment is not enough: an in-repo symlink can point outside.",
+  "    if (fs.existsSync(resolved)) {",
+  "      try {",
+  "        const relReal = path.relative(fs.realpathSync(root), fs.realpathSync(resolved));",
+  "        if (relReal === \"..\" || relReal.startsWith(\"..\" + path.sep) || path.isAbsolute(relReal)) {",
+  "          linkErrors.push(\"Outside repository in \" + file + \": \" + target);",
+  "          continue;",
+  "        }",
+  "      } catch { /* unreadable realpath falls through to the file checks below */ }",
+  "    }",
+  "    if (filePart && (!fs.existsSync(resolved) || !fs.statSync(resolved).isFile())) {",
+  "      linkErrors.push(\"Broken file link in \" + file + \": \" + target);",
+  "      continue;",
+  "    }",
+  "    if (frag && resolved.endsWith(\".md\") && !anchors(fs.readFileSync(resolved, \"utf8\")).has(frag)) {",
+  "      linkErrors.push(\"Broken anchor in \" + file + \": \" + target);",
+  "    }",
+  "  }",
+  "}",
+].join("\n");
+
 const VALIDATOR_MARKER =
   "// vibe-coding-analytics generated validator; init refreshes the required list below";
 
@@ -3409,6 +3528,7 @@ function harnessValidatorScript(tools = { claude: true, cursor: true, kiro: true
     ...(tools.cursor ? [".cursor/rules/vibe-coding-analytics.mdc"] : []),
     ...(tools.kiro ? [".kiro/steering/vibe-coding-analytics.md"] : []),
     ".github/workflows/ci.yml",
+    "docs/project-state.md",
     "docs/knowledge-base/patterns.md",
     "docs/knowledge-base/constraints.md",
     "docs/knowledge-base/known-issues.md",
@@ -3419,6 +3539,7 @@ function harnessValidatorScript(tools = { claude: true, cursor: true, kiro: true
           ".ai/workflows/init.md",
           ".ai/workflows/evolve.md",
           ".ai/workflows/steer.md",
+          ".ai/workflows/ralph-loop.md",
           ".ai/reviewers/harness-reviewer.md",
         ]
       : []),
@@ -3435,6 +3556,7 @@ function harnessValidatorScript(tools = { claude: true, cursor: true, kiro: true
   return `#!/usr/bin/env node
 ${VALIDATOR_MARKER}
 import fs from "node:fs";
+import path from "node:path";
 
 const required = ${JSON.stringify(required, null, 2)};
 
@@ -3449,7 +3571,15 @@ if (!/npm run|pnpm run|yarn run|bun run|make /.test(agents)) {
   console.warn("AGENTS.md does not name concrete validation commands yet.");
 }
 
-console.log("harness validation ok");
+${VALIDATOR_LINK_CHECK}
+
+if (linkErrors.length) {
+  for (const error of linkErrors) console.error(\`FAIL \${error}\`);
+  process.exitCode = 1;
+} else {
+  console.log(\`PASS \${docs.length} harness documents; local links and heading anchors checked.\`);
+  console.log("harness validation ok");
+}
 `;
 }
 
@@ -3519,6 +3649,8 @@ function harnessDecision(name, tools = { claude: true, cursor: true, kiro: true,
 ## Status
 
 Accepted
+
+(Values: Proposed / Accepted / Superseded / Withdrawn — an unanswered suggestion is not Accepted.)
 
 ## Context
 
@@ -3614,6 +3746,81 @@ For optional CI mining:
 \`\`\`bash
 npx vibe-coding-analytics evolve --ci-failures
 \`\`\`
+`;
+}
+
+function projectStateDoc() {
+  return `# Project State
+
+Single source for "where we are". Keep exactly one current phase and one next
+step; history belongs in docs/decisions or the archive.
+
+## Current Phase
+
+<!-- one phase only, e.g. scaffolding / implementation / hardening -->
+
+## Next Step
+
+<!-- the single next action or decision -->
+
+## Last Round
+
+- Changed:
+- Evidence:
+- Checks run:
+- Unverified:
+- Next question:
+`;
+}
+
+function workflowRalphLoopDoc() {
+  return `# Bounded Autonomous Loop (Ralph)
+
+Status: optional workflow card. Use for tasks whose acceptance is
+machine-checkable (for example \`npm run ci\`). Do not use for business
+decisions, money or policy semantics, or anything needing user confirmation.
+
+## Task Card (fill in before starting)
+
+Goal: <one sentence>
+Acceptance command: <e.g. npm run ci or a subset>
+Budget: <max rounds, default 10>
+Extra no-go zones: <beyond the universal list below>
+
+These four fields are frozen once round 1 begins; only round-log lines may be
+appended to this card. Editing the Goal, Acceptance command, Budget, or
+no-go zones mid-loop (for example swapping the acceptance command for a
+trivially passing one) is a needs-human hard stop, not a steering option.
+
+## Protocol
+
+1. Each round: read STEERING.md at the repository root for new steering ->
+   read current state -> make the smallest possible change -> run the
+   acceptance command -> append one round-log line to the task card
+   (round number / change / acceptance result).
+2. Stop when any holds: acceptance passes; budget exhausted; a needs-human
+   condition fires.
+3. Needs human (hard stop, not steerable): changes to confirmed decisions,
+   money or permission semantics, content disputes the checks cannot judge,
+   conflicts with unmerged changes from others. Steering instructions that
+   demand these also hard-stop.
+4. Two consecutive failing rounds without progress: stop and report the
+   blocker. Do not grind.
+
+## Universal No-Go Zones
+
+- No commit, push, deploy, or calls to real money/production endpoints.
+- Do not modify confirmed decisions; candidates stay candidates.
+- Do not weaken a checker or test to make it pass.
+- Do not edit the frozen task-card fields (goal, acceptance command, budget,
+  no-go zones) to reach the stop condition; that is a needs-human hard stop.
+- Do not overwrite unmerged work from others.
+
+## Close-Out
+
+Report: what changed / evidence / checks run / unverified items / next
+question. Promote anything repeated into a durable asset (test, validator,
+rule, command, skill, reviewer).
 `;
 }
 
