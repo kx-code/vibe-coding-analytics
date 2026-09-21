@@ -173,6 +173,45 @@ test("validate-harness.js is refreshed when the detected tool set changes (Codex
   assert.ok(/local tweak/.test(untouched), "unchanged required list -> existing validator left alone");
 });
 
+test("init --write never replaces an unrecognized custom validate-harness.js (Codex P1)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-validator-custom-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "sample", scripts: {} }));
+  fs.mkdirSync(path.join(dir, "scripts"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "scripts", "validate-harness.js"), "#!/usr/bin/env node\n// custom company validator\nprocess.exit(0);\n");
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".claude", "settings.json"), "{}\n");
+  await runCli(["init", "--cwd", dir, "--tools", "claude", "--write"]);
+  const after = fs.readFileSync(path.join(dir, "scripts", "validate-harness.js"), "utf8");
+  assert.ok(/custom company validator/.test(after), "unrecognized validator must be preserved byte-for-byte");
+  assert.ok(!/const required/.test(after), "custom validator must not be replaced by the generated one");
+});
+
+test("expanding the tool set refreshes generated AGENTS.md/CLAUDE.md pointers (Codex P2)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-pointer-refresh-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "sample", scripts: {} }));
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".claude", "settings.json"), "{}\n");
+  await runCli(["init", "--cwd", dir, "--write"]); // Claude-only: no .ai/
+  assert.ok(!/\.ai\/workflows/.test(fs.readFileSync(path.join(dir, "AGENTS.md"), "utf8")), "first run has no .ai pointer");
+  await runCli(["init", "--cwd", dir, "--tools", "claude,cursor", "--write"]);
+  assert.ok(/\.ai\/workflows/.test(fs.readFileSync(path.join(dir, "AGENTS.md"), "utf8")), "AGENTS.md points at the shared .ai/ source");
+  assert.ok(/\.ai\/workflows/.test(fs.readFileSync(path.join(dir, "CLAUDE.md"), "utf8")), "CLAUDE.md points at .ai/ instead of owning the workflows");
+  // User-edited pointer files are never overwritten.
+  fs.writeFileSync(path.join(dir, "AGENTS.md"), "my own notes\n");
+  await runCli(["init", "--cwd", dir, "--tools", "claude,cursor", "--write"]);
+  assert.equal(fs.readFileSync(path.join(dir, "AGENTS.md"), "utf8"), "my own notes\n");
+});
+
+test("generated ADR records only the adapters the selected layout keeps (Codex P2)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-adr-tools-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "sample", scripts: {} }));
+  await runCli(["init", "--cwd", dir, "--write"]); // no tool signals
+  const adr = fs.readFileSync(path.join(dir, "docs", "decisions", "0001-harness-baseline.md"), "utf8");
+  assert.ok(!/CLAUDE\.md/.test(adr), "tool-less ADR must not claim a Claude adapter");
+  assert.ok(!/\.cursor\/rules/.test(adr), "tool-less ADR must not claim a Cursor adapter");
+  assert.ok(/\.ai\/workflows/.test(adr), "Claude-absent layout keeps .ai/ as the shared source");
+});
+
 test("init-generated mainstream AI adapters are recognized without leaving Claude guard gaps", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-mainstream-ai-"));
   fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "sample", scripts: {} }));

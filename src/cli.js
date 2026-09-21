@@ -2829,12 +2829,13 @@ function buildInitFiles(report, tools = resolveTools(report)) {
   // at .ai/workflows as their only workflow home.)
   const toolCount = [tools.claude, tools.cursor, tools.kiro, tools.copilot].filter(Boolean).length;
   const writeAi = !tools.claude || toolCount >= 2;
+  const agentsArgs = [name, report.packageJson?.scripts, Boolean(report.packageJson), commandPrefix];
   const files = [
-    file("AGENTS.md", agentInstructions(name, report.packageJson?.scripts, Boolean(report.packageJson), commandPrefix, writeAi)),
+    file("AGENTS.md", agentInstructions(...agentsArgs, writeAi), refreshPointer(agentInstructions(...agentsArgs, !writeAi))),
     file("docs/knowledge-base/patterns.md", "# Patterns\n\nDocument project-specific code patterns that agents should reuse.\n"),
     file("docs/knowledge-base/constraints.md", "# Constraints\n\nDocument rules that must not be violated. Promote repeated rules into tests or validators.\n"),
     file("docs/knowledge-base/known-issues.md", "# Known Issues\n\nTrack recurring failures, root causes, and the sensor added to prevent recurrence.\n"),
-    file("docs/decisions/0001-harness-baseline.md", harnessDecision(name)),
+    file("docs/decisions/0001-harness-baseline.md", harnessDecision(name, tools, writeAi)),
     file("scripts/validate-harness.js", harnessValidatorScript(tools, writeAi), refreshHarnessValidator),
     file(".github/workflows/ci.yml", githubCiWorkflow(report)),
   ];
@@ -2849,7 +2850,7 @@ function buildInitFiles(report, tools = resolveTools(report)) {
   }
   if (tools.claude) {
     files.push(
-      file("CLAUDE.md", claudeInstructions(name, writeAi)),
+      file("CLAUDE.md", claudeInstructions(name, writeAi), refreshPointer(claudeInstructions(name, !writeAi))),
       file(".claude/commands/analytics.md", slashAnalyticsCommand()),
       file(".claude/commands/init.md", slashInitCommand()),
       file(".claude/commands/evolve.md", slashEvolveCommand()),
@@ -3431,16 +3432,38 @@ console.log("harness validation ok");
 /** Regenerate scripts/validate-harness.js only when its embedded required-file
  *  list changed (the tool set grew/shrunk between init runs); an unchanged
  *  validator is left byte-identical. (Codex P2 #4061862974) */
+/** Refresh a generated pointer file (AGENTS.md / CLAUDE.md) whose only
+ *  init-time variation is whether .ai/ is the shared source. When the tool set
+ *  grows between init runs, an unmodified file from the other layout is
+ *  upgraded to the current one; user-edited content is left untouched.
+ *  (Codex P2 #4061989780) */
+function refreshPointer(alternative) {
+  return (existing, incoming) => (existing === alternative ? incoming : existing);
+}
+
 function refreshHarnessValidator(existing, incoming) {
   const list = (s) => {
     const m = s.match(/const required = (\[[\s\S]*?\]);/);
-    if (!m) return s;
-    try { return JSON.stringify(JSON.parse(m[1])); } catch { return s; }
+    if (!m) return null;
+    try { return JSON.parse(m[1]); } catch { return null; }
   };
-  return list(existing) === list(incoming) ? existing : incoming;
+  const prev = list(existing);
+  const next = list(incoming);
+  // A validator we cannot parse as generated (custom or hand-written) is left
+  // untouched: replacing it would destroy user code. (Codex P1 #4061989769)
+  if (!prev || !next || JSON.stringify(prev) === JSON.stringify(next)) return existing;
+  // Recognized generated validator: update only the embedded required list,
+  // preserving any local tweaks to the body.
+  return existing.replace(/const required = (\[[\s\S]*?\]);/, `const required = ${JSON.stringify(next)};`);
 }
 
-function harnessDecision(name) {
+function harnessDecision(name, tools = { claude: true, cursor: true, kiro: true, copilot: true }, writeAi = true) {
+  const adapters = [
+    ...(tools.claude ? ["CLAUDE.md and .claude/commands/"] : []),
+    ...(tools.cursor ? [".cursor/rules/"] : []),
+    ...(tools.kiro ? [".kiro/steering/"] : []),
+    ...(tools.copilot ? [".github/copilot-instructions.md"] : []),
+  ].join(", ");
   return `# ADR 0001: Establish AI Coding Harness
 
 ## Status
@@ -3457,13 +3480,9 @@ roles, and feedback loops so AI coding agents can work safely across sessions.
 Keep a minimal harness in version control:
 
 - AGENTS.md for stable commands and rules.
-- CLAUDE.md, .cursor/rules/, .kiro/steering/, .github/copilot-instructions.md,
-  and .claude/commands/ as native adapters for mainstream AI tools.
-- docs/knowledge-base/ for patterns, constraints, and known issues.
+${adapters ? `- ${adapters} as native adapters for mainstream AI tools.\n` : ""}- docs/knowledge-base/ for patterns, constraints, and known issues.
 - docs/decisions/ for cross-session architectural decisions.
-- .ai/workflows/ for reusable workflows that any AI CLI or IDE can read.
-- .ai/reviewers/harness-reviewer.md for harness-focused review guidance.
-- scripts/validate-harness.js and CI as executable sensors.
+${writeAi ? `- .ai/workflows/ for reusable workflows that any AI CLI or IDE can read.\n- .ai/reviewers/harness-reviewer.md for harness-focused review guidance.\n` : ""}- scripts/validate-harness.js and CI as executable sensors.
 
 ## Consequences
 
