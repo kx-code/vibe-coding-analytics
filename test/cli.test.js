@@ -5694,3 +5694,31 @@ test("init detects legacy .cursorrules as a Cursor signal", async () => {
   assert.equal(fs.existsSync(path.join(dir, ".cursor/rules/vibe-coding-analytics.mdc")), true, "cursor adapter written for a legacy .cursorrules project");
   assert.equal(fs.existsSync(path.join(dir, "CLAUDE.md")), false, "no claude adapter without a claude signal");
 });
+
+test("init --tools all scaffold passes its own validator with doc-link checks", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-linkcheck-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "sample", scripts: {} }));
+  await runCli(["init", "--cwd", dir, "--tools", "all", "--write"]);
+  assert.equal(fs.existsSync(path.join(dir, ".ai/workflows/ralph-loop.md")), true, "ralph-loop workflow card scaffolded");
+  assert.equal(fs.existsSync(path.join(dir, "docs/project-state.md")), true, "project-state scaffolded");
+  const res = spawnSync(process.execPath, ["scripts/validate-harness.js"], { cwd: dir, encoding: "utf8" });
+  assert.equal(res.status, 0, `validator should pass on a clean scaffold: ${res.stderr}`);
+  assert.match(res.stdout, /local links and heading anchors checked/);
+});
+
+test("generated validator rejects broken, absolute, out-of-repo, and bad-anchor doc links", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-linkbad-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "sample", scripts: {} }));
+  await runCli(["init", "--cwd", dir, "--tools", "all", "--write"]);
+  fs.writeFileSync(
+    path.join(dir, "docs/knowledge-base/patterns.md"),
+    "# Patterns\n\nBad: [broken](nope.md), [abs](D:\\temp\\x.md), [out](../../../evil.md), [anchor](../project-state.md#nope).\nGood: [state](../project-state.md#current-phase).\n",
+  );
+  const res = spawnSync(process.execPath, ["scripts/validate-harness.js"], { cwd: dir, encoding: "utf8" });
+  assert.notEqual(res.status, 0, "validator should fail on bad links");
+  assert.match(res.stderr, /Broken file link.*nope\.md/);
+  assert.match(res.stderr, /Absolute local link.*temp/);
+  assert.match(res.stderr, /Outside repository.*evil\.md/);
+  assert.match(res.stderr, /Broken anchor.*#nope/);
+  assert.doesNotMatch(res.stderr, /current-phase/, "valid anchor link must not be flagged");
+});
