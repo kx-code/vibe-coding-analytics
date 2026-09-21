@@ -5685,3 +5685,12 @@ test("init --write skips the format hook when an existing `npm --prefix <dir> ru
   const settingsPath = path.join(dir, ".claude", "settings.json");
   assert.ok(!fs.existsSync(settingsPath), "no settings.json scaffolded: dirScripts passed to scaffold detectHooksConfig -> existing prefix-format hook recognized");
 });
+
+test("init detects legacy .cursorrules as a Cursor signal", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-init-cursorrules-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "sample", scripts: {} }));
+  fs.writeFileSync(path.join(dir, ".cursorrules"), "Always answer in English.\n");
+  await runCli(["init", "--cwd", dir, "--write"]);
+  assert.equal(fs.existsSync(path.join(dir, ".cursor/rules/vibe-coding-analytics.mdc")), true, "cursor adapter written for a legacy .cursorrules project");
+  assert.equal(fs.existsSync(path.join(dir, "CLAUDE.md")), false, "no claude adapter without a claude signal");
+});

@@ -1944,7 +1944,8 @@ function isUserAuthoredRulesPath(f) {
  *  scaffolded for tools in use (or forced via --tools) so a single-tool project
  *  is not littered with dead directories no tool reads. */
 function usesCursor(allFiles) {
-  return allFiles.some((f) => f === ".cursor" || f.startsWith(".cursor/") || f.includes("/.cursor/"));
+  // .cursorrules is Cursor's legacy root config (pre .cursor/rules/); still common.
+  return allFiles.some((f) => f === ".cursor" || f.startsWith(".cursor/") || f.includes("/.cursor/") || f === ".cursorrules" || f.endsWith("/.cursorrules"));
 }
 
 function usesKiro(allFiles) {
