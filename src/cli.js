@@ -1923,8 +1923,17 @@ function isClaudeCodeProject(allFiles) {
     if (isUserAuthoredAgentPath(f)) return true;
     if (isUserAuthoredSkillPath(f)) return true;
     if (isUserAuthoredCommandPath(f)) return true;
+    if (isUserAuthoredRulesPath(f)) return true;
   }
   return false;
+}
+
+/** Claude Code modular rules (`.claude/rules/**.md`). `vca init`/`evolve` never
+ *  write `.claude/rules/`, so any file there is user-authored: a rules-only
+ *  project (no CLAUDE.md, no settings) is still an active Claude project and
+ *  must get CLAUDE.md + hooks + deny-list scaffolding. (Codex P1 #4061862957) */
+function isUserAuthoredRulesPath(f) {
+  return /(?:^|\/)\.claude\/rules\/[^/]+\.md$/.test(f);
 }
 
 /** Which AI tools a project actually uses, from existing tool-native config.
@@ -2821,12 +2830,12 @@ function buildInitFiles(report, tools = resolveTools(report)) {
   const toolCount = [tools.claude, tools.cursor, tools.kiro, tools.copilot].filter(Boolean).length;
   const writeAi = !tools.claude || toolCount >= 2;
   const files = [
-    file("AGENTS.md", agentInstructions(name, report.packageJson?.scripts, Boolean(report.packageJson), commandPrefix)),
+    file("AGENTS.md", agentInstructions(name, report.packageJson?.scripts, Boolean(report.packageJson), commandPrefix, writeAi)),
     file("docs/knowledge-base/patterns.md", "# Patterns\n\nDocument project-specific code patterns that agents should reuse.\n"),
     file("docs/knowledge-base/constraints.md", "# Constraints\n\nDocument rules that must not be violated. Promote repeated rules into tests or validators.\n"),
     file("docs/knowledge-base/known-issues.md", "# Known Issues\n\nTrack recurring failures, root causes, and the sensor added to prevent recurrence.\n"),
     file("docs/decisions/0001-harness-baseline.md", harnessDecision(name)),
-    file("scripts/validate-harness.js", harnessValidatorScript(tools, writeAi)),
+    file("scripts/validate-harness.js", harnessValidatorScript(tools, writeAi), refreshHarnessValidator),
     file(".github/workflows/ci.yml", githubCiWorkflow(report)),
   ];
   if (writeAi) {
@@ -3138,7 +3147,7 @@ function writeOrPreview(cwd, files, write) {
   if (!write) console.log("\nRun again with --write to apply these changes.");
 }
 
-function agentInstructions(name, scripts, hasPackageJson = false, pm = "npm") {
+function agentInstructions(name, scripts, hasPackageJson = false, pm = "npm", hasAi = false) {
   // Emit `npm run <script>` rather than the raw body: locally installed binaries
   //  (vite, tsc, eslint) are only on PATH when run through npm scripts.
   const cmd = (...keys) => {
@@ -3171,7 +3180,13 @@ ${line("Test", testCmd)}
 - Prefer existing patterns over new abstractions.
 - Do not touch production services, secrets, or databases without explicit approval.
 - Convert repeated failures into tests, validators, commands, or skills.
-`;
+${hasAi ? `
+## Shared Workflow Source
+
+Use .ai/workflows/ for reusable workflow prompts and .ai/reviewers/ for
+shared review criteria. Tool-native files are thin adapters that point back
+to this file and .ai/; do not duplicate long-lived rules elsewhere.
+` : ""}`;
 }
 
 function copilotInstructions(name) {
@@ -3411,6 +3426,18 @@ if (!/npm run|pnpm run|yarn run|bun run|make /.test(agents)) {
 
 console.log("harness validation ok");
 `;
+}
+
+/** Regenerate scripts/validate-harness.js only when its embedded required-file
+ *  list changed (the tool set grew/shrunk between init runs); an unchanged
+ *  validator is left byte-identical. (Codex P2 #4061862974) */
+function refreshHarnessValidator(existing, incoming) {
+  const list = (s) => {
+    const m = s.match(/const required = (\[[\s\S]*?\]);/);
+    if (!m) return s;
+    try { return JSON.stringify(JSON.parse(m[1])); } catch { return s; }
+  };
+  return list(existing) === list(incoming) ? existing : incoming;
 }
 
 function harnessDecision(name) {

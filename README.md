@@ -115,7 +115,7 @@ Adapters are scaffolded **only for AI tools the project already uses**, so a
 single-tool project is not littered with directories no tool reads:
 
 - Claude Code — detected from `CLAUDE.md`, `.claude/settings*.json`,
-  user-authored `.claude/agents|skills|commands/`.
+  user-authored `.claude/agents|skills|commands|rules/`.
 - Cursor — detected from any `.cursor/` config.
 - Kiro — detected from any `.kiro/` config.
 - GitHub Copilot — detected from `.github/copilot-instructions.md`.
