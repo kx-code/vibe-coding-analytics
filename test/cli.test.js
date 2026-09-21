@@ -231,6 +231,49 @@ test("expanding the tool set refreshes generated AGENTS.md/CLAUDE.md pointers (C
   assert.equal(fs.readFileSync(path.join(dir, "AGENTS.md"), "utf8"), "my own notes\n");
 });
 
+test("nested .claude/rules/ subdirectories still mark a Claude project (Codex P1)", () => {
+  // Claude Code discovers rules recursively (e.g. .claude/rules/frontend/style.md);
+  // the detector previously matched only direct children, so nested-rules-only
+  // projects were misread as non-Claude and their guard checks went N/A.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-claude-nested-rules-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {} }));
+  fs.mkdirSync(path.join(dir, ".claude", "rules", "frontend"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".claude", "rules", "frontend", "style.md"), "# style rule");
+  const r = analyzeForTest(dir);
+  const guard = r.checks.find((c) => c.area === "Dangerous-command guard");
+  assert.equal(guard.na, false, "nested .claude/rules -> Claude project -> guard NOT N/A");
+});
+
+test("adopting Claude keeps an existing .ai/ shared layer instead of orphaning it (Codex P2)", async () => {
+  // A tool-less project gets .ai/; if it later adopts Claude, dropping writeAi
+  // would strip the AGENTS.md pointer and stop validating the still-present .ai files.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-ai-persist-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "sample", scripts: {} }));
+  await runCli(["init", "--cwd", dir, "--write"]); // tool-less: .ai/ created
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".claude", "settings.json"), "{}\n");
+  await runCli(["init", "--cwd", dir, "--write"]); // now a Claude signal exists
+  assert.ok(/\.ai\/workflows/.test(fs.readFileSync(path.join(dir, "AGENTS.md"), "utf8")), "AGENTS.md keeps pointing at the existing .ai/ layer");
+  assert.ok(/\.ai\/workflows/.test(fs.readFileSync(path.join(dir, "CLAUDE.md"), "utf8")), "CLAUDE.md adopts .ai/ as the shared source");
+  assert.ok(/\.ai\/workflows\/evolve\.md/.test(fs.readFileSync(path.join(dir, "scripts", "validate-harness.js"), "utf8")), "validator still requires the .ai/ files");
+});
+
+test("pointer files refresh even when package inputs drifted between runs (Codex P2)", async () => {
+  // Tools expanded AND a validate script was added between init runs: the
+  // stale generated AGENTS.md no longer byte-matches the alternative render,
+  // so the pointer upgrade was skipped and the freshly created .ai/ layer went
+  // unmentioned. The layout section must refresh independently of that drift.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-pointer-drift-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "sample", scripts: {} }));
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".claude", "settings.json"), "{}\n");
+  await runCli(["init", "--cwd", dir, "--write"]); // claude-only: no .ai pointer
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "sample", scripts: { validate: "node scripts/validate-harness.js" } }));
+  await runCli(["init", "--cwd", dir, "--tools", "claude,cursor", "--write"]);
+  assert.ok(/## Shared Workflow Source/.test(fs.readFileSync(path.join(dir, "AGENTS.md"), "utf8")), "drifted generated AGENTS.md gains the .ai/ pointer");
+  assert.ok(/\.ai\/workflows/.test(fs.readFileSync(path.join(dir, "CLAUDE.md"), "utf8")), "drifted CLAUDE.md switches to the shared source");
+});
+
 test("generated ADR records only the adapters the selected layout keeps (Codex P2)", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-adr-tools-"));
   fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "sample", scripts: {} }));

@@ -1928,12 +1928,15 @@ function isClaudeCodeProject(allFiles) {
   return false;
 }
 
-/** Claude Code modular rules (`.claude/rules/**.md`). `vca init`/`evolve` never
+/** Claude Code modular rules (`.claude/rules/**.md`, including nested
+ *  subdirectories like `.claude/rules/frontend/style.md` — Claude Code
+ *  discovers rules recursively). `vca init`/`evolve` never
  *  write `.claude/rules/`, so any file there is user-authored: a rules-only
  *  project (no CLAUDE.md, no settings) is still an active Claude project and
- *  must get CLAUDE.md + hooks + deny-list scaffolding. (Codex P1 #4061862957) */
+ *  must get CLAUDE.md + hooks + deny-list scaffolding.
+ *  (Codex P1 #4061862957, #4062149876) */
 function isUserAuthoredRulesPath(f) {
-  return /(?:^|\/)\.claude\/rules\/[^/]+\.md$/.test(f);
+  return /(?:^|\/)\.claude\/rules\/(?:[^/]+\/)*[^/]+\.md$/.test(f);
 }
 
 /** Which AI tools a project actually uses, from existing tool-native config.
@@ -2828,10 +2831,15 @@ function buildInitFiles(report, tools = resolveTools(report)) {
   // (.ai/ also stays when Claude is absent: AGENTS.md points codex/other CLIs
   // at .ai/workflows as their only workflow home.)
   const toolCount = [tools.claude, tools.cursor, tools.kiro, tools.copilot].filter(Boolean).length;
-  const writeAi = !tools.claude || toolCount >= 2;
+  // Keep .ai/ enabled once the shared layer already exists on disk (e.g. a
+  // tool-less project adopted Claude later): switching to the Claude-only
+  // layout would orphan the still-present .ai/ files, strip their pointer
+  // from AGENTS.md, and stop validating them. (Codex P2 #4062149881)
+  const hasAiLayer = [...(report.files || [])].some((f) => f === ".ai" || f.startsWith(".ai/") || f.includes("/.ai/"));
+  const writeAi = !tools.claude || toolCount >= 2 || hasAiLayer;
   const agentsArgs = [name, report.packageJson?.scripts, Boolean(report.packageJson), commandPrefix];
   const files = [
-    file("AGENTS.md", agentInstructions(...agentsArgs, writeAi), refreshPointer(agentInstructions(...agentsArgs, !writeAi))),
+    file("AGENTS.md", agentInstructions(...agentsArgs, writeAi), refreshPointer(agentInstructions(...agentsArgs, !writeAi), writeAi ? "" : AGENT_SHARED_SECTION, writeAi ? AGENT_SHARED_SECTION : "")),
     file("docs/knowledge-base/patterns.md", "# Patterns\n\nDocument project-specific code patterns that agents should reuse.\n"),
     file("docs/knowledge-base/constraints.md", "# Constraints\n\nDocument rules that must not be violated. Promote repeated rules into tests or validators.\n"),
     file("docs/knowledge-base/known-issues.md", "# Known Issues\n\nTrack recurring failures, root causes, and the sensor added to prevent recurrence.\n"),
@@ -2850,7 +2858,7 @@ function buildInitFiles(report, tools = resolveTools(report)) {
   }
   if (tools.claude) {
     files.push(
-      file("CLAUDE.md", claudeInstructions(name, writeAi), refreshPointer(claudeInstructions(name, !writeAi))),
+      file("CLAUDE.md", claudeInstructions(name, writeAi), refreshPointer(claudeInstructions(name, !writeAi), writeAi ? CLAUDE_NATIVE_SOURCE : CLAUDE_AI_SOURCE, writeAi ? CLAUDE_AI_SOURCE : CLAUDE_NATIVE_SOURCE)),
       file(".claude/commands/analytics.md", slashAnalyticsCommand()),
       file(".claude/commands/init.md", slashInitCommand()),
       file(".claude/commands/evolve.md", slashEvolveCommand()),
@@ -3148,6 +3156,17 @@ function writeOrPreview(cwd, files, write) {
   if (!write) console.log("\nRun again with --write to apply these changes.");
 }
 
+/** The .ai shared-source section appended to generated AGENTS.md. Deliberately
+ *  input-independent (no name/scripts/pm) so refreshPointer can swap it even
+ *  when other template inputs drifted between init runs. (Codex P2 #4062149885) */
+const AGENT_SHARED_SECTION = `
+## Shared Workflow Source
+
+Use .ai/workflows/ for reusable workflow prompts and .ai/reviewers/ for
+shared review criteria. Tool-native files are thin adapters that point back
+to this file and .ai/; do not duplicate long-lived rules elsewhere.
+`;
+
 function agentInstructions(name, scripts, hasPackageJson = false, pm = "npm", hasAi = false) {
   // Emit `npm run <script>` rather than the raw body: locally installed binaries
   //  (vite, tsc, eslint) are only on PATH when run through npm scripts.
@@ -3181,14 +3200,18 @@ ${line("Test", testCmd)}
 - Prefer existing patterns over new abstractions.
 - Do not touch production services, secrets, or databases without explicit approval.
 - Convert repeated failures into tests, validators, commands, or skills.
-${hasAi ? `
-## Shared Workflow Source
-
-Use .ai/workflows/ for reusable workflow prompts and .ai/reviewers/ for
-shared review criteria. Tool-native files are thin adapters that point back
-to this file and .ai/; do not duplicate long-lived rules elsewhere.
-` : ""}`;
+${hasAi ? AGENT_SHARED_SECTION : ""}`;
 }
+
+/** The two layout variants of the CLAUDE.md guidance paragraph. Constant,
+ *  input-independent text so refreshPointer can swap them under input drift.
+ *  (Codex P2 #4062149885) */
+const CLAUDE_AI_SOURCE = `Use .ai/workflows/ as the portable workflow source and .ai/reviewers/ as shared
+review criteria. The .claude/commands/ files are Claude Code adapters; do not
+duplicate long-lived rules here unless they are Claude-specific.`;
+const CLAUDE_NATIVE_SOURCE = `Use .claude/commands/ as the workflow home and .claude/agents/ for reviewer
+specs; do not duplicate long-lived rules here unless they are Claude-specific.
+Run \`vca init --tools all --write\` if more AI tools are adopted later.`;
 
 function copilotInstructions(name) {
   return `# ${name} Copilot Instructions
@@ -3202,13 +3225,7 @@ source of truth.
 }
 
 function claudeInstructions(name, hasAi = true) {
-  const source = hasAi
-    ? `Use .ai/workflows/ as the portable workflow source and .ai/reviewers/ as shared
-review criteria. The .claude/commands/ files are Claude Code adapters; do not
-duplicate long-lived rules here unless they are Claude-specific.`
-    : `Use .claude/commands/ as the workflow home and .claude/agents/ for reviewer
-specs; do not duplicate long-lived rules here unless they are Claude-specific.
-Run \`vca init --tools all --write\` if more AI tools are adopted later.`;
+  const source = hasAi ? CLAUDE_AI_SOURCE : CLAUDE_NATIVE_SOURCE;
   return `# ${name} Claude Code Instructions
 
 Canonical project guidance lives in AGENTS.md.
@@ -3439,12 +3456,31 @@ console.log("harness validation ok");
  *  list changed (the tool set grew/shrunk between init runs); an unchanged
  *  validator is left byte-identical. (Codex P2 #4061862974) */
 /** Refresh a generated pointer file (AGENTS.md / CLAUDE.md) whose only
- *  init-time variation is whether .ai/ is the shared source. When the tool set
- *  grows between init runs, an unmodified file from the other layout is
- *  upgraded to the current one; user-edited content is left untouched.
- *  (Codex P2 #4061989780) */
-function refreshPointer(alternative) {
-  return (existing, incoming) => (existing === alternative ? incoming : existing);
+ *  init-time variation is which home owns the shared workflows. When the tool
+ *  set grows between init runs, an unmodified file from the other layout is
+ *  upgraded byte-for-byte (existing === alternative). When OTHER template
+ *  inputs (package name, scripts, package manager) also drifted between runs,
+ *  byte comparison misreads the stale generated file as user-authored and the
+ *  new .ai/ pointer never lands; in that case swap only the layout-varying
+ *  section, which is input-independent constant text, preserving all other
+ *  content including genuine user edits. (Codex P2 #4061989780, #4062149885) */
+function refreshPointer(alternative, oldSection = "", newSection = "") {
+  return (existing, incoming) => {
+    if (existing === alternative) return incoming;
+    if (oldSection && newSection) {
+      return existing.includes(oldSection) ? existing.replace(oldSection, newSection) : existing;
+    }
+    if (!oldSection && newSection) {
+      // Layout adds the section: only append to a file that still ends with the
+      // generated constant tail, so hand-written AGENTS.md stays untouched.
+      const tail = alternative.slice(alternative.lastIndexOf("\n", alternative.length - 2) + 1);
+      return existing.endsWith(tail) && !existing.includes(newSection) ? existing + newSection : existing;
+    }
+    if (oldSection && !newSection) {
+      return existing.includes(oldSection) ? existing.replace(oldSection, "") : existing;
+    }
+    return existing;
+  };
 }
 
 function refreshHarnessValidator(existing, incoming) {
