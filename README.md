@@ -149,6 +149,10 @@ The `evolve` and `steer` commands are designed to pair with local loops:
 /loop 30m /steer   # after each bug fix: add the smallest sensor that would have caught it
 ```
 
+`.ai/workflows/ralph-loop.md` is an optional bounded autonomous-loop card for
+tasks with machine-checkable acceptance (task card, round budget, hard stops,
+universal no-go zones).
+
 Use it to extract repeated user corrections, failed checks, review feedback,
 and repeated command sequences into durable tests, validators, rules,
 commands, skills, or reviewer agents.
@@ -186,6 +190,9 @@ for marketplace submission.
 - Tests, typecheck, lint, architecture validators, and CI
 - Rule-to-sensor coverage: prose rules in `CLAUDE.md`/`AGENTS.md` backed by
   computational sensors (tests, lint, validators), not prose-only
+- Harness doc link integrity: the generated validator checks that every local
+  markdown link and heading anchor in the harness docs resolves, with no
+  absolute local paths and nothing escaping the repository
 - Steering loop: either numbered rules (`Rule N`) in `CLAUDE.md`/`AGENTS.md`,
   or 5+ numbered `D…`/`ADR-…` decision entries backed by a promotion policy or
   cross-document references. Requiring evidence of active use prevents a stale

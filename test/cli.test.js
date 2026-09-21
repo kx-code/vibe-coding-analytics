@@ -5694,3 +5694,100 @@ test("init detects legacy .cursorrules as a Cursor signal", async () => {
   assert.equal(fs.existsSync(path.join(dir, ".cursor/rules/vibe-coding-analytics.mdc")), true, "cursor adapter written for a legacy .cursorrules project");
   assert.equal(fs.existsSync(path.join(dir, "CLAUDE.md")), false, "no claude adapter without a claude signal");
 });
+
+test("init --tools all scaffold passes its own validator with doc-link checks", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-linkcheck-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "sample", scripts: {} }));
+  await runCli(["init", "--cwd", dir, "--tools", "all", "--write"]);
+  assert.equal(fs.existsSync(path.join(dir, ".ai/workflows/ralph-loop.md")), true, "ralph-loop workflow card scaffolded");
+  assert.equal(fs.existsSync(path.join(dir, "docs/project-state.md")), true, "project-state scaffolded");
+  const res = spawnSync(process.execPath, ["scripts/validate-harness.js"], { cwd: dir, encoding: "utf8" });
+  assert.equal(res.status, 0, `validator should pass on a clean scaffold: ${res.stderr}`);
+  assert.match(res.stdout, /local links and heading anchors checked/);
+});
+
+test("generated validator rejects broken, absolute, out-of-repo, and bad-anchor doc links", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-linkbad-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "sample", scripts: {} }));
+  await runCli(["init", "--cwd", dir, "--tools", "all", "--write"]);
+  fs.writeFileSync(
+    path.join(dir, "docs/knowledge-base/patterns.md"),
+    "# Patterns\n\nBad: [broken](nope.md), [abs](D:\\temp\\x.md), [out](../../../evil.md), [anchor](../project-state.md#nope).\nGood: [state](../project-state.md#current-phase).\n",
+  );
+  const res = spawnSync(process.execPath, ["scripts/validate-harness.js"], { cwd: dir, encoding: "utf8" });
+  assert.notEqual(res.status, 0, "validator should fail on bad links");
+  assert.match(res.stderr, /Broken file link.*nope\.md/);
+  assert.match(res.stderr, /Absolute local link.*temp/);
+  assert.match(res.stderr, /Outside repository.*evil\.md/);
+  assert.match(res.stderr, /Broken anchor.*#nope/);
+  assert.doesNotMatch(res.stderr, /current-phase/, "valid anchor link must not be flagged");
+});
+
+test("generated validator accepts titled links, setext anchors, protocol-relative URLs, and inner non-closing fences (Codex P2 PR#26)", async () => {
+  // Four false-positive classes in one doc: (1) [x](dest \"title\") is valid
+  // CommonMark — the title must not become part of the file path; (2) Setext
+  // headings (Title over ===) get GitHub anchors like ATX headings; (3)
+  // //example.com/docs is an external protocol-relative URL, not an absolute
+  // local path; (4) a line like ```not-a-close inside a fence is fenced CONTENT
+  // (closing fences may be followed only by whitespace), so links after it stay
+  // unscanned instead of being reported as broken prose links.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-linkvalid-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "sample", scripts: {} }));
+  await runCli(["init", "--cwd", dir, "--tools", "all", "--write"]);
+  const doc = [
+    "# Patterns",
+    "",
+    "Setext Title",
+    "============",
+    "",
+    "- Titled link: [state](../project-state.md \"Project state\").",
+    "- Protocol-relative external: [docs](//example.com/docs).",
+    "- Setext anchor: [t](#setext-title).",
+    "",
+    "```text",
+    "```not-a-close",
+    "[broken](inside-code.md)",
+    "```",
+    "",
+  ].join("\n");
+  fs.writeFileSync(path.join(dir, "docs", "knowledge-base", "patterns.md"), doc);
+  const res = spawnSync(process.execPath, ["scripts/validate-harness.js"], { cwd: dir, encoding: "utf8" });
+  assert.equal(res.status, 0, `valid titled/setext/external/fenced links must not be flagged: ${res.stderr}`);
+  assert.match(res.stdout, /local links and heading anchors checked/);
+});
+
+test("generated validator rejects in-repo symlinks pointing outside the repository (Codex P2 PR#26)", async (t) => {
+  // Lexical containment (path.relative) accepts docs/out.md -> /tmp/outside.md:
+  // the path is inside the repo, statSync follows the link, so an escaping
+  // symlink used to pass. The validator must compare realpaths of the repo root
+  // and existing targets before accepting the link.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-linksym-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "sample", scripts: {} }));
+  await runCli(["init", "--cwd", dir, "--tools", "all", "--write"]);
+  const outside = path.join(os.tmpdir(), "vca-linksym-outside.md");
+  fs.writeFileSync(outside, "# Outside\n");
+  try {
+    fs.symlinkSync(outside, path.join(dir, "docs", "knowledge-base", "outside.md"));
+  } catch (e) {
+    if (process.platform === "win32" && ["EPERM", "EACCES", "EINVAL"].includes(e.code)) return t.skip("file symlinks need Developer Mode on Windows");
+    throw e;
+  }
+  fs.writeFileSync(path.join(dir, "docs", "knowledge-base", "patterns.md"), "# Patterns\n\nOut: [outside](outside.md).\n");
+  const res = spawnSync(process.execPath, ["scripts/validate-harness.js"], { cwd: dir, encoding: "utf8" });
+  assert.notEqual(res.status, 0, "a symlink escaping the repository must fail validation");
+  assert.match(res.stderr, /Outside repository.*outside\.md/);
+});
+
+test("ralph-loop card freezes goal/acceptance/budget/no-go fields once round 1 starts (Codex P1 PR#26)", async () => {
+  // After a failing round nothing previously stopped the agent from editing the
+  // task card itself (e.g. swapping `npm run ci` for `true`) to satisfy the stop
+  // condition: the card is not a checker or test, so the no-go list missed it.
+  // The card must declare its four config fields immutable mid-loop and make
+  // editing them a needs-human hard stop.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-ralph-freeze-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "sample", scripts: {} }));
+  await runCli(["init", "--cwd", dir, "--tools", "all", "--write"]);
+  const ralph = fs.readFileSync(path.join(dir, ".ai", "workflows", "ralph-loop.md"), "utf8");
+  assert.match(ralph, /frozen once round 1/i, "task-card fields must be declared immutable once the loop starts");
+  assert.match(ralph, /needs-human hard stop/i, "editing frozen fields must be an explicit hard stop");
+});
