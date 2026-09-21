@@ -86,7 +86,7 @@ files.
 | Command | Purpose |
 | --- | --- |
 | `scan` | Audit the current project for AI coding readiness (`analytics` is an alias). |
-| `init` | Propose or create a minimum viable harness: `AGENTS.md`, `.ai/workflows`, `.ai/reviewers`, knowledge base, ADR decision log, CI, validator script, plus native adapters for Codex, Claude Code, Cursor, Kiro, and Copilot. |
+| `init` | Propose or create a minimum viable harness: `AGENTS.md`, `.ai/workflows`, `.ai/reviewers`, knowledge base, ADR decision log, CI, validator script, plus native adapters — only for the AI tools detected in the project (`--tools` to override). |
 | `evolve` | Propose or create self-evolution loop files for repeated improvements; also backfills hooks + deny list when missing. |
 
 ## Compatibility Model
@@ -108,6 +108,26 @@ files.
 The adapter files point back to `AGENTS.md` and `.ai/` instead of duplicating
 long-lived rules, so a project can be opened with multiple AI CLIs or IDEs
 without maintaining several copies of the same guidance.
+
+### Tool Detection
+
+Adapters are scaffolded **only for AI tools the project already uses**, so a
+single-tool project is not littered with directories no tool reads:
+
+- Claude Code — detected from `CLAUDE.md`, `.claude/settings*.json`,
+  user-authored `.claude/agents|skills|commands/`.
+- Cursor — detected from any `.cursor/` config.
+- Kiro — detected from any `.kiro/` config.
+- GitHub Copilot — detected from `.github/copilot-instructions.md`.
+
+A Claude-only project keeps `.claude/commands/` as its workflow home and skips
+the `.ai/` layer entirely (no duplication); `.ai/` is written when two or more
+tools are in use, or when Codex/other CLIs are the only readers. Force a
+tool set with `--tools claude,cursor` or `--tools all`.
+
+Adapters are intentionally plain files rather than symlinks: symlinks do not
+survive a default Git checkout on Windows, while a thin pointer file keeps the
+single-source behavior for every collaborator.
 
 ## Integrations
 

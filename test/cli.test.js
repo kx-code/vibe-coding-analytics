@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { execSync, execFileSync } from "node:child_process";
+import { execSync, execFileSync, spawnSync } from "node:child_process";
 import assert from "node:assert/strict";
 import { analyzeForTest, runCli, buildEvolutionPlan, printEvolution, printReport, parseOptions, denyEntryFamily, defaultDenyList } from "../src/cli.js";
 
@@ -55,7 +55,7 @@ test("analyzes an empty project with missing harness areas", () => {
 test("init --write creates baseline harness files", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-init-"));
   fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "sample", scripts: {} }));
-  await runCli(["init", "--cwd", dir, "--write"]);
+  await runCli(["init", "--cwd", dir, "--tools", "all", "--write"]);
   assert.equal(fs.existsSync(path.join(dir, "AGENTS.md")), true);
   assert.equal(fs.existsSync(path.join(dir, "CLAUDE.md")), true);
   assert.equal(fs.existsSync(path.join(dir, ".github/copilot-instructions.md")), true);
@@ -88,10 +88,37 @@ test("init --write creates baseline harness files", async () => {
   }
 });
 
+test("init scaffolds only detected tools by default", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-init-min-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "sample", scripts: {} }));
+  await runCli(["init", "--cwd", dir, "--write"]);
+  for (const p of ["AGENTS.md", "docs/decisions/0001-harness-baseline.md", "scripts/validate-harness.js", ".ai/workflows/evolve.md"]) {
+    assert.equal(fs.existsSync(path.join(dir, p)), true, `${p} written for a tool-less project`);
+  }
+  for (const p of ["CLAUDE.md", ".claude/settings.local.json", ".cursor/rules/vibe-coding-analytics.mdc", ".kiro/steering/vibe-coding-analytics.md", ".github/copilot-instructions.md"]) {
+    assert.equal(fs.existsSync(path.join(dir, p)), false, `${p} must not be written for a tool-less project`);
+  }
+});
+
+test("init claude-only project skips the .ai duplication layer", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-init-claude-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "sample", scripts: {} }));
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".claude", "settings.json"), "{}\n");
+  await runCli(["init", "--cwd", dir, "--write"]);
+  assert.equal(fs.existsSync(path.join(dir, ".claude/commands/evolve.md")), true, "claude adapters written");
+  assert.equal(fs.existsSync(path.join(dir, ".ai/workflows/evolve.md")), false, ".ai/ layer skipped for a claude-only project");
+  assert.equal(fs.existsSync(path.join(dir, ".cursor/rules/vibe-coding-analytics.mdc")), false, "cursor adapter skipped");
+  const claude = fs.readFileSync(path.join(dir, "CLAUDE.md"), "utf8");
+  assert.ok(/\.claude\/commands/.test(claude), "CLAUDE.md points at the native commands home");
+  const res = spawnSync(process.execPath, ["scripts/validate-harness.js"], { cwd: dir, encoding: "utf8" });
+  assert.equal(res.status, 0, `generated validate-harness passes: ${res.stderr}`);
+});
+
 test("init-generated mainstream AI adapters are recognized without leaving Claude guard gaps", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-mainstream-ai-"));
   fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "sample", scripts: {} }));
-  await runCli(["init", "--cwd", dir, "--write"]);
+  await runCli(["init", "--cwd", dir, "--tools", "all", "--write"]);
   const report = analyzeForTest(dir);
   const hooks = report.checks.find((c) => c.area === "Agent hooks");
   const guard = report.checks.find((c) => c.area === "Dangerous-command guard");
@@ -1449,6 +1476,7 @@ test("init --write scaffolds hooks + deny list for Claude Code projects", async 
 test("init --write scaffolds Claude adapters without hooks when no formatter is available", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-init-nohooks-"));
   fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "demo", scripts: {} }));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# demo\n");
   await runCli(["init", "--cwd", dir, "--write"]);
   assert.equal(fs.existsSync(path.join(dir, ".claude", "settings.json")), false, "no hook settings without formatter tools");
   assert.equal(fs.existsSync(path.join(dir, ".claude", "settings.local.json")), true, "dangerous-command guard is scaffolded with the Claude adapter");

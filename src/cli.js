@@ -36,7 +36,7 @@ export async function runCli(argv) {
 
   if (command === "init") {
     printReport(report);
-    const files = buildInitFiles(report);
+    const files = buildInitFiles(report, resolveTools(report, options.tools));
     writeOrPreview(cwd, files, options.write);
     return;
   }
@@ -64,10 +64,11 @@ export function analyzeForTest(cwd) {
 }
 
 export function parseOptions(args) {
-  const options = { write: false, cwd: null, format: "text", ciFailures: false };
+  const options = { write: false, cwd: null, format: "text", ciFailures: false, tools: null };
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i];
     if (arg === "--write") options.write = true;
+    if (arg === "--tools") options.tools = args[++i] || "";
     if (arg === "--cwd") options.cwd = args[++i];
     if (arg === "--format") options.format = args[++i] || "text";
     if (arg === "--ci-failures") options.ciFailures = true;
@@ -174,7 +175,7 @@ function analyzeProject(cwd) {
     ),
     check(
       "Reusable skills",
-      hasPrefixAt(".ai/workflows/") || hasPrefixAt(".claude/skills/") || hasPrefixAt("skills/") || hasPrefixAt("docs/workflows/"),
+      hasPrefixAt(".ai/workflows/") || hasPrefixAt(".claude/skills/") || hasPrefixAt(".claude/commands/") || hasPrefixAt("skills/") || hasPrefixAt("docs/workflows/"),
       "Create reusable AI workflows such as .ai/workflows, skills, or tool-specific commands for validate, deploy, migrate, or debug.",
     ),
     check(
@@ -1926,6 +1927,39 @@ function isClaudeCodeProject(allFiles) {
   return false;
 }
 
+/** Which AI tools a project actually uses, from existing tool-native config.
+ *  Tool adapters (.cursor/, .kiro/, copilot-instructions, .claude/) are only
+ *  scaffolded for tools in use (or forced via --tools) so a single-tool project
+ *  is not littered with dead directories no tool reads. */
+function usesCursor(allFiles) {
+  return allFiles.some((f) => f === ".cursor" || f.startsWith(".cursor/") || f.includes("/.cursor/"));
+}
+
+function usesKiro(allFiles) {
+  return allFiles.some((f) => f === ".kiro" || f.startsWith(".kiro/") || f.includes("/.kiro/"));
+}
+
+function usesCopilot(allFiles) {
+  return allFiles.some((f) => f === ".github/copilot-instructions.md" || f.endsWith("/.github/copilot-instructions.md"));
+}
+
+/** Resolve the tool selection for init: `--tools all` or `--tools claude,cursor`
+ *  forces tools; otherwise detect from the project's existing config files. */
+function resolveTools(report, toolsFlag) {
+  if (toolsFlag && /(^|,)all(,|$)/.test(toolsFlag)) {
+    return { claude: true, cursor: true, kiro: true, copilot: true };
+  }
+  const files = report.files ? [...report.files] : [];
+  const explicit = toolsFlag ? new Set(toolsFlag.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean)) : null;
+  const pick = (name, detected) => (explicit ? explicit.has(name) : detected);
+  return {
+    claude: pick("claude", isClaudeCodeProject(files)),
+    cursor: pick("cursor", usesCursor(files)),
+    kiro: pick("kiro", usesKiro(files)),
+    copilot: pick("copilot", usesCopilot(files)),
+  };
+}
+
 /** Detect whether the project declares prettier + eslint as dependencies, so we
  *  only scaffold Node edit-time hooks where they can actually run. Without this
  *  gate, a Python/Go/Rust Claude project would invoke undeclared prettier/eslint
@@ -2663,7 +2697,7 @@ function printHelp() {
 
 Usage:
   npx vibe-coding-analytics scan [--cwd path]
-  npx vibe-coding-analytics init [--cwd path] [--write]
+  npx vibe-coding-analytics init [--cwd path] [--tools a,b,c|all] [--write]
   npx vibe-coding-analytics evolve [--cwd path] [--write] [--ci-failures]
 
 Commands:
@@ -2676,6 +2710,9 @@ Flags:
   --cwd path      Operate on a different directory.
   --format json   (analytics) Emit the report as JSON.
   --ci-failures   (evolve) Mine recent CI failures via \`gh\` and list the worst offenders.
+  --tools list    (init) Comma-separated AI tools to adapt for
+                  (claude,cursor,kiro,copilot) or \`all\`. Default: only tools
+                  already detected in the project.
 
 By default commands are read-only.`);
 }
@@ -2774,32 +2811,46 @@ function detectPackageManager(cwd, packageJson) {
   return "npm";
 }
 
-function buildInitFiles(report) {
+function buildInitFiles(report, tools = resolveTools(report)) {
   const name = report.packageJson?.name || path.basename(report.cwd);
   const commandPrefix = detectPackageManager(report.cwd, report.packageJson);
+  // Multi-tool projects keep .ai/ as the shared portable source; single-tool
+  // projects keep only the tool-native home so content is not duplicated.
+  // (.ai/ also stays when Claude is absent: AGENTS.md points codex/other CLIs
+  // at .ai/workflows as their only workflow home.)
+  const toolCount = [tools.claude, tools.cursor, tools.kiro, tools.copilot].filter(Boolean).length;
+  const writeAi = !tools.claude || toolCount >= 2;
   const files = [
     file("AGENTS.md", agentInstructions(name, report.packageJson?.scripts, Boolean(report.packageJson), commandPrefix)),
-    file("CLAUDE.md", claudeInstructions(name)),
-    file(".github/copilot-instructions.md", copilotInstructions(name)),
-    file(".cursor/rules/vibe-coding-analytics.mdc", cursorRule(name)),
-    file(".kiro/steering/vibe-coding-analytics.md", kiroSteering(name)),
     file("docs/knowledge-base/patterns.md", "# Patterns\n\nDocument project-specific code patterns that agents should reuse.\n"),
     file("docs/knowledge-base/constraints.md", "# Constraints\n\nDocument rules that must not be violated. Promote repeated rules into tests or validators.\n"),
     file("docs/knowledge-base/known-issues.md", "# Known Issues\n\nTrack recurring failures, root causes, and the sensor added to prevent recurrence.\n"),
     file("docs/decisions/0001-harness-baseline.md", harnessDecision(name)),
-    file(".ai/workflows/analytics.md", workflowAnalyticsDoc()),
-    file(".ai/workflows/init.md", workflowInitDoc()),
-    file(".ai/workflows/evolve.md", workflowEvolveDoc()),
-    file(".ai/workflows/steer.md", workflowSteerDoc()),
-    file(".ai/reviewers/harness-reviewer.md", harnessReviewerDoc()),
-    file("scripts/validate-harness.js", harnessValidatorScript()),
+    file("scripts/validate-harness.js", harnessValidatorScript(tools, writeAi)),
     file(".github/workflows/ci.yml", githubCiWorkflow(report)),
-    file(".claude/commands/analytics.md", slashAnalyticsCommand()),
-    file(".claude/commands/init.md", slashInitCommand()),
-    file(".claude/commands/evolve.md", slashEvolveCommand()),
-    file(".claude/commands/steer.md", slashSteerCommand()),
-    file(".claude/agents/harness-reviewer.md", harnessReviewerAgent()),
   ];
+  if (writeAi) {
+    files.push(
+      file(".ai/workflows/analytics.md", workflowAnalyticsDoc()),
+      file(".ai/workflows/init.md", workflowInitDoc()),
+      file(".ai/workflows/evolve.md", workflowEvolveDoc()),
+      file(".ai/workflows/steer.md", workflowSteerDoc()),
+      file(".ai/reviewers/harness-reviewer.md", harnessReviewerDoc()),
+    );
+  }
+  if (tools.claude) {
+    files.push(
+      file("CLAUDE.md", claudeInstructions(name, writeAi)),
+      file(".claude/commands/analytics.md", slashAnalyticsCommand()),
+      file(".claude/commands/init.md", slashInitCommand()),
+      file(".claude/commands/evolve.md", slashEvolveCommand()),
+      file(".claude/commands/steer.md", slashSteerCommand()),
+      file(".claude/agents/harness-reviewer.md", harnessReviewerAgent()),
+    );
+  }
+  if (tools.cursor) files.push(file(".cursor/rules/vibe-coding-analytics.mdc", cursorRule(name)));
+  if (tools.kiro) files.push(file(".kiro/steering/vibe-coding-analytics.md", kiroSteering(name)));
+  if (tools.copilot) files.push(file(".github/copilot-instructions.md", copilotInstructions(name)));
   // Claude Code projects: scaffold PostToolUse lint+format hooks + a deny list
   // of irreversible commands. Skipped for non-Claude stacks (Codex/Cursor).
   // Hooks (settings.json) are also gated on prettier+eslint being present so we
@@ -2810,10 +2861,10 @@ function buildInitFiles(report) {
   // does NOT skip: mergePermissionsLocal unions the missing default families in,
   // so rm -rf / force-push / hard-reset / git-clean / pipe-to-shell get blocked.
   // (Codex P1 #3660296403)
-  if (!denyGuardIsComplete(report)) {
+  if (tools.claude && !denyGuardIsComplete(report)) {
     files.push(file(".claude/settings.local.json", claudePermissionsLocal(report), mergePermissionsLocal));
   }
-  const hooksContent = claudeHooksSettings(report);
+  const hooksContent = tools.claude ? claudeHooksSettings(report) : null;
   if (hooksContent) files.push(file(".claude/settings.json", hooksContent, (existing, incoming) => mergeHooksSettings(existing, incoming, report.scripts, report.workspaceScripts, report.dirScripts)));
   return files;
 }
@@ -3134,14 +3185,19 @@ source of truth.
 `;
 }
 
-function claudeInstructions(name) {
+function claudeInstructions(name, hasAi = true) {
+  const source = hasAi
+    ? `Use .ai/workflows/ as the portable workflow source and .ai/reviewers/ as shared
+review criteria. The .claude/commands/ files are Claude Code adapters; do not
+duplicate long-lived rules here unless they are Claude-specific.`
+    : `Use .claude/commands/ as the workflow home and .claude/agents/ for reviewer
+specs; do not duplicate long-lived rules here unless they are Claude-specific.
+Run \`vca init --tools all --write\` if more AI tools are adopted later.`;
   return `# ${name} Claude Code Instructions
 
 Canonical project guidance lives in AGENTS.md.
 
-Use .ai/workflows/ as the portable workflow source and .ai/reviewers/ as shared
-review criteria. The .claude/commands/ files are Claude Code adapters; do not
-duplicate long-lived rules here unless they are Claude-specific.
+${source}
 `;
 }
 
@@ -3225,7 +3281,8 @@ Expected generic baseline:
 - Kiro .kiro/steering/*.md
 - Copilot .github/copilot-instructions.md
 
-Before finishing, verify every compatibility target above has a native adapter file.
+Before finishing, verify a native adapter exists for every AI tool this project
+actually uses (pass --tools all to vca init for every mainstream adapter).
 `;
 }
 
@@ -3305,32 +3362,41 @@ jobs:
 `;
 }
 
-function harnessValidatorScript() {
+function harnessValidatorScript(tools = { claude: true, cursor: true, kiro: true, copilot: true }, writeAi = true) {
+  const required = [
+    "AGENTS.md",
+    ...(tools.claude ? ["CLAUDE.md"] : []),
+    ...(tools.copilot ? [".github/copilot-instructions.md"] : []),
+    ...(tools.cursor ? [".cursor/rules/vibe-coding-analytics.mdc"] : []),
+    ...(tools.kiro ? [".kiro/steering/vibe-coding-analytics.md"] : []),
+    ".github/workflows/ci.yml",
+    "docs/knowledge-base/patterns.md",
+    "docs/knowledge-base/constraints.md",
+    "docs/knowledge-base/known-issues.md",
+    "docs/decisions/0001-harness-baseline.md",
+    ...(writeAi
+      ? [
+          ".ai/workflows/analytics.md",
+          ".ai/workflows/init.md",
+          ".ai/workflows/evolve.md",
+          ".ai/workflows/steer.md",
+          ".ai/reviewers/harness-reviewer.md",
+        ]
+      : []),
+    ...(tools.claude
+      ? [
+          ".claude/commands/analytics.md",
+          ".claude/commands/init.md",
+          ".claude/commands/evolve.md",
+          ".claude/commands/steer.md",
+          ".claude/agents/harness-reviewer.md",
+        ]
+      : []),
+  ];
   return `#!/usr/bin/env node
 import fs from "node:fs";
 
-const required = [
-  "AGENTS.md",
-  "CLAUDE.md",
-  ".github/copilot-instructions.md",
-  ".cursor/rules/vibe-coding-analytics.mdc",
-  ".kiro/steering/vibe-coding-analytics.md",
-  ".github/workflows/ci.yml",
-  "docs/knowledge-base/patterns.md",
-  "docs/knowledge-base/constraints.md",
-  "docs/knowledge-base/known-issues.md",
-  "docs/decisions/0001-harness-baseline.md",
-  ".ai/workflows/analytics.md",
-  ".ai/workflows/init.md",
-  ".ai/workflows/evolve.md",
-  ".ai/workflows/steer.md",
-  ".ai/reviewers/harness-reviewer.md",
-  ".claude/commands/analytics.md",
-  ".claude/commands/init.md",
-  ".claude/commands/evolve.md",
-  ".claude/commands/steer.md",
-  ".claude/agents/harness-reviewer.md"
-];
+const required = ${JSON.stringify(required, null, 2)};
 
 const missing = required.filter((file) => !fs.existsSync(file));
 if (missing.length) {
