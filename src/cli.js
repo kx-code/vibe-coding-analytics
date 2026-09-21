@@ -3428,10 +3428,12 @@ const VALIDATOR_LINK_CHECK = [
   "  const kept = [];",
   "  let fence = \"\";",
   "  for (const line of content.split(/\\r?\\n/)) {",
-  "    const m = line.match(/^\\s{0,3}(`{3,}|~{3,})/);",
+  "    const m = line.match(/^\\s{0,3}(`{3,}|~{3,})(.*)$/);",
   "    if (m) {",
   "      if (!fence) fence = m[1];",
-  "      else if (m[1][0] === fence[0] && m[1].length >= fence.length) fence = \"\";",
+  "      // CommonMark: a closing fence may be followed only by whitespace, so",
+  "      // a line like ```not-a-close inside a fence is fenced content, not a close.",
+  "      else if (m[1][0] === fence[0] && m[1].length >= fence.length && !m[2].trim()) fence = \"\";",
   "      continue;",
   "    }",
   "    if (!fence) kept.push(line);",
@@ -3440,11 +3442,19 @@ const VALIDATOR_LINK_CHECK = [
   "}",
   "function anchors(content) {",
   "  const ids = new Set();",
-  "  for (const m of prose(content).matchAll(/^#{1,6}\\s+(.+?)\\s*#*\\s*$/gm)) {",
-  "    const base = m[1].toLowerCase().replace(/[^\\p{L}\\p{M}\\p{N}_\\-\\s]/gu, \"\").replace(/\\s/g, \"-\");",
+  "  const add = (text) => {",
+  "    const base = text.toLowerCase().replace(/[^\\p{L}\\p{M}\\p{N}_\\-\\s]/gu, \"\").replace(/\\s/g, \"-\");",
   "    let id = base;",
   "    for (let s = 1; ids.has(id); s += 1) id = base + \"-\" + s;",
   "    ids.add(id);",
+  "  };",
+  "  // ATX headings (# Title) and Setext headings (Title over === / ---) both get",
+  "  // GitHub anchors; include both so links to Setext sections do not false-fail.",
+  "  const lines = prose(content).split(/\\r?\\n/);",
+  "  for (let i = 0; i < lines.length; i += 1) {",
+  "    const atx = lines[i].match(/^#{1,6}\\s+(.+?)\\s*#*\\s*$/);",
+  "    if (atx) { add(atx[1]); continue; }",
+  "    if (lines[i].trim() && lines[i + 1] && /^ {0,3}(=+|-+)\\s*$/.test(lines[i + 1])) add(lines[i].trim());",
   "  }",
   "  return ids;",
   "}",
@@ -3458,12 +3468,21 @@ const VALIDATOR_LINK_CHECK = [
   "  for (const m of content.matchAll(/\\]\\(([^)]+)\\)/g)) {",
   "    let target;",
   "    try {",
-  "      target = decodeURIComponent(m[1].replace(/^<|>$/g, \"\"));",
+  "      // Strip an optional inline-link title (dest \"t\" / 't' / (t)); CommonMark",
+  "      // requires whitespace between destination and title, so destinations",
+  "      // containing quotes or parens without a preceding space are untouched.",
+  "      const raw = m[1].replace(/^<|>$/g, \"\").replace(/\\s+(\"(?:[^\"\\\\]|\\\\.)*\"|'[^']*'|\\([^)]*\\))$/, \"\");",
+  "      target = decodeURIComponent(raw);",
   "    } catch {",
   "      linkErrors.push(\"Invalid link encoding in \" + file);",
   "      continue;",
   "    }",
-  "    if (path.isAbsolute(target) || /^[a-zA-Z]:[\\\\/]/.test(target) || /^file:/i.test(target)) {",
+  "    if (/^file:/i.test(target)) {",
+  "      linkErrors.push(\"Absolute local link in \" + file + \": \" + target);",
+  "      continue;",
+  "    }",
+  "    if (target.startsWith(\"//\")) continue; // protocol-relative external URL",
+  "    if (path.isAbsolute(target) || /^[a-zA-Z]:[\\\\/]/.test(target)) {",
   "      linkErrors.push(\"Absolute local link in \" + file + \": \" + target);",
   "      continue;",
   "    }",
@@ -3476,6 +3495,16 @@ const VALIDATOR_LINK_CHECK = [
   "    if (rel === \"..\" || rel.startsWith(\"..\" + path.sep) || path.isAbsolute(rel)) {",
   "      linkErrors.push(\"Outside repository in \" + file + \": \" + target);",
   "      continue;",
+  "    }",
+  "    // Lexical containment is not enough: an in-repo symlink can point outside.",
+  "    if (fs.existsSync(resolved)) {",
+  "      try {",
+  "        const relReal = path.relative(fs.realpathSync(root), fs.realpathSync(resolved));",
+  "        if (relReal === \"..\" || relReal.startsWith(\"..\" + path.sep) || path.isAbsolute(relReal)) {",
+  "          linkErrors.push(\"Outside repository in \" + file + \": \" + target);",
+  "          continue;",
+  "        }",
+  "      } catch { /* unreadable realpath falls through to the file checks below */ }",
   "    }",
   "    if (filePart && (!fs.existsSync(resolved) || !fs.statSync(resolved).isFile())) {",
   "      linkErrors.push(\"Broken file link in \" + file + \": \" + target);",
@@ -3758,6 +3787,11 @@ Acceptance command: <e.g. npm run ci or a subset>
 Budget: <max rounds, default 10>
 Extra no-go zones: <beyond the universal list below>
 
+These four fields are frozen once round 1 begins; only round-log lines may be
+appended to this card. Editing the Goal, Acceptance command, Budget, or
+no-go zones mid-loop (for example swapping the acceptance command for a
+trivially passing one) is a needs-human hard stop, not a steering option.
+
 ## Protocol
 
 1. Each round: read STEERING.md at the repository root for new steering ->
@@ -3778,6 +3812,8 @@ Extra no-go zones: <beyond the universal list below>
 - No commit, push, deploy, or calls to real money/production endpoints.
 - Do not modify confirmed decisions; candidates stay candidates.
 - Do not weaken a checker or test to make it pass.
+- Do not edit the frozen task-card fields (goal, acceptance command, budget,
+  no-go zones) to reach the stop condition; that is a needs-human hard stop.
 - Do not overwrite unmerged work from others.
 
 ## Close-Out
