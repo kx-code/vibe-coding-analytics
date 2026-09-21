@@ -186,6 +186,35 @@ test("init --write never replaces an unrecognized custom validate-harness.js (Co
   assert.ok(!/const required/.test(after), "custom validator must not be replaced by the generated one");
 });
 
+test("a custom validator declaring its own required list stays untouched (Codex P1 review of 2712916)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-validator-required-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "sample", scripts: {} }));
+  fs.mkdirSync(path.join(dir, "scripts"), { recursive: true });
+  const custom = '#!/usr/bin/env node\n// custom company validator\nimport fs from "node:fs";\nconst required = ["company-policy.md", "SECURITY.md"];\nfor (const f of required) if (!fs.existsSync(f)) process.exit(1);\nconsole.log("company validation ok");\n';
+  fs.writeFileSync(path.join(dir, "scripts", "validate-harness.js"), custom);
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".claude", "settings.json"), "{}\n");
+  await runCli(["init", "--cwd", dir, "--tools", "claude", "--write"]);
+  const after = fs.readFileSync(path.join(dir, "scripts", "validate-harness.js"), "utf8");
+  assert.strictEqual(after, custom, "custom validator with its own required list must stay byte-for-byte unchanged");
+});
+
+test("legacy generated validators without the provenance marker still refresh their required list", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-validator-legacy-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "sample", scripts: {} }));
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".claude", "settings.json"), "{}\n");
+  await runCli(["init", "--cwd", dir, "--write"]);
+  const marker = "// vibe-coding-analytics generated validator; init refreshes the required list below\n";
+  const generated = fs.readFileSync(path.join(dir, "scripts", "validate-harness.js"), "utf8");
+  assert.ok(generated.includes(marker.trim()), "new validators carry the provenance marker");
+  fs.writeFileSync(path.join(dir, "scripts", "validate-harness.js"), generated.replace(marker, "")); // simulate a pre-marker release
+  await runCli(["init", "--cwd", dir, "--tools", "claude,cursor", "--write"]);
+  const after = fs.readFileSync(path.join(dir, "scripts", "validate-harness.js"), "utf8");
+  assert.ok(/\.cursor\/rules\/vibe-coding-analytics\.mdc"/.test(after), "legacy generated validator is still refreshed");
+  assert.ok(after.includes(marker.trim()), "refreshed validator gains the provenance marker");
+});
+
 test("expanding the tool set refreshes generated AGENTS.md/CLAUDE.md pointers (Codex P2)", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-pointer-refresh-"));
   fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "sample", scripts: {} }));

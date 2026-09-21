@@ -3378,6 +3378,11 @@ jobs:
 `;
 }
 
+/** Provenance marker distinguishing vca-generated validators from custom
+ *  scripts that happen to declare their own `const required` list. */
+const VALIDATOR_MARKER =
+  "// vibe-coding-analytics generated validator; init refreshes the required list below";
+
 function harnessValidatorScript(tools = { claude: true, cursor: true, kiro: true, copilot: true }, writeAi = true) {
   const required = [
     "AGENTS.md",
@@ -3410,6 +3415,7 @@ function harnessValidatorScript(tools = { claude: true, cursor: true, kiro: true
       : []),
   ];
   return `#!/usr/bin/env node
+${VALIDATOR_MARKER}
 import fs from "node:fs";
 
 const required = ${JSON.stringify(required, null, 2)};
@@ -3452,8 +3458,15 @@ function refreshHarnessValidator(existing, incoming) {
   // A validator we cannot parse as generated (custom or hand-written) is left
   // untouched: replacing it would destroy user code. (Codex P1 #4061989769)
   if (!prev || !next || JSON.stringify(prev) === JSON.stringify(next)) return existing;
-  // Recognized generated validator: update only the embedded required list,
-  // preserving any local tweaks to the body.
+  // Template body comparison ignores the marker and the embedded list, so a
+  // byte-identical (legacy or current) generated validator upgrades wholesale.
+  const body = (s) => s.replace(`${VALIDATOR_MARKER}\n`, "").replace(/const required = (\[[\s\S]*?\]);/, "const required = REQUIRED;");
+  if (body(existing) === body(incoming)) return incoming;
+  // Marker + locally tweaked body: refresh only the embedded required list.
+  // A custom script declaring its own required list has no marker and a body
+  // that never matches the template, so it stays byte-for-byte untouched.
+  // (Codex P1 review of 2712916)
+  if (!existing.includes(VALIDATOR_MARKER)) return existing;
   return existing.replace(/const required = (\[[\s\S]*?\]);/, `const required = ${JSON.stringify(next)};`);
 }
 
