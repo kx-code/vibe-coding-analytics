@@ -399,7 +399,7 @@ function enrichDepth(checks, ctx) {
   const allRootFiles = new Set(ctx.allFiles);
   for (const [root, files] of ctx.filesByRoot) {
     if (root === cwd) continue;
-    const prefix = path.relative(cwd, root);
+    const prefix = path.relative(cwd, root).split(path.sep).join("/"); // POSIX: merged paths below use "/"
     for (const f of files) allRootFiles.add(prefix ? `${prefix}/${f}` : f);
   }
   const merged = [...allRootFiles];
