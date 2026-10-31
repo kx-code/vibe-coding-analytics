@@ -289,6 +289,14 @@ function analyzeProject(cwd) {
   }
   const score = total === 0 ? 100 : Math.round((earned / total) * 100);
   const warnings = detectWarnings(checks);
+  const allowedDangerous = allowedDangerousWithoutDeny({ roots });
+  if (allowedDangerous.length) {
+    const fams = [...new Set(allowedDangerous.map((h) => h.family))].join(", ");
+    warnings.push({
+      code: "allow-span-dangerous",
+      message: `permissions.allow entries span irreversible-command families (${fams}) with no matching deny; Claude Code deny overrides allow, so narrow them or add deny entries: ${allowedDangerous.map((h) => h.entry).join(", ")}`,
+    });
+  }
   return { cwd, shape, roots, files: allFiles, packageJson, scripts, workspaceScripts, dirScripts, checks, score, warnings, untrackedHarness };
 }
 
@@ -1075,6 +1083,46 @@ export function denyEntryFamily(entry) {
   // sudo, where -r is a prefix of the -readme token) MISSing, and
   // `Bash(echo sudo rm:*)` (sudo not leading) MISSing.
   if (/^(?:sudo\s+)+rm\b/.test(cmd)) return "rm-recursive";
+  return null;
+}
+
+/** Wildcard allow prefixes that SPAN a dangerous family even though the entry
+ *  text names no dangerous command: `Bash(git push *)` permits `git push
+ *  --force`, `Bash(rm *)` permits `rm -rf`. Mirrors the DANGEROUS_CMD_FAMILIES
+ *  verbs. (Issue #31) */
+const DANGEROUS_CMD_PREFIXES = [
+  ["rm", "rm-recursive"],
+  ["git push", "git-force-push"],
+  ["git reset", "git-hard-reset"],
+  ["git clean", "git-clean-force"],
+  ["mkfs", "device-write"],
+  ["dd", "device-write"],
+  ["psql", "sql-destructive"],
+  ["mysql", "sql-destructive"],
+  ["prisma", "sql-destructive"],
+  ["curl", "pipe-to-shell"],
+  ["wget", "pipe-to-shell"],
+];
+
+/** The dangerous-command family an ALLOW entry spans, or null. Two paths:
+ *  denyEntryFamily catches entries that literally name a dangerous command
+ *  (`Bash(rm -rf:*)`); the wildcard path catches broad prefixes (`Bash(rm *)`)
+ *  whose `*` can expand into a family member. A wildcard-free entry allows
+ *  exactly its own (safe) command, so it never flags. Prefix matching is
+ *  word-bounded, so `Bash(git pushx *)` does not flag. */
+export function allowEntryDangerFamily(entry) {
+  const direct = denyEntryFamily(entry);
+  if (direct) return direct;
+  const m = String(entry).trim().match(/^Bash\(([^)]*)\)$/);
+  if (!m) return null;
+  let cmd = m[1];
+  if (cmd.endsWith(":*")) cmd = cmd.slice(0, -2);
+  if (!cmd.endsWith("*")) return null; // exact command allow — expands to nothing
+  cmd = cmd.slice(0, -1).trimEnd();
+  cmd = cmd.replace(/^sudo\b\s*/, ""); // sudo is a runner, not the command
+  for (const [prefix, fam] of DANGEROUS_CMD_PREFIXES) {
+    if (cmd === prefix || cmd.startsWith(prefix + " ")) return fam;
+  }
   return null;
 }
 
@@ -2480,17 +2528,42 @@ export function defaultDenyList(report) {
  *  Comparing against the exact scaffolded defaults closes both gaps, because the
  *  default set itself grows the moment isDbProject becomes true. (Codex P1
  *  #3660483486 / #3660483492) */
+/** permissions.allow / permissions.deny entries from .claude/settings.json ∪
+ *  settings.local.json of the primary root. Shared by the guard completeness
+ *  check and the allow-span warning so both read the same sources. */
+function readPermissionEntries(report) {
+  const primary = report.roots?.[0];
+  const out = { allow: [], deny: [] };
+  for (const f of ["settings.json", "settings.local.json"]) {
+    const s = primary ? readJson(path.join(primary, ".claude", f)) : null;
+    const p = s?.permissions || {};
+    for (const k of ["allow", "deny"]) {
+      if (Array.isArray(p[k])) out[k].push(...p[k].map(String));
+    }
+  }
+  return out;
+}
+
 export function denyGuardIsComplete(report) {
   const defaults = defaultDenyList(report);
-  const primary = report.roots?.[0];
-  const settings = primary ? readJson(path.join(primary, ".claude", "settings.json")) : null;
-  const local = primary ? readJson(path.join(primary, ".claude", "settings.local.json")) : null;
-  const existing = new Set();
-  for (const denyList of [settings?.permissions?.deny, local?.permissions?.deny]) {
-    if (!Array.isArray(denyList)) continue;
-    for (const entry of denyList) existing.add(String(entry).trim());
-  }
+  const existing = new Set(readPermissionEntries(report).deny.map((e) => e.trim()));
   return defaults.every((entry) => existing.has(entry));
+}
+
+/** Allow entries that span an irreversible-command family while NO deny entry
+ *  covers that family. Claude Code deny overrides allow, so a denied family is
+ *  safe; without one, accumulated broad allows (`Bash(git push *)` from an
+ *  approval) quietly re-open the commands the scaffolded guard exists to block.
+ *  Warning only — never affects the score. (Issue #31) */
+export function allowedDangerousWithoutDeny(report) {
+  const { allow, deny } = readPermissionEntries(report);
+  const deniedFamilies = new Set(deny.map(denyEntryFamily));
+  const hits = [];
+  for (const entry of allow) {
+    const fam = allowEntryDangerFamily(entry);
+    if (fam && !deniedFamilies.has(fam)) hits.push({ entry, family: fam });
+  }
+  return hits;
 }
 
 /** Broad SQL-CLIENT invocations (psql -c/-f, mysql -e) run ARBITRARY SQL — a safe
@@ -3392,6 +3465,10 @@ function githubCiWorkflow(report) {
     scripts.test ? "npm test" :
     "npx --yes vibe-coding-analytics scan";
   return `name: CI
+
+# Free-tier PRIVATE repos get ~2000 Actions minutes/month; the push trigger
+# below re-runs the full suite on every commit and can exhaust them fast.
+# Delete the push: block to run CI on pull requests only.
 
 on:
   pull_request:
