@@ -4,7 +4,7 @@ import path from "node:path";
 import test from "node:test";
 import { execSync, execFileSync, spawnSync } from "node:child_process";
 import assert from "node:assert/strict";
-import { analyzeForTest, runCli, buildEvolutionPlan, printEvolution, printReport, parseOptions, denyEntryFamily, defaultDenyList } from "../src/cli.js";
+import { analyzeForTest, runCli, buildEvolutionPlan, printEvolution, printReport, parseOptions, denyEntryFamily, allowEntryDangerFamily, defaultDenyList } from "../src/cli.js";
 
 // One representative entry per always-on irreversible-command family. This
 // satisfied the OLD family-level coverage (a single entry marks a family
@@ -5811,4 +5811,56 @@ test("ralph-loop card freezes goal/acceptance/budget/no-go fields once round 1 s
   const ralph = fs.readFileSync(path.join(dir, ".ai", "workflows", "ralph-loop.md"), "utf8");
   assert.match(ralph, /frozen once round 1/i, "task-card fields must be declared immutable once the loop starts");
   assert.match(ralph, /needs-human hard stop/i, "editing frozen fields must be an explicit hard stop");
+});
+
+test("allowEntryDangerFamily: wildcard allow prefixes that span dangerous families (issue #31)", () => {
+  // Direct path: the entry literally names a dangerous command.
+  assert.equal(allowEntryDangerFamily("Bash(rm -rf:*)"), "rm-recursive");
+  assert.equal(allowEntryDangerFamily("Bash(git push --force:*)"), "git-force-push");
+  // Wildcard path: the `*` can expand into a family member.
+  assert.equal(allowEntryDangerFamily("Bash(git push *)"), "git-force-push");
+  assert.equal(allowEntryDangerFamily("Bash(rm *)"), "rm-recursive");
+  assert.equal(allowEntryDangerFamily("Bash(sudo dd *)"), "device-write");
+  assert.equal(allowEntryDangerFamily("Bash(mysql *)"), "sql-destructive");
+  // Word boundary: a longer command name does not match the prefix.
+  assert.equal(allowEntryDangerFamily("Bash(git pushx *)"), null);
+  // Wildcard-free entries allow exactly their own (safe) command.
+  assert.equal(allowEntryDangerFamily("Bash(git status)"), null);
+  assert.equal(allowEntryDangerFamily("Bash(npm run test)"), null);
+});
+
+test("scan warns when permissions.allow spans dangerous families with no deny (issue #31)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-allow-danger-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".claude", "settings.local.json"), JSON.stringify({
+    permissions: { allow: ["Bash(git push *)", "Bash(npm run build)"], deny: [] },
+  }));
+  const r = analyzeForTest(dir);
+  const w = r.warnings.find((x) => x.code === "allow-span-dangerous");
+  assert.ok(w, "broad git push allow with no deny must warn");
+  assert.match(w.message, /Bash\(git push \*\)/);
+  assert.ok(!w.message.includes("npm run build"), "safe exact allow is not flagged");
+});
+
+test("scan stays quiet when a deny entry covers the allowed family (issue #31)", () => {
+  // Claude Code deny overrides allow, so the family is guarded — no warning.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-allow-denied-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# x\n");
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".claude", "settings.local.json"), JSON.stringify({
+    permissions: { allow: ["Bash(git push *)"], deny: ["Bash(git push --force:*)"] },
+  }));
+  const r = analyzeForTest(dir);
+  assert.equal(r.warnings.some((x) => x.code === "allow-span-dangerous"), false);
+});
+
+test("init CI template documents free-tier private-repo Actions minutes (issue #30)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-ci-minutes-"));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "sample", scripts: {} }));
+  await runCli(["init", "--cwd", dir, "--tools", "all", "--write"]);
+  const ci = fs.readFileSync(path.join(dir, ".github", "workflows", "ci.yml"), "utf8");
+  assert.match(ci, /PRIVATE/, "mentions private-repo minute budgets");
+  assert.match(ci, /minutes/, "names the Actions minutes cost");
+  assert.match(ci, /Delete the push: block/, "tells the user how to opt out");
 });
