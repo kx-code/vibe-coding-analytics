@@ -534,7 +534,9 @@ function collectAllScripts(cwd, allFiles) {
     if (typeof pkg.name === "string" && pkg.name) byName[pkg.name] = pkg.scripts;
     // Also key by member DIRECTORY (relative to cwd) so the `--workspace <path>`
     // selector form resolves to THIS package.
-    const rel = path.relative(cwd, dir);
+    // POSIX separators: selectors are written `packages/a`, while on Windows
+    // path.relative yields `packages\a`, which would never match.
+    const rel = path.relative(cwd, dir).split(path.sep).join("/");
     if (rel) byName[rel] = pkg.scripts;
   }
   return { flat, byName, byDir, all };
@@ -896,6 +898,17 @@ function untrackedHarnessFiles(cwd, allFiles) {
   return offenders;
 }
 
+/** Directories the scanner never descends into: dependency and build output
+ *  plus test/tooling artifact dirs. Artifact dirs (test-results, .react-router,
+ *  ...) are gitignored and often hold full copies of the source tree, so walking
+ *  them inflates test counts and makes the "Harness files committed" check list
+ *  hundreds of intentionally-ignored tsconfig.json / *.d.ts copies. */
+const SCAN_SKIP_DIRS = new Set([
+  "node_modules", ".git", "dist", "build", ".next", ".astro",
+  "test-results", "playwright-report", ".react-router", ".wrangler", ".vite",
+  ".turbo", ".svelte-kit", ".nuxt", ".output",
+]);
+
 function listFiles(root, maxDepth) {
   const result = new Set();
   walk(root, "", 0, maxDepth, result);
@@ -913,7 +926,7 @@ function walk(root, rel, depth, maxDepth, result) {
   }
 
   for (const entry of entries) {
-    if (["node_modules", ".git", "dist", "build", ".next", ".astro"].includes(entry.name)) continue;
+    if (SCAN_SKIP_DIRS.has(entry.name)) continue;
     const childRel = rel ? `${rel}/${entry.name}` : entry.name;
     if (entry.isDirectory()) {
       result.add(`${childRel}/`);
