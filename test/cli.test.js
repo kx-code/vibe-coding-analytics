@@ -968,6 +968,24 @@ test("does not flag harness files when the tree is not a git repo", () => {
   assert.ok(tracked && tracked.ok, "N/A outside a git repo");
 });
 
+test("scan skips gitignored build/test artifact dirs (test-results, .react-router) when counting and checking tracked files", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-artifacts-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# root\n");
+  fs.writeFileSync(path.join(dir, "tsconfig.json"), "{}\n");
+  fs.writeFileSync(path.join(dir, ".gitignore"), "test-results/\n.react-router/\n");
+  fs.mkdirSync(path.join(dir, "test-results", "run1", "source"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "test-results", "run1", "source", "tsconfig.json"), "{}\n");
+  fs.writeFileSync(path.join(dir, "test-results", "run1", "source", "a.test.mjs"), "// copy\n");
+  fs.mkdirSync(path.join(dir, ".react-router", "types"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".react-router", "types", "+server-build.d.ts"), "export {}\n");
+  execSync('git init -q && git config user.email t@t.t && git config user.name t', { cwd: dir, stdio: "pipe" });
+  execSync("git add -A", { cwd: dir, stdio: "pipe" });
+  const report = analyzeForTest(dir);
+  const tracked = report.checks.find((c) => c.area === "Harness files committed");
+  assert.ok(tracked && tracked.ok, "artifact copies must not trigger Harness files committed");
+  assert.ok(![...report.files].some((f) => f.startsWith("test-results/") || f.startsWith(".react-router/")), "artifact dirs are not walked");
+});
+
 test("init pre-fills detected package.json scripts into AGENTS.md", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vca-prefill-"));
   fs.writeFileSync(
@@ -2103,7 +2121,10 @@ test("generated read-path pipeline preserves quotes/backslashes/spaces end-to-en
   const tricky = "docs/it's a\\b.md"; // apostrophe + spaces + backslash
   const payload = JSON.stringify({ tool_input: { file_path: tricky } });
   const pathPlusNul = execFileSync("node", ["-e", script], { input: payload, encoding: "utf8" });
-  const out = execFileSync("xargs", ["-0", "-I{}", "printf", "%s\\n", "{}"], { input: pathPlusNul, encoding: "utf8" });
+  // Run xargs through `sh -c` like the real hook does (the path travels on stdin,
+  // never in the script text, so there is still no injection surface). Invoking
+  // the MSYS xargs.exe directly on Windows mangles its argv (issue #21).
+  const out = execFileSync("sh", ["-c", 'xargs -0 -I{} printf "%s\\n" {}'], { input: pathPlusNul, encoding: "utf8" });
   assert.equal(out.trim(), tricky, "quote+backslash+space path survives the NUL-delimited pipeline");
 });
 
@@ -4182,7 +4203,7 @@ test("combined hook's sh -c placeholder passes a tricky path byte-for-byte as $1
   const payload = JSON.stringify({ tool_input: { file_path: tricky } });
   const pathPlusNul = execFileSync("node", ["-e", script], { input: payload, encoding: "utf8" });
   // Mirror the exact `xargs -0 -I{} sh -c '... "$1" ...' _ {}` shape emitted.
-  const out = execFileSync("xargs", ["-0", "-I{}", "sh", "-c", 'printf "%s\\n" "$1"', "_", "{}"], { input: pathPlusNul, encoding: "utf8" });
+  const out = execFileSync("sh", ["-c", "xargs -0 -I{} sh -c 'printf \"%s\\n\" \"$1\"' _ {}"], { input: pathPlusNul, encoding: "utf8" });
   assert.equal(out.trim(), tricky, "apostrophe+space+backslash path reaches $1 byte-for-byte");
 });
 
